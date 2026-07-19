@@ -55,7 +55,7 @@ function runGenerator(root, mode, ...extraArguments) {
       "--output-dir", path.join(root, "licenses"),
       ...extraArguments,
     ],
-    { cwd: root, encoding: "utf8", windowsHide: true },
+    { cwd: root, encoding: "utf8", windowsHide: true, timeout: 300_000 },
   );
 }
 
@@ -188,7 +188,7 @@ test("write/check preserves nested package instances and exact bundle contributi
         "--metafile-label", "build/meta.json",
         "--output-dir", path.join(root, "licenses"),
       ],
-      { cwd: root, encoding: "utf8", windowsHide: true },
+      { cwd: root, encoding: "utf8", windowsHide: true, timeout: 300_000 },
     );
     assert.equal(candidateChecked.status, 0, `${candidateChecked.stdout}\n${candidateChecked.stderr}`);
 
@@ -534,7 +534,7 @@ test("checked-in notices match the clean-checkout candidate bundle metafile", ()
       "--metafile-label", "build/esbuild-meta.json",
       "--output-dir", path.join(projectRoot, "licenses"),
     ],
-    { cwd: projectRoot, encoding: "utf8", windowsHide: true },
+    { cwd: projectRoot, encoding: "utf8", windowsHide: true, timeout: 300_000 },
   );
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
   assert.match(result.stdout, /Verified notices for 24 bundled package instances\./u);
