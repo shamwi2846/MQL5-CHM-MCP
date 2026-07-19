@@ -5,6 +5,7 @@ import {
 } from "node:fs";
 import {
   access,
+  link,
   lstat,
   mkdir,
   open,
@@ -18,6 +19,8 @@ import {
   writeFile,
 } from "node:fs/promises";
 import path from "node:path";
+import { hostname as systemHostname } from "node:os";
+import { spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { inflateSync } from "node:zlib";
@@ -2012,18 +2015,559 @@ function validateDatabase(database, {
   database.exec("INSERT INTO search_fts(search_fts) VALUES('integrity-check')");
 }
 
-async function acquireBuildLock(lockPath) {
+const BUILD_LOCK_SCHEMA_VERSION = 1;
+const BUILD_TRANSACTION_SCHEMA_VERSION = 1;
+const BUILD_TRANSACTION_KIND = "mql5-chm-index-publication-v1";
+const BUILD_TRANSACTION_FILENAME = ".index-build-transaction.json";
+const ASSET_DISPOSAL_ROLES = ["target", "candidate", "backup"];
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
+
+function exactObjectKeys(value, expected) {
+  if (!value || Array.isArray(value) || typeof value !== "object") return false;
+  const actual = Object.keys(value).sort();
+  const wanted = [...expected].sort();
+  return actual.length === wanted.length && actual.every((key, index) => key === wanted[index]);
+}
+
+function defaultProbeProcess(pid) {
   try {
-    const handle = await open(lockPath, "wx", 0o600);
-    await handle.writeFile(`${JSON.stringify({ pid: process.pid, started_at: new Date().toISOString() })}\n`);
+    process.kill(pid, 0);
+    return "live";
+  } catch (error) {
+    if (error?.code === "ESRCH") return "dead";
+    if (error?.code === "EPERM" || error?.code === "EACCES") return "inaccessible";
+    return "inaccessible";
+  }
+}
+
+async function readBoundedRegularFile(filePath, label, maximumBytes = 16_384) {
+  const info = await lstat(filePath);
+  if (!info.isFile() || info.isSymbolicLink()) {
+    throw new Error(`${label} must be a regular non-link file: ${filePath}`);
+  }
+  if (info.size <= 0 || info.size > maximumBytes) {
+    throw new Error(`${label} has an invalid size: ${filePath}`);
+  }
+  return readFile(filePath, "utf8");
+}
+
+export function isObviouslySharedOrDevicePath(candidate) {
+  const text = String(candidate ?? "");
+  return /^(?:\\\\|\/\/)/u.test(text);
+}
+
+async function hasExplicitLegacySameHostProof(options, lockPath) {
+  if (isObviouslySharedOrDevicePath(lockPath)) return false;
+  const proof = options.legacySameHostProof;
+  if (typeof proof === "function") return await proof(lockPath) === true;
+  return false;
+}
+
+export async function proveLocalWindowsLockStorage(lockPath, driveTypeProbe = null) {
+  if (process.platform !== "win32" && typeof driveTypeProbe !== "function") return false;
+  const resolved = path.resolve(String(lockPath ?? ""));
+  if (isObviouslySharedOrDevicePath(resolved)) return false;
+  const volumeRoot = path.parse(resolved).root;
+  if (!/^[A-Za-z]:\\$/u.test(volumeRoot)) return false;
+  if (typeof driveTypeProbe === "function") return await driveTypeProbe(volumeRoot) === true;
+
+  const systemRoot = process.env.SystemRoot;
+  if (!systemRoot || !path.win32.isAbsolute(systemRoot)) return false;
+  const powershell = path.win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const script = [
+    "$ErrorActionPreference='Stop'",
+    "$root=[IO.Path]::GetPathRoot([IO.Path]::GetFullPath($env:MQL5_CHM_LEGACY_LOCK_PATH))",
+    "if([string]::IsNullOrWhiteSpace($root)){exit 4}",
+    "$drive=New-Object IO.DriveInfo($root)",
+    "if($drive.DriveType -eq [IO.DriveType]::Fixed -or $drive.DriveType -eq [IO.DriveType]::Ram){exit 0}",
+    "exit 5",
+  ].join(";");
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  const result = spawnSync(
+    powershell,
+    ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+    {
+      env: { ...process.env, MQL5_CHM_LEGACY_LOCK_PATH: resolved },
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 10_000,
+      maxBuffer: 16_384,
+    },
+  );
+  return !result.error && result.signal === null && result.status === 0;
+}
+
+function transactionTemporaryPath(outputDirectory, token) {
+  return path.join(outputDirectory, `${BUILD_TRANSACTION_FILENAME}.tmp-${token}`);
+}
+
+function assetDisposalPath(outputDirectory, role, token) {
+  if (!ASSET_DISPOSAL_ROLES.includes(role)) throw new Error(`Unsupported asset disposal role: ${role}`);
+  return path.join(outputDirectory, `.assets.disposal-${role}-${token}`);
+}
+
+function tokenBoundBuildLeafNames(token) {
+  return new Set([
+    `${BUILD_TRANSACTION_FILENAME}.tmp-${token}`,
+    `.mql5-docs.sqlite.candidate-${token}`,
+    `.mql5-docs.sqlite.candidate-${token}-journal`,
+    `.mql5-docs.sqlite.candidate-${token}-wal`,
+    `.mql5-docs.sqlite.candidate-${token}-shm`,
+    `.manifest.json.candidate-${token}`,
+    `.assets.candidate-${token}`,
+    `.mql5-docs.sqlite.backup-${token}`,
+    `.manifest.json.backup-${token}`,
+    `.assets.backup-${token}`,
+    ...ASSET_DISPOSAL_ROLES.map((role) => `.assets.disposal-${role}-${token}`),
+  ]);
+}
+
+async function listLockSwapDebris(lockPath, { legacy = false } = {}) {
+  const directory = path.dirname(lockPath);
+  const entries = await readdir(directory).catch((error) => {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  });
+  return entries.filter((name) => {
+    if (/^\.index-build\.lock\.(?:reclaim|release)-/u.test(name)) return true;
+    if (!legacy) return false;
+    return name === BUILD_TRANSACTION_FILENAME || name.startsWith(`${BUILD_TRANSACTION_FILENAME}.tmp-`) ||
+      /^\.(?:mql5-docs\.sqlite|manifest\.json|assets)\.(?:candidate|backup)-/u.test(name) ||
+      /^\.assets\.disposal-/u.test(name) ||
+      /^\.(?:mql5-docs\.sqlite|manifest\.json|assets)\.tmp-/u.test(name);
+  });
+}
+
+function parseTokenBoundBuildDebris(name) {
+  const patterns = [
+    [/^\.index-build-transaction\.json\.tmp-([0-9a-f-]{36})$/iu, "journal-temp", null],
+    [/^\.mql5-docs\.sqlite\.candidate-([0-9a-f-]{36})$/iu, "candidate", "database"],
+    [/^\.mql5-docs\.sqlite\.candidate-([0-9a-f-]{36})-(journal|wal|shm)$/iu, "candidate-sidecar", "database"],
+    [/^\.manifest\.json\.candidate-([0-9a-f-]{36})$/iu, "candidate", "manifest"],
+    [/^\.assets\.candidate-([0-9a-f-]{36})$/iu, "candidate", "assets"],
+    [/^\.mql5-docs\.sqlite\.backup-([0-9a-f-]{36})$/iu, "backup", "database"],
+    [/^\.manifest\.json\.backup-([0-9a-f-]{36})$/iu, "backup", "manifest"],
+    [/^\.assets\.backup-([0-9a-f-]{36})$/iu, "backup", "assets"],
+    [/^\.assets\.disposal-(target|candidate|backup)-([0-9a-f-]{36})$/iu, "disposal", "assets"],
+  ];
+  for (const [pattern, kind, artifact] of patterns) {
+    const match = pattern.exec(name);
+    if (!match) continue;
+    const role = kind === "disposal" ? match[1].toLowerCase() : null;
+    const token = kind === "disposal" ? match[2] : match[1];
+    return UUID_PATTERN.test(token) ? { name, kind, artifact, role, token: token.toLowerCase() } : { name, invalid: true };
+  }
+  if (/^\.(?:index-build-transaction\.json\.tmp-|mql5-docs\.sqlite\.(?:candidate|backup)-|manifest\.json\.(?:candidate|backup)-|assets\.(?:candidate|backup|disposal)-)/iu.test(name)) {
+    return { name, invalid: true };
+  }
+  return null;
+}
+
+async function listTokenBoundBuildDebris(outputDirectory) {
+  const entries = await readdir(outputDirectory).catch((error) => {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  });
+  return entries.map(parseTokenBoundBuildDebris).filter(Boolean);
+}
+
+async function inspectOwnedAssetDisposal(target, label) {
+  const info = await lstat(target).catch((error) => {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  });
+  if (!info) return false;
+  if (!info.isDirectory() || info.isSymbolicLink()) {
+    throw new Error(`${label} must be a real directory: ${target}`);
+  }
+  return true;
+}
+
+async function disposeOwnedAssetDirectory(source, disposal, { onCutPoint = null, cutPointPrefix = "dispose" } = {}) {
+  const sourcePresent = await inspectOwnedAssetDisposal(source, "Owned asset directory");
+  const disposalPresent = await inspectOwnedAssetDisposal(disposal, "Owned asset disposal directory");
+  if (sourcePresent && disposalPresent) {
+    throw new Error(`Both an owned asset directory and its disposal path exist; state is ambiguous: ${source}`);
+  }
+  if (sourcePresent) {
+    await rename(source, disposal);
+    await onCutPoint?.(`${cutPointPrefix}:renamed`);
+  }
+  if (sourcePresent || disposalPresent) {
+    await rm(disposal, { recursive: true, force: true });
+    await onCutPoint?.(`${cutPointPrefix}:removed`);
+  }
+}
+
+async function assertRegularNonLinkForRemoval(filePath, label) {
+  const info = await lstat(filePath);
+  if (!info.isFile() || info.isSymbolicLink()) {
+    throw new Error(`${label} must be a regular non-link file: ${filePath}`);
+  }
+}
+
+async function cleanDeadOwnerPreJournalDebris(lockPath, ownerToken, options = {}) {
+  const outputDirectory = path.dirname(lockPath);
+  const journalPath = path.join(outputDirectory, BUILD_TRANSACTION_FILENAME);
+  const journalPresent = await pathExists(journalPath);
+  const debris = await listTokenBoundBuildDebris(outputDirectory);
+
+  if (journalPresent) {
+    const raw = await readBoundedRegularFile(journalPath, "Index build transaction journal", 1_048_576);
+    const journal = parseBuildTransaction(raw);
+    const journalToken = journal.owner_token.toLowerCase();
+    const journalLeafNames = tokenBoundBuildLeafNames(journal.owner_token);
+    if (debris.some((entry) =>
+      entry.invalid || entry.token !== journalToken || !journalLeafNames.has(entry.name))) {
+      throw new Error("Pending index build transaction has debris outside its strict journal owner; state was preserved.");
+    }
+    // A successor acquires its own strict lock before it resumes an older
+    // durable journal. If that successor dies during idempotent recovery, the
+    // journal legitimately retains the original owner's token while the lock
+    // identifies the dead recovery custodian. No successor candidate can have
+    // been started because recovery precedes output preparation.
+    return;
+  }
+
+  const expectedLeafNames = tokenBoundBuildLeafNames(ownerToken);
+  if (debris.some((entry) =>
+    entry.invalid || entry.token !== ownerToken.toLowerCase() || !expectedLeafNames.has(entry.name))) {
+    throw new Error("Ambiguous index build debris is not bound to the proven-dead lock owner.");
+  }
+
+  const unsafe = debris.filter((entry) =>
+    entry.kind === "backup" || (entry.kind === "disposal" && entry.role !== "candidate"),
+  );
+  if (unsafe.length) {
+    throw new Error(`Journal-free index build has ambiguous publication debris: ${unsafe.map((entry) => entry.name).sort().join(", ")}.`);
+  }
+
+  const candidateAssets = path.join(outputDirectory, `.assets.candidate-${ownerToken}`);
+  const candidateDisposal = assetDisposalPath(outputDirectory, "candidate", ownerToken);
+  const candidateAssetsPresent = debris.some((entry) => entry.kind === "candidate" && entry.artifact === "assets");
+  const candidateDisposalPresent = debris.some((entry) => entry.kind === "disposal" && entry.role === "candidate");
+  if (candidateAssetsPresent) await inspectOwnedAssetDisposal(candidateAssets, "Dead-owner candidate assets");
+  if (candidateDisposalPresent) await inspectOwnedAssetDisposal(candidateDisposal, "Dead-owner candidate asset disposal");
+  if (candidateAssetsPresent && candidateDisposalPresent) {
+    throw new Error("Dead-owner candidate assets exist at both active and disposal paths.");
+  }
+  for (const entry of debris) {
+    if ((entry.kind === "candidate" && entry.artifact === "assets") || entry.kind === "disposal") continue;
+    const target = path.join(outputDirectory, entry.name);
+    await assertRegularNonLinkForRemoval(target, "Dead-owner candidate build file");
+  }
+
+  for (const entry of debris) {
+    if ((entry.kind === "candidate" && entry.artifact === "assets") || entry.kind === "disposal") continue;
+    await unlink(path.join(outputDirectory, entry.name));
+    await options.onCleanupCutPoint?.(`dead-owner:${entry.kind}:${entry.artifact ?? "journal"}:removed`);
+  }
+  await disposeOwnedAssetDirectory(candidateAssets, candidateDisposal, {
+    onCutPoint: options.onCleanupCutPoint,
+    cutPointPrefix: "dead-owner:candidate:assets",
+  });
+}
+
+function parseExistingBuildLock(raw, localHostname) {
+  let value;
+  try {
+    value = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`Existing index build lock contains malformed JSON: ${error.message}`);
+  }
+
+  if (exactObjectKeys(value, ["schema_version", "pid", "hostname", "owner_token", "started_at"])) {
+    if (
+      value.schema_version !== BUILD_LOCK_SCHEMA_VERSION ||
+      !Number.isSafeInteger(value.pid) || value.pid <= 0 ||
+      typeof value.hostname !== "string" || !value.hostname || value.hostname.length > 255 ||
+      /[\u0000-\u001f\u007f]/u.test(value.hostname) ||
+      typeof value.owner_token !== "string" || !UUID_PATTERN.test(value.owner_token)
+    ) {
+      throw new Error("Existing index build lock is malformed or has an unsupported schema.");
+    }
+    requireUtcLockTimestamp(value.started_at, "Existing index build lock started_at");
+    if (value.hostname.toLowerCase() !== localHostname.toLowerCase()) {
+      throw new Error(`Existing index build lock belongs to foreign host '${value.hostname}'.`);
+    }
+    return { kind: "current", value };
+  }
+
+  if (exactObjectKeys(value, ["pid", "started_at"])) {
+    if (!Number.isSafeInteger(value.pid) || value.pid <= 0) {
+      throw new Error("Existing legacy index build lock is malformed.");
+    }
+    requireUtcLockTimestamp(value.started_at, "Existing legacy index build lock started_at");
+    return { kind: "legacy", value };
+  }
+
+  throw new Error("Existing index build lock is malformed or has an unsupported schema.");
+}
+
+function requireUtcLockTimestamp(value, label) {
+  requireIsoTimestamp(value, label);
+  if (typeof value !== "string" || !value.endsWith("Z")) {
+    throw new Error(`${label} must be an ISO-8601 UTC timestamp ending in Z.`);
+  }
+}
+
+async function recoverDeadReleaseClaim(lockPath, claimNames, options = {}) {
+  if (!claimNames.length) return;
+  const lockLeaf = path.basename(lockPath);
+  const releasePrefix = `${lockLeaf}.release-`;
+  const releaseClaims = claimNames.filter((name) => name.startsWith(releasePrefix));
+  if (!releaseClaims.length) return;
+  if (releaseClaims.length !== 1 || claimNames.length !== 1) {
+    throw new Error(`Ambiguous index lock recovery debris exists: ${claimNames.sort().join(", ")}.`);
+  }
+  if (await pathExists(lockPath)) {
+    throw new Error("A canonical index lock and a release claim both exist; state is ambiguous and was preserved.");
+  }
+  const claimName = releaseClaims[0];
+  const claimToken = claimName.slice(releasePrefix.length).toLowerCase();
+  if (!UUID_PATTERN.test(claimToken)) {
+    throw new Error(`Malformed index lock release claim exists: ${claimName}.`);
+  }
+  const claimPath = path.join(path.dirname(lockPath), claimName);
+  const localHostname = String(options.hostname ?? systemHostname());
+  const raw = await readBoundedRegularFile(claimPath, "Released index build lock");
+  const parsed = parseExistingBuildLock(raw, localHostname);
+  if (parsed.kind !== "current" || parsed.value.owner_token.toLowerCase() !== claimToken) {
+    throw new Error("Index lock release claim is not bound to its strict lock owner; state was preserved.");
+  }
+  const probeProcess = options.probeProcess ?? defaultProbeProcess;
+  const state = await probeProcess(parsed.value.pid);
+  if (state === "live") {
+    throw new Error(`Index lock release owner is still active (PID ${parsed.value.pid}).`);
+  }
+  if (state !== "dead") {
+    throw new Error(`Index lock release owner is inaccessible; cannot prove PID ${parsed.value.pid} is dead.`);
+  }
+  await unlink(claimPath).catch((error) => {
+    if (error?.code !== "ENOENT") throw error;
+  });
+  await options.onCleanupCutPoint?.("dead-release-claim:removed");
+}
+
+async function recoverDeadReclaimClaim(lockPath, suppliedLockPath, claimNames, options = {}) {
+  if (!claimNames.length) return;
+  const lockLeaf = path.basename(lockPath);
+  const reclaimPrefix = `${lockLeaf}.reclaim-`;
+  const reclaimClaims = claimNames.filter((name) => name.startsWith(reclaimPrefix));
+  if (!reclaimClaims.length) return;
+  if (reclaimClaims.length !== 1 || claimNames.length !== 1) {
+    throw new Error(`Ambiguous index lock recovery debris exists: ${claimNames.sort().join(", ")}.`);
+  }
+  const claimName = reclaimClaims[0];
+  const recoveryToken = claimName.slice(reclaimPrefix.length).toLowerCase();
+  if (!UUID_PATTERN.test(recoveryToken)) {
+    throw new Error(`Malformed index lock reclaim claim exists: ${claimName}.`);
+  }
+  const claimPath = path.join(path.dirname(lockPath), claimName);
+  let raw;
+  try {
+    raw = await readBoundedRegularFile(claimPath, "Reclaimed index build lock");
+  } catch (error) {
+    // Another contender may have atomically restored the same lone claim.
+    // Re-read the directory below rather than manufacturing a second lock.
+    if (error?.code === "ENOENT" && await pathExists(lockPath)) return;
+    throw error;
+  }
+  const localHostname = String(options.hostname ?? systemHostname());
+  const parsed = parseExistingBuildLock(raw, localHostname);
+  if (parsed.kind === "legacy") {
+    if (isObviouslySharedOrDevicePath(suppliedLockPath) ||
+        !await hasExplicitLegacySameHostProof(options, lockPath)) {
+      throw new Error("Cannot recover a legacy index build reclaim claim without explicit proof that its path is local to this host.");
+    }
+    const legacyDebris = (await listLockSwapDebris(lockPath, { legacy: true }))
+      .filter((name) => name !== claimName);
+    if (legacyDebris.length) {
+      throw new Error(`Cannot recover legacy index build reclaim claim while ambiguous swap debris exists: ${legacyDebris.sort().join(", ")}.`);
+    }
+  }
+  const probeProcess = options.probeProcess ?? defaultProbeProcess;
+  const claimedOwnerState = await probeProcess(parsed.value.pid);
+  if (claimedOwnerState === "live") {
+    throw new Error(`Index lock reclaim owner is still active (PID ${parsed.value.pid}).`);
+  }
+  if (claimedOwnerState !== "dead") {
+    throw new Error(`Index lock reclaim owner is inaccessible; cannot prove PID ${parsed.value.pid} is dead.`);
+  }
+
+  if (await pathExists(lockPath)) {
+    const canonicalRaw = await readBoundedRegularFile(lockPath, "Canonical index build lock during reclaim recovery");
+    const canonical = parseExistingBuildLock(canonicalRaw, localHostname);
+    if (canonical.kind !== "current" || canonical.value.owner_token.toLowerCase() !== recoveryToken) {
+      throw new Error("A canonical index lock and reclaim claim are not bound to the same recovery owner; state was preserved.");
+    }
+    const canonicalOwnerState = await probeProcess(canonical.value.pid);
+    if (canonicalOwnerState === "live") {
+      throw new Error(`The canonical reclaim recovery owner is still active (PID ${canonical.value.pid}).`);
+    }
+    if (canonicalOwnerState !== "dead") {
+      throw new Error(`The canonical reclaim recovery owner is inaccessible; cannot prove PID ${canonical.value.pid} is dead.`);
+    }
+    await unlink(claimPath).catch((error) => {
+      if (error?.code !== "ENOENT") throw error;
+    });
+    await options.onCleanupCutPoint?.("dead-reclaim-pair:claim-removed");
+    return;
+  }
+
+  try {
+    await rename(claimPath, lockPath);
+  } catch (error) {
+    if (error?.code === "ENOENT" && await pathExists(lockPath)) return;
+    throw new Error(`Could not restore the proven-dead index lock reclaim claim: ${error.message}`);
+  }
+  const restoredRaw = await readBoundedRegularFile(lockPath, "Restored index build lock");
+  if (restoredRaw !== raw) {
+    if (!await pathExists(claimPath)) await rename(lockPath, claimPath).catch(() => {});
+    throw new Error("Index lock reclaim claim changed during restoration; state is ambiguous and was preserved.");
+  }
+  await options.onCleanupCutPoint?.("dead-reclaim-claim:restored");
+}
+
+async function createOwnedBuildLock(lockPath, ownerToken, localHostname) {
+  const handle = await open(lockPath, "wx", 0o600);
+  const value = {
+    schema_version: BUILD_LOCK_SCHEMA_VERSION,
+    pid: process.pid,
+    hostname: localHostname,
+    owner_token: ownerToken,
+    started_at: new Date().toISOString(),
+  };
+  try {
+    await handle.writeFile(`${JSON.stringify(value)}\n`);
     await handle.sync();
-    return handle;
+    return { handle, lockPath, ownerToken, raw: `${JSON.stringify(value)}\n` };
+  } catch (error) {
+    await handle.close().catch(() => {});
+    await unlink(lockPath).catch(() => {});
+    throw error;
+  }
+}
+
+export async function acquireBuildLock(lockPath, options = {}) {
+  const suppliedLockPath = String(lockPath);
+  const resolvedLockPath = path.resolve(lockPath);
+  const localHostname = String(options.hostname ?? systemHostname());
+  const probeProcess = options.probeProcess ?? defaultProbeProcess;
+  const ownerToken = randomUUID();
+  const strandedClaims = await listLockSwapDebris(resolvedLockPath);
+  await recoverDeadReleaseClaim(resolvedLockPath, strandedClaims, options);
+  const claimsAfterReleaseRecovery = await listLockSwapDebris(resolvedLockPath);
+  await recoverDeadReclaimClaim(resolvedLockPath, suppliedLockPath, claimsAfterReleaseRecovery, options);
+  const remainingClaims = await listLockSwapDebris(resolvedLockPath);
+  if (remainingClaims.length) {
+    throw new Error(`Ambiguous index lock recovery debris exists: ${remainingClaims.sort().join(", ")}.`);
+  }
+
+  try {
+    return await createOwnedBuildLock(resolvedLockPath, ownerToken, localHostname);
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+  }
+
+  const raw = await readBoundedRegularFile(resolvedLockPath, "Existing index build lock");
+  const parsed = parseExistingBuildLock(raw, localHostname);
+  if (parsed.kind === "legacy") {
+    if (isObviouslySharedOrDevicePath(suppliedLockPath) ||
+        !await hasExplicitLegacySameHostProof(options, resolvedLockPath)) {
+      throw new Error("Cannot reclaim a legacy index build lock without explicit proof that its path is local to this host.");
+    }
+    const debris = await listLockSwapDebris(resolvedLockPath, { legacy: true });
+    if (debris.length) {
+      throw new Error(`Cannot reclaim legacy index build lock while ambiguous swap debris exists: ${debris.sort().join(", ")}.`);
+    }
+  }
+  const state = await probeProcess(parsed.value.pid);
+  if (state === "live") {
+    throw new Error(`Another index build is active (PID ${parsed.value.pid}): ${resolvedLockPath}`);
+  }
+  if (state !== "dead") {
+    throw new Error(`Existing index build owner is inaccessible; cannot prove PID ${parsed.value.pid} is dead.`);
+  }
+
+  const claimPath = `${resolvedLockPath}.reclaim-${ownerToken}`;
+  await rename(resolvedLockPath, claimPath).catch((error) => {
+    throw new Error(`Existing index build lock changed during stale-owner recovery: ${error.message}`);
+  });
+  const claimedRaw = await readBoundedRegularFile(claimPath, "Reclaimed index build lock");
+  if (claimedRaw !== raw) {
+    if (!await pathExists(resolvedLockPath)) await rename(claimPath, resolvedLockPath).catch(() => {});
+    throw new Error("Existing index build lock changed during recovery; state is ambiguous and was preserved.");
+  }
+  await options.onCleanupCutPoint?.("dead-owner-lock:claimed");
+
+  if (parsed.kind === "current") {
+    try {
+      await cleanDeadOwnerPreJournalDebris(resolvedLockPath, parsed.value.owner_token, options);
+    } catch (error) {
+      if (!await pathExists(resolvedLockPath)) await rename(claimPath, resolvedLockPath).catch(() => {});
+      throw new Error(`Could not safely clean the proven-dead index build owner's debris: ${error.message}`);
+    }
+  }
+
+  let lease;
+  try {
+    lease = await createOwnedBuildLock(resolvedLockPath, ownerToken, localHostname);
   } catch (error) {
     if (error?.code === "EEXIST") {
-      throw new Error(`Another index build may be active (lock exists): ${lockPath}`);
+      await rm(claimPath, { force: true }).catch(() => {});
+      throw new Error(`Another index build became active during stale-owner recovery: ${resolvedLockPath}`);
+    }
+    if (!await pathExists(resolvedLockPath)) {
+      await rename(claimPath, resolvedLockPath).catch(() => {});
     }
     throw error;
   }
+  try {
+    await options.onCleanupCutPoint?.("dead-owner-lock:new-lock-created");
+  } catch (error) {
+    // Test cut-point injection models process termination, which closes the
+    // handle while leaving both durable names exactly where the crash did.
+    await lease.handle.close().catch(() => {});
+    throw error;
+  }
+  try {
+    const removeReclaimClaim = options.removeReclaimClaim ?? ((target) => rm(target, { force: true }));
+    await removeReclaimClaim(claimPath);
+  } catch (error) {
+    let closeError = null;
+    try {
+      await lease.handle.close();
+    } catch (caught) {
+      closeError = caught;
+    }
+    const suffix = closeError ? ` The retained canonical lock handle also could not close: ${closeError.message}` : "";
+    throw new Error(`Could not finish stale index lock reclamation; the bound canonical/reclaim pair was retained for retry: ${error.message}.${suffix}`);
+  }
+  return lease;
+}
+
+export async function releaseBuildLock(lease) {
+  if (!lease?.handle || !lease?.lockPath || !lease?.ownerToken || typeof lease.raw !== "string") {
+    throw new Error("Invalid index build lock lease.");
+  }
+  await lease.handle.close();
+  const releasePath = `${lease.lockPath}.release-${lease.ownerToken}`;
+  try {
+    await rename(lease.lockPath, releasePath);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      throw new Error("Index build lock disappeared before release.");
+    }
+    throw error;
+  }
+  const raw = await readBoundedRegularFile(releasePath, "Released index build lock");
+  if (raw !== lease.raw) {
+    if (!await pathExists(lease.lockPath)) await rename(releasePath, lease.lockPath).catch(() => {});
+    throw new Error("Index build lock ownership changed before release; the lock was preserved.");
+  }
+  await rm(releasePath, { force: true });
 }
 
 async function writeDurableJson(filePath, value) {
@@ -2037,45 +2581,618 @@ async function writeDurableJson(filePath, value) {
   }
 }
 
-async function replaceBuildArtifacts(
-  tempDatabasePath,
-  databasePath,
-  tempManifestPath,
-  manifestPath,
-  tempAssetsPath,
-  assetsPath,
-) {
-  const nonce = `${process.pid}-${randomUUID()}`;
-  const items = [
-    { temporary: tempDatabasePath, target: databasePath, backup: `${databasePath}.backup-${nonce}` },
-    { temporary: tempManifestPath, target: manifestPath, backup: `${manifestPath}.backup-${nonce}` },
-    { temporary: tempAssetsPath, target: assetsPath, backup: `${assetsPath}.backup-${nonce}` },
-  ];
-  const backedUp = [];
-  const installed = [];
+function requireSha256(value, label) {
+  if (typeof value !== "string" || !SHA256_PATTERN.test(value)) {
+    throw new Error(`${label} must be a lowercase SHA-256 digest.`);
+  }
+  return value;
+}
 
+async function describeFile(filePath, label) {
+  await assertRealFile(filePath, label);
+  const info = await stat(filePath);
+  return { bytes: info.size, sha256: await sha256File(filePath) };
+}
+
+async function describeAssetTree(assetsPath) {
+  await assertRealDirectory(assetsPath, "Index artifact assets");
+  const files = await enumerateFiles(assetsPath);
+  const rows = [];
+  let totalBytes = 0;
+  for (const filePath of files) {
+    await assertNoLinkTraversal(assetsPath, filePath, "Index artifact asset", "asset root");
+    const relativePath = normalizeSlashes(path.relative(assetsPath, filePath));
+    if (!relativePath || relativePath.startsWith("../") || path.isAbsolute(relativePath)) {
+      throw new Error(`Index artifact asset has an unsafe relative path: ${relativePath}`);
+    }
+    const info = await stat(filePath);
+    const digest = await sha256File(filePath);
+    rows.push({ storageKey: `assets/${relativePath}`, sha256: digest, byteCount: info.size });
+    totalBytes += info.size;
+  }
+  return {
+    file_count: rows.length,
+    total_bytes: totalBytes,
+    tree_sha256: computeAssetTreeSha256(rows),
+  };
+}
+
+export async function describeIndexArtifactSet({ databasePath, manifestPath, assetsPath }) {
+  const database = await describeFile(databasePath, "Index artifact database");
+  const manifestFile = await describeFile(manifestPath, "Index artifact manifest");
+  let manifest;
   try {
-    for (const item of items) {
-      if (await pathExists(item.target)) {
-        await rename(item.target, item.backup);
-        backedUp.push(item);
-      }
-    }
-    for (const item of items) {
-      await rename(item.temporary, item.target);
-      installed.push(item);
-    }
+    manifest = JSON.parse(await readFile(manifestPath, "utf8"));
   } catch (error) {
-    for (const item of installed.reverse()) {
-      await rm(item.target, { force: true, recursive: true }).catch(() => {});
+    throw new Error(`Index artifact manifest is malformed: ${error.message}`);
+  }
+  const assets = await describeAssetTree(assetsPath);
+  const indexRevision = requireSha256(manifest?.index_revision, "Index artifact revision");
+  const corpusRevision = requireSha256(manifest?.corpus_revision, "Index artifact corpus revision");
+  if (
+    Number(manifest?.schema_version) !== SCHEMA_VERSION ||
+    manifest?.index_contract !== INDEX_CONTRACT ||
+    manifest?.database?.filename !== "mql5-docs.sqlite" ||
+    Number(manifest?.database?.bytes) !== database.bytes ||
+    manifest?.database?.sha256 !== database.sha256 ||
+    indexRevision !== database.sha256 ||
+    manifest?.assets?.directory !== "assets" ||
+    Number(manifest?.assets?.cataloged_count) !== assets.file_count ||
+    Number(manifest?.assets?.total_bytes) !== assets.total_bytes ||
+    manifest?.assets?.tree_sha256 !== assets.tree_sha256
+  ) {
+    throw new Error("Index artifact set does not form a valid database/manifest/assets closure.");
+  }
+  return {
+    index_revision: indexRevision,
+    corpus_revision: corpusRevision,
+    database,
+    manifest: manifestFile,
+    assets: {
+      ...assets,
+      catalog_sha256: requireSha256(manifest.assets.catalog_sha256, "Index artifact asset catalog"),
+    },
+  };
+}
+
+function validateArtifactSetDescriptor(value, label) {
+  if (!exactObjectKeys(value, ["index_revision", "corpus_revision", "database", "manifest", "assets"])) {
+    throw new Error(`${label} descriptor is malformed.`);
+  }
+  requireSha256(value.index_revision, `${label} index revision`);
+  requireSha256(value.corpus_revision, `${label} corpus revision`);
+  for (const name of ["database", "manifest"]) {
+    if (!exactObjectKeys(value[name], ["bytes", "sha256"]) ||
+        !Number.isSafeInteger(value[name].bytes) || value[name].bytes < 0) {
+      throw new Error(`${label} ${name} descriptor is malformed.`);
     }
-    for (const item of backedUp.reverse()) {
-      await rename(item.backup, item.target).catch(() => {});
+    requireSha256(value[name].sha256, `${label} ${name}`);
+  }
+  if (!exactObjectKeys(value.assets, ["file_count", "total_bytes", "tree_sha256", "catalog_sha256"]) ||
+      !Number.isSafeInteger(value.assets.file_count) || value.assets.file_count < 0 ||
+      !Number.isSafeInteger(value.assets.total_bytes) || value.assets.total_bytes < 0) {
+    throw new Error(`${label} assets descriptor is malformed.`);
+  }
+  requireSha256(value.assets.tree_sha256, `${label} asset tree`);
+  requireSha256(value.assets.catalog_sha256, `${label} asset catalog`);
+  if (value.index_revision !== value.database.sha256) {
+    throw new Error(`${label} revision does not match its database hash.`);
+  }
+  return value;
+}
+
+function artifactItems(outputDirectory, token) {
+  return [
+    {
+      key: "database",
+      type: "file",
+      target: path.join(outputDirectory, "mql5-docs.sqlite"),
+      candidate: path.join(outputDirectory, `.mql5-docs.sqlite.candidate-${token}`),
+      backup: path.join(outputDirectory, `.mql5-docs.sqlite.backup-${token}`),
+    },
+    {
+      key: "manifest",
+      type: "file",
+      target: path.join(outputDirectory, "manifest.json"),
+      candidate: path.join(outputDirectory, `.manifest.json.candidate-${token}`),
+      backup: path.join(outputDirectory, `.manifest.json.backup-${token}`),
+    },
+    {
+      key: "assets",
+      type: "directory",
+      target: path.join(outputDirectory, "assets"),
+      candidate: path.join(outputDirectory, `.assets.candidate-${token}`),
+      backup: path.join(outputDirectory, `.assets.backup-${token}`),
+      disposals: Object.fromEntries(ASSET_DISPOSAL_ROLES.map((role) => [
+        role,
+        assetDisposalPath(outputDirectory, role, token),
+      ])),
+    },
+  ];
+}
+
+function descriptorForItem(setDescriptor, key) {
+  return setDescriptor[key];
+}
+
+async function describeOneArtifact(item, target) {
+  if (item.key === "assets") return describeAssetTree(target);
+  return describeFile(target, `Transaction ${item.key}`);
+}
+
+function descriptorsEqual(actual, expected, key) {
+  if (key === "assets") {
+    return actual.file_count === expected.file_count &&
+      actual.total_bytes === expected.total_bytes &&
+      actual.tree_sha256 === expected.tree_sha256;
+  }
+  return actual.bytes === expected.bytes && actual.sha256 === expected.sha256;
+}
+
+async function inspectArtifact(item, target, candidateDescriptor, oldDescriptor) {
+  const info = await lstat(target).catch((error) => {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  });
+  if (!info) return { present: false, candidate: false, old: false };
+  if ((item.type === "file" && (!info.isFile() || info.isSymbolicLink())) ||
+      (item.type === "directory" && (!info.isDirectory() || info.isSymbolicLink()))) {
+    return { present: true, candidate: false, old: false };
+  }
+  const actual = await describeOneArtifact(item, target);
+  return {
+    present: true,
+    candidate: descriptorsEqual(actual, descriptorForItem(candidateDescriptor, item.key), item.key),
+    old: oldDescriptor ? descriptorsEqual(actual, descriptorForItem(oldDescriptor, item.key), item.key) : false,
+  };
+}
+
+function transactionPathObject(token) {
+  return {
+    journal: {
+      target: BUILD_TRANSACTION_FILENAME,
+      temporary: `${BUILD_TRANSACTION_FILENAME}.tmp-${token}`,
+    },
+    database: {
+      target: "mql5-docs.sqlite",
+      candidate: `.mql5-docs.sqlite.candidate-${token}`,
+      backup: `.mql5-docs.sqlite.backup-${token}`,
+    },
+    manifest: {
+      target: "manifest.json",
+      candidate: `.manifest.json.candidate-${token}`,
+      backup: `.manifest.json.backup-${token}`,
+    },
+    assets: {
+      target: "assets",
+      candidate: `.assets.candidate-${token}`,
+      backup: `.assets.backup-${token}`,
+      disposals: Object.fromEntries(ASSET_DISPOSAL_ROLES.map((role) => [
+        role,
+        `.assets.disposal-${role}-${token}`,
+      ])),
+    },
+  };
+}
+
+function parseBuildTransaction(raw) {
+  let value;
+  try {
+    value = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`Index build transaction journal contains malformed JSON: ${error.message}`);
+  }
+  if (!exactObjectKeys(value, [
+    "schema_version", "transaction", "owner_token", "created_at", "paths", "old", "candidate",
+  ]) ||
+      value.schema_version !== BUILD_TRANSACTION_SCHEMA_VERSION ||
+      value.transaction !== BUILD_TRANSACTION_KIND ||
+      typeof value.owner_token !== "string" || !UUID_PATTERN.test(value.owner_token)) {
+    throw new Error("Index build transaction journal is malformed or unsupported.");
+  }
+  requireIsoTimestamp(value.created_at, "Index build transaction created_at");
+  const expectedPaths = transactionPathObject(value.owner_token);
+  if (JSON.stringify(value.paths) !== JSON.stringify(expectedPaths)) {
+    throw new Error("Index build transaction paths are not token-bound canonical leaf names.");
+  }
+  if (value.old !== null) validateArtifactSetDescriptor(value.old, "Old index artifact set");
+  validateArtifactSetDescriptor(value.candidate, "Candidate index artifact set");
+  return value;
+}
+
+async function assertCanonicalMatches(outputDirectory, descriptor) {
+  const actual = await describeIndexArtifactSet({
+    databasePath: path.join(outputDirectory, "mql5-docs.sqlite"),
+    manifestPath: path.join(outputDirectory, "manifest.json"),
+    assetsPath: path.join(outputDirectory, "assets"),
+  });
+  if (!artifactSetDescriptorsEqual(actual, descriptor)) {
+    throw new Error("Published canonical index set does not match its transaction descriptor.");
+  }
+}
+
+async function publishDurableTransactionJournal(outputDirectory, token, value, onCutPoint) {
+  const journalPath = path.join(outputDirectory, BUILD_TRANSACTION_FILENAME);
+  const temporaryPath = transactionTemporaryPath(outputDirectory, token);
+  if (await pathExists(journalPath)) {
+    throw new Error(`An index build transaction is already pending: ${journalPath}`);
+  }
+  if (await pathExists(temporaryPath)) {
+    throw new Error(`A token-bound index transaction journal temporary already exists: ${temporaryPath}`);
+  }
+  await writeDurableJson(temporaryPath, value);
+  await onCutPoint?.("journal:prepared");
+  try {
+    await link(temporaryPath, journalPath);
+  } catch (error) {
+    if (error?.code === "EEXIST") {
+      throw new Error(`An index build transaction became active before journal publication: ${journalPath}`);
     }
     throw error;
   }
+  await onCutPoint?.("journal");
+  await unlink(temporaryPath);
+  await onCutPoint?.("journal:temporary-removed");
+}
 
-  for (const item of backedUp) await rm(item.backup, { force: true, recursive: true });
+async function inspectPublishedJournalTemporary(outputDirectory, journal, raw) {
+  const expected = transactionTemporaryPath(outputDirectory, journal.owner_token);
+  const debris = await listTokenBoundBuildDebris(outputDirectory);
+  const expectedLeafNames = tokenBoundBuildLeafNames(journal.owner_token);
+  if (debris.some((entry) =>
+    entry.invalid || entry.token !== journal.owner_token.toLowerCase() || !expectedLeafNames.has(entry.name))) {
+    throw new Error("Index build transaction has unrelated or malformed token-bound debris; all state was preserved.");
+  }
+  if (debris.some((entry) => entry.kind === "candidate-sidecar")) {
+    throw new Error("Index build transaction has an unexpected SQLite candidate sidecar; all state was preserved.");
+  }
+  const journalTemporaries = debris.filter((entry) => entry.kind === "journal-temp");
+  if (journalTemporaries.some((entry) => path.join(outputDirectory, entry.name) !== expected)) {
+    throw new Error("Index build transaction has an unrelated or malformed journal temporary; all state was preserved.");
+  }
+  if (!journalTemporaries.length) return null;
+  const temporaryRaw = await readBoundedRegularFile(expected, "Index build transaction journal temporary", 1_048_576);
+  if (temporaryRaw !== raw) {
+    throw new Error("Index build transaction journal temporary does not match the canonical journal.");
+  }
+  return expected;
+}
+
+function artifactSetDescriptorsEqual(left, right) {
+  return left.index_revision === right.index_revision &&
+    left.corpus_revision === right.corpus_revision &&
+    descriptorsEqual(left.database, right.database, "database") &&
+    descriptorsEqual(left.manifest, right.manifest, "manifest") &&
+    descriptorsEqual(left.assets, right.assets, "assets") &&
+    left.assets.catalog_sha256 === right.assets.catalog_sha256;
+}
+
+function artifactLocation(item, target) {
+  for (const role of ["target", "candidate", "backup"]) {
+    if (path.resolve(item[role]) === path.resolve(target)) return role;
+  }
+  throw new Error(`Artifact removal target is not journal-bound: ${target}`);
+}
+
+async function removeKnownArtifact(item, target, options = {}) {
+  if (item.type !== "directory") {
+    await rm(target, { force: true });
+    await options.onCutPoint?.(`${options.cutPointPrefix ?? "remove"}:removed`);
+    return;
+  }
+  const role = artifactLocation(item, target);
+  await disposeOwnedAssetDirectory(target, item.disposals[role], {
+    onCutPoint: options.onCutPoint,
+    cutPointPrefix: options.cutPointPrefix ?? `dispose:${role}:assets`,
+  });
+}
+
+async function inspectAssetDisposals(item) {
+  if (item.type !== "directory") return {};
+  const output = {};
+  for (const role of ASSET_DISPOSAL_ROLES) {
+    output[role] = await inspectOwnedAssetDisposal(item.disposals[role], `Transaction assets ${role} disposal`);
+  }
+  return output;
+}
+
+function assertOnlyAllowedAssetDisposals(state, allowedRoles) {
+  for (const role of ASSET_DISPOSAL_ROLES) {
+    if (state.disposals?.[role] && !allowedRoles.includes(role)) {
+      throw new Error(`Index build transaction has an unexpected assets ${role} disposal; all state was preserved.`);
+    }
+  }
+}
+
+async function clearAssetDisposals(item, roles, onCutPoint) {
+  if (item.type !== "directory") return;
+  for (const role of roles) {
+    const disposal = item.disposals[role];
+    if (!await inspectOwnedAssetDisposal(disposal, `Transaction assets ${role} disposal`)) continue;
+    await rm(disposal, { recursive: true, force: true });
+    await onCutPoint?.(`dispose:${role}:assets:removed`);
+  }
+}
+
+async function assertTransactionEphemeralAbsent(items, journalTemporary) {
+  const paths = [];
+  for (const item of items) {
+    paths.push(item.candidate, item.backup);
+    if (item.type === "directory") paths.push(...Object.values(item.disposals));
+  }
+  if (journalTemporary) paths.push(journalTemporary);
+  for (const target of paths) {
+    if (await pathExists(target)) {
+      throw new Error(`Index build transaction cleanup is incomplete: ${target}`);
+    }
+  }
+}
+
+async function assertCanonicalArtifactsAbsent(items) {
+  for (const item of items) {
+    if (await pathExists(item.target)) {
+      throw new Error(`Partial first-build cleanup left a canonical artifact: ${item.target}`);
+    }
+  }
+}
+
+export async function recoverIndexBuildTransaction(outputDirectoryInput, options = {}) {
+  const outputDirectory = path.resolve(outputDirectoryInput);
+  const onCutPoint = options.onCutPoint ?? null;
+  const journalPath = path.join(outputDirectory, BUILD_TRANSACTION_FILENAME);
+  const journalInfo = await lstat(journalPath).catch((error) => {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  });
+  if (!journalInfo) return { action: "none" };
+  const raw = await readBoundedRegularFile(journalPath, "Index build transaction journal", 1_048_576);
+  const journal = parseBuildTransaction(raw);
+  const journalTemporary = await inspectPublishedJournalTemporary(outputDirectory, journal, raw);
+  const items = artifactItems(outputDirectory, journal.owner_token);
+  const states = new Map();
+
+  for (const item of items) {
+    const state = {
+      target: await inspectArtifact(item, item.target, journal.candidate, journal.old),
+      candidate: await inspectArtifact(item, item.candidate, journal.candidate, journal.old),
+      backup: await inspectArtifact(item, item.backup, journal.candidate, journal.old),
+      disposals: await inspectAssetDisposals(item),
+    };
+    if ((state.target.present && !state.target.candidate && !state.target.old) ||
+        (state.candidate.present && !state.candidate.candidate) ||
+        (state.backup.present && !state.backup.old)) {
+      throw new Error(`Index build transaction has ambiguous ${item.key} bytes; all state was preserved.`);
+    }
+    states.set(item.key, state);
+  }
+
+  const candidateComplete = items.every((item) => {
+    const state = states.get(item.key);
+    return state.candidate.candidate || state.target.candidate;
+  });
+  const oldComplete = journal.old !== null && items.every((item) => {
+    const state = states.get(item.key);
+    return state.backup.old || state.target.old;
+  });
+
+  if (candidateComplete) {
+    for (const item of items) {
+      const state = states.get(item.key);
+      assertOnlyAllowedAssetDisposals(state, ["backup"]);
+      if (item.type === "directory" && state.disposals.backup && state.backup.present) {
+        throw new Error("Candidate publication has assets at both backup and backup-disposal paths.");
+      }
+    }
+    // Validate the complete recovery plan before the first rename. A conflict
+    // in a later artifact must not leave an earlier artifact half-published.
+    for (const item of items) {
+      const state = states.get(item.key);
+      if (!state.candidate.candidate) continue;
+      if (state.target.present &&
+          (!state.target.old || state.backup.present || journal.old === null)) {
+        throw new Error(`Cannot complete candidate publication because ${item.key} target state is ambiguous.`);
+      }
+    }
+    for (const item of items) {
+      const state = states.get(item.key);
+      if (!state.candidate.candidate) continue;
+      if (state.target.present) {
+        await rename(item.target, item.backup);
+      }
+      await rename(item.candidate, item.target);
+    }
+    await assertCanonicalMatches(outputDirectory, journal.candidate);
+    for (const item of items) {
+      const backup = await inspectArtifact(item, item.backup, journal.candidate, journal.old);
+      if (backup.present) {
+        if (!backup.old) throw new Error(`Cannot remove unverified ${item.key} backup.`);
+        await removeKnownArtifact(item, item.backup, {
+          onCutPoint,
+          cutPointPrefix: `dispose:backup:${item.key}`,
+        });
+      } else if (item.type === "directory") {
+        await clearAssetDisposals(item, ["backup"], onCutPoint);
+      }
+    }
+    if (journalTemporary) {
+      await unlink(journalTemporary);
+      await onCutPoint?.("journal:temporary-removed");
+    }
+    await assertCanonicalMatches(outputDirectory, journal.candidate);
+    await assertTransactionEphemeralAbsent(items, journalTemporary);
+    await unlink(journalPath);
+    await onCutPoint?.("journal:removed");
+    return { action: "committed" };
+  }
+
+  if (oldComplete) {
+    for (const item of items) {
+      const state = states.get(item.key);
+      assertOnlyAllowedAssetDisposals(state, ["target", "candidate"]);
+      if (item.type === "directory") {
+        if (state.disposals.target && state.target.present) {
+          throw new Error("Rollback has assets at both target and target-disposal paths.");
+        }
+        if (state.disposals.candidate && state.candidate.present) {
+          throw new Error("Rollback has assets at both candidate and candidate-disposal paths.");
+        }
+      }
+    }
+    // As above, preflight every rollback item before removing or renaming any
+    // canonical artifact.
+    for (const item of items) {
+      const state = states.get(item.key);
+      if (state.backup.old && state.target.present && !state.target.candidate) {
+        throw new Error(`Cannot restore prior ${item.key} because the target state is ambiguous.`);
+      }
+    }
+    for (const item of items) {
+      const state = states.get(item.key);
+      if (!state.backup.old) continue;
+      if (state.target.present) {
+        await removeKnownArtifact(item, item.target, {
+          onCutPoint,
+          cutPointPrefix: `dispose:target:${item.key}`,
+        });
+      }
+      await rename(item.backup, item.target);
+    }
+    await assertCanonicalMatches(outputDirectory, journal.old);
+    for (const item of items) {
+      const candidate = await inspectArtifact(item, item.candidate, journal.candidate, journal.old);
+      if (candidate.present) {
+        if (!candidate.candidate) throw new Error(`Cannot remove unverified candidate ${item.key}.`);
+        await removeKnownArtifact(item, item.candidate, {
+          onCutPoint,
+          cutPointPrefix: `dispose:candidate:${item.key}`,
+        });
+      } else if (item.type === "directory") {
+        await clearAssetDisposals(item, ["candidate"], onCutPoint);
+      }
+    }
+    await clearAssetDisposals(items.find((item) => item.key === "assets"), ["target"], onCutPoint);
+    if (journalTemporary) {
+      await unlink(journalTemporary);
+      await onCutPoint?.("journal:temporary-removed");
+    }
+    await assertCanonicalMatches(outputDirectory, journal.old);
+    await assertTransactionEphemeralAbsent(items, journalTemporary);
+    await unlink(journalPath);
+    await onCutPoint?.("journal:removed");
+    return { action: "restored" };
+  }
+
+  if (journal.old === null) {
+    for (const item of items) {
+      const state = states.get(item.key);
+      assertOnlyAllowedAssetDisposals(state, ["target", "candidate"]);
+      if (state.backup.present || state.disposals?.backup) {
+        throw new Error("Partial first index build has an unexpected backup; all state was preserved.");
+      }
+      if (item.type === "directory") {
+        if (state.disposals.target && state.target.present) {
+          throw new Error("Partial first build has assets at both target and target-disposal paths.");
+        }
+        if (state.disposals.candidate && state.candidate.present) {
+          throw new Error("Partial first build has assets at both candidate and candidate-disposal paths.");
+        }
+      }
+    }
+    for (const item of items) {
+      const state = states.get(item.key);
+      for (const [location, target] of [["target", item.target], ["candidate", item.candidate]]) {
+        if (state[location].present) {
+          await removeKnownArtifact(item, target, {
+            onCutPoint,
+            cutPointPrefix: `dispose:${location}:${item.key}`,
+          });
+        } else if (item.type === "directory") {
+          await clearAssetDisposals(item, [location], onCutPoint);
+        }
+      }
+    }
+    if (journalTemporary) {
+      await unlink(journalTemporary);
+      await onCutPoint?.("journal:temporary-removed");
+    }
+    await assertCanonicalArtifactsAbsent(items);
+    await assertTransactionEphemeralAbsent(items, journalTemporary);
+    await unlink(journalPath);
+    await onCutPoint?.("journal:removed");
+    return { action: "rebuild" };
+  }
+
+  throw new Error("Index build transaction can recover neither the complete candidate nor the complete prior set; all state was preserved.");
+}
+
+export async function publishIndexBuildTransaction({
+  outputDirectory: outputDirectoryInput,
+  databasePath,
+  manifestPath,
+  assetsPath,
+  transactionToken = randomUUID(),
+  onCutPoint = null,
+}) {
+  const outputDirectory = path.resolve(outputDirectoryInput);
+  if (!UUID_PATTERN.test(transactionToken)) throw new Error("Index build transaction token must be a UUID.");
+  const items = artifactItems(outputDirectory, transactionToken);
+  const supplied = { database: databasePath, manifest: manifestPath, assets: assetsPath };
+  for (const item of items) {
+    if (path.resolve(supplied[item.key]) !== path.resolve(item.candidate)) {
+      throw new Error(`Candidate ${item.key} path is not derived from the transaction token.`);
+    }
+  }
+  const journalPath = path.join(outputDirectory, BUILD_TRANSACTION_FILENAME);
+  if (await pathExists(journalPath)) {
+    throw new Error(`An index build transaction is already pending: ${journalPath}`);
+  }
+  const existingDebris = await listTokenBoundBuildDebris(outputDirectory);
+  const expectedCandidateLeafNames = new Set([
+    `.mql5-docs.sqlite.candidate-${transactionToken}`,
+    `.manifest.json.candidate-${transactionToken}`,
+    `.assets.candidate-${transactionToken}`,
+  ]);
+  if (existingDebris.some((entry) =>
+    entry.invalid || entry.token !== transactionToken.toLowerCase() || entry.kind !== "candidate" ||
+    !expectedCandidateLeafNames.has(entry.name))) {
+    throw new Error("Cannot begin index publication while ambiguous or unrelated token-bound debris exists.");
+  }
+
+  const canonicalPresence = await Promise.all(items.map((item) => pathExists(item.target)));
+  if (canonicalPresence.some(Boolean) && !canonicalPresence.every(Boolean)) {
+    throw new Error("Cannot publish over an incomplete canonical index artifact set.");
+  }
+  const oldDescriptor = canonicalPresence.every(Boolean)
+    ? await describeIndexArtifactSet({
+      databasePath: items[0].target,
+      manifestPath: items[1].target,
+      assetsPath: items[2].target,
+    })
+    : null;
+  const candidateDescriptor = await describeIndexArtifactSet({ databasePath, manifestPath, assetsPath });
+  const journal = {
+    schema_version: BUILD_TRANSACTION_SCHEMA_VERSION,
+    transaction: BUILD_TRANSACTION_KIND,
+    owner_token: transactionToken,
+    created_at: new Date().toISOString(),
+    paths: transactionPathObject(transactionToken),
+    old: oldDescriptor,
+    candidate: candidateDescriptor,
+  };
+  await publishDurableTransactionJournal(outputDirectory, transactionToken, journal, onCutPoint);
+
+  if (oldDescriptor) {
+    for (const item of items) {
+      await rename(item.target, item.backup);
+      await onCutPoint?.(`backup:${item.key}`);
+    }
+  }
+  for (const item of items) {
+    await rename(item.candidate, item.target);
+    await onCutPoint?.(`install:${item.key}`);
+  }
+  await recoverIndexBuildTransaction(outputDirectory, { onCutPoint });
+  return candidateDescriptor;
 }
 
 function requireIsoTimestamp(value, label) {
@@ -2186,12 +3303,18 @@ async function loadImagePolicy(imagePolicyPath) {
   }
   return {
     policy,
-    sha256: createHash("sha256").update(raw).digest("hex"),
+    sha256: computeImagePolicySha256(raw),
     catalogExtensions,
     publicMimeTypes,
     denylist,
     integrityExceptions,
   };
+}
+
+export function computeImagePolicySha256(raw) {
+  const text = Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw);
+  const canonicalText = text.replace(/\r\n?/gu, "\n");
+  return createHash("sha256").update(canonicalText, "utf8").digest("hex");
 }
 
 function chooseCanonicalCaption(asset) {
@@ -2474,6 +3597,7 @@ function parseCliArguments(argv) {
     corpusLockPath: "",
     sourceMetadataPath: "",
     imagePolicyPath: "",
+    reclaimDeadLegacyLock: false,
   };
   const switches = new Map([
     ["--root", "root"],
@@ -2494,6 +3618,11 @@ function parseCliArguments(argv) {
       }
       values[key] = argv[index + 1];
       index += 1;
+    } else if (argument === "--reclaim-dead-legacy-lock") {
+      if (values.reclaimDeadLegacyLock) {
+        throw new Error("--reclaim-dead-legacy-lock must be provided at most once.");
+      }
+      values.reclaimDeadLegacyLock = true;
     } else if (argument === "--help" || argument === "-h") {
       return { help: true, root: "" };
     } else {
@@ -2554,20 +3683,31 @@ export async function buildIndex(projectRootInput, options = {}) {
   if (sourceMetadataPath) await assertRealFile(sourceMetadataPath, "Source metadata");
   await assertRealFile(imagePolicyPath, "Image policy");
   const definitions = await loadSourceDefinitions(corpusLockPath);
-  await assertPreparedOutputDirectory(outputDirectory, definitions.map((definition) => definition.filename));
   await mkdir(outputDirectory, { recursive: true });
   await assertNoLinkTraversal(workspaceRoot, outputDirectory, "Output directory", "maintenance workspace root");
   await assertRealDirectory(outputDirectory, "Output directory");
 
   const lockPath = path.join(outputDirectory, ".index-build.lock");
-  const lockHandle = await acquireBuildLock(lockPath);
-  const nonce = `${process.pid}-${randomUUID()}`;
-  const tempDatabasePath = path.join(outputDirectory, `.mql5-docs.sqlite.tmp-${nonce}`);
-  const tempManifestPath = path.join(outputDirectory, `.manifest.json.tmp-${nonce}`);
-  const tempAssetsPath = path.join(outputDirectory, `.assets.tmp-${nonce}`);
+  const legacySameHostProof = typeof options.legacySameHostProof === "function"
+    ? options.legacySameHostProof
+    : options.reclaimDeadLegacyLock === true
+      ? (candidate) => proveLocalWindowsLockStorage(candidate, options.legacyLocalStorageProbe ?? null)
+      : null;
+  const lockLease = await acquireBuildLock(lockPath, {
+    legacySameHostProof,
+    probeProcess: options.lockProbeProcess,
+  });
+  const transactionPath = path.join(outputDirectory, BUILD_TRANSACTION_FILENAME);
+  const transactionToken = lockLease.ownerToken;
+  const tempDatabasePath = path.join(outputDirectory, `.mql5-docs.sqlite.candidate-${transactionToken}`);
+  const tempManifestPath = path.join(outputDirectory, `.manifest.json.candidate-${transactionToken}`);
+  const tempAssetsPath = path.join(outputDirectory, `.assets.candidate-${transactionToken}`);
   let database;
+  let primaryBuildError = null;
 
   try {
+    await recoverIndexBuildTransaction(outputDirectory);
+    await assertPreparedOutputDirectory(outputDirectory, definitions.map((definition) => definition.filename));
     const buildTimestamp = new Date().toISOString();
     const imagePolicy = await loadImagePolicy(imagePolicyPath);
     let sourceMetadata = options.sourceMetadata ?? {};
@@ -2927,14 +4067,13 @@ export async function buildIndex(projectRootInput, options = {}) {
       if (serializedManifest.database.sha256 !== databaseSha256) {
         throw new Error("Serialized manifest database hash verification failed.");
       }
-      await replaceBuildArtifacts(
-        tempDatabasePath,
-        databasePath,
-        tempManifestPath,
-        manifestPath,
-        tempAssetsPath,
-        assetsPath,
-      );
+      await publishIndexBuildTransaction({
+        outputDirectory,
+        databasePath: tempDatabasePath,
+        manifestPath: tempManifestPath,
+        assetsPath: tempAssetsPath,
+        transactionToken,
+      });
 
       return {
         databasePath,
@@ -2963,22 +4102,63 @@ export async function buildIndex(projectRootInput, options = {}) {
       }
       throw error;
     }
+  } catch (error) {
+    primaryBuildError = error;
+    throw error;
   } finally {
+    const cleanupErrors = [];
+    const cleanupRemove = typeof options.cleanupRemove === "function" ? options.cleanupRemove : rm;
     if (database) {
       try {
         database.close();
-      } catch {
-        // Preserve the original build error.
+      } catch (error) {
+        cleanupErrors.push(new Error(`Could not close the candidate database: ${error.message}`, { cause: error }));
       }
     }
-    await rm(tempDatabasePath, { force: true }).catch(() => {});
-    await rm(`${tempDatabasePath}-journal`, { force: true }).catch(() => {});
-    await rm(`${tempDatabasePath}-wal`, { force: true }).catch(() => {});
-    await rm(`${tempDatabasePath}-shm`, { force: true }).catch(() => {});
-    await rm(tempManifestPath, { force: true }).catch(() => {});
-    await rm(tempAssetsPath, { force: true, recursive: true }).catch(() => {});
-    await lockHandle.close().catch(() => {});
-    await unlink(lockPath).catch(() => {});
+    const transactionPresent = await pathExists(transactionPath);
+    if (!transactionPresent) {
+      for (const target of [
+        transactionTemporaryPath(outputDirectory, transactionToken),
+        tempDatabasePath,
+        `${tempDatabasePath}-journal`,
+        `${tempDatabasePath}-wal`,
+        `${tempDatabasePath}-shm`,
+        tempManifestPath,
+      ]) {
+        try {
+          await cleanupRemove(target, { force: true });
+        } catch (error) {
+          cleanupErrors.push(new Error(`Could not remove owner-bound candidate file ${target}: ${error.message}`, { cause: error }));
+        }
+      }
+      try {
+        await disposeOwnedAssetDirectory(
+          tempAssetsPath,
+          assetDisposalPath(outputDirectory, "candidate", transactionToken),
+        );
+      } catch (error) {
+        cleanupErrors.push(new Error(`Could not remove owner-bound candidate assets: ${error.message}`, { cause: error }));
+      }
+    }
+    if (cleanupErrors.length && !transactionPresent) {
+      try {
+        await lockLease.handle.close();
+      } catch (error) {
+        cleanupErrors.push(new Error(`Could not close the retained index build lock handle: ${error.message}`, { cause: error }));
+      }
+      const causes = primaryBuildError ? [primaryBuildError, ...cleanupErrors] : cleanupErrors;
+      throw new AggregateError(causes, "Index build cleanup failed; the strict owner lock was retained for safe dead-owner recovery.");
+    }
+    try {
+      await releaseBuildLock(lockLease);
+    } catch (error) {
+      const causes = primaryBuildError ? [primaryBuildError, ...cleanupErrors, error] : [...cleanupErrors, error];
+      throw new AggregateError(causes, "Index build lock release failed after cleanup.");
+    }
+    if (cleanupErrors.length) {
+      const causes = primaryBuildError ? [primaryBuildError, ...cleanupErrors] : cleanupErrors;
+      throw new AggregateError(causes, "Index build completed transaction recovery but encountered cleanup errors.");
+    }
   }
 }
 
@@ -2988,7 +4168,7 @@ export async function main(argv = process.argv.slice(2)) {
     process.stdout.write(
       "Usage: node src/indexer.mjs --root <projectRoot> [--source-directory <dir>] " +
         "[--workspace-root <dir>] [--extracted-directory <dir>] [--output-directory <dir>] [--corpus-lock <json>] " +
-        "[--source-metadata <json>] [--image-policy <json>]\n",
+        "[--source-metadata <json>] [--image-policy <json>] [--reclaim-dead-legacy-lock]\n",
     );
     return;
   }
@@ -3000,6 +4180,7 @@ export async function main(argv = process.argv.slice(2)) {
     corpusLockPath: arguments_.corpusLockPath || undefined,
     sourceMetadataPath: arguments_.sourceMetadataPath || undefined,
     imagePolicyPath: arguments_.imagePolicyPath || undefined,
+    reclaimDeadLegacyLock: arguments_.reclaimDeadLegacyLock,
   });
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }

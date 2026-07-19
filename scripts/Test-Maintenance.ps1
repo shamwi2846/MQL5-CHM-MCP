@@ -55,6 +55,9 @@ try {
         [IO.File]::WriteAllText($aliasHelper, $helperSource, (New-Object Text.UTF8Encoding($false)))
 
         $aliasLease = Enter-ExclusiveFileLock -Path $dosLockPath -TimeoutSeconds 5
+        if ([string]$aliasLease.Name -notlike 'Global\Mql5ChmMcp-*') {
+            throw "Maintenance lock was not created in the machine-global namespace: $($aliasLease.Name)"
+        }
         $aliasResult = Invoke-NativeCapture -FilePath (Get-Command pwsh).Source -Arguments @(
             '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $aliasHelper,
             (Join-Path $PSScriptRoot 'Common.ps1'), $volumeLockPath
@@ -453,7 +456,8 @@ try {
     [IO.File]::WriteAllText((Join-Path $rollbackProbeScripts 'IndexMaintenance.ps1'), @'
 function Add-ProbeCall { param([string]$ProjectRoot,[string]$Name) Add-Content -LiteralPath (Join-Path $ProjectRoot 'rollback-order.log') -Value $Name }
 function Resolve-FullPath { param([string]$Path,[switch]$MustExist,[string]$PathType) return [IO.Path]::GetFullPath($Path) }
-function Enter-ExclusiveFileLock { param([string]$Path,[int]$TimeoutSeconds) return [IO.File]::Open($Path,[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None) }
+function Assert-NoReparsePoint { param([string]$Root,[string]$Path) }
+function Enter-ExclusiveFileLock { param([string]$Path,[string]$IdentityRoot,[int]$TimeoutSeconds) $parent=Split-Path -Parent $Path;if(-not(Test-Path -LiteralPath $parent)){New-Item -ItemType Directory -Path $parent -Force|Out-Null};return [IO.File]::Open($Path,[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None) }
 function Repair-InterruptedMaintenanceArtifacts { param([string]$ProjectRoot) Add-ProbeCall $ProjectRoot 'artifacts' }
 function Convert-DevelopmentLegacyActivePointerForStageRecovery { param([string]$ProjectRoot) Add-ProbeCall $ProjectRoot 'legacy-convert'; return $null }
 function Repair-InterruptedRevisionStageInstall { param([string]$ProjectRoot) Add-ProbeCall $ProjectRoot 'stage'; return [pscustomobject]@{State='completed';Operation='rebuild';Revision=('c'*64)} }
@@ -470,7 +474,7 @@ function Clear-RevisionTransition { param([string]$ProjectRoot,[object]$Expected
     $rollbackOrder = @(Get-Content -LiteralPath (Join-Path $rollbackProbeRoot 'rollback-order.log'))
     $rollbackStageCall = [Array]::IndexOf($rollbackOrder,'stage')
     Assert-Fixture -Condition ($rollbackStageCall -gt [Array]::IndexOf($rollbackOrder,'artifacts') -and $rollbackStageCall -lt [Array]::IndexOf($rollbackOrder,'transition-read') -and $rollbackStageCall -lt [Array]::IndexOf($rollbackOrder,'integrity') -and $rollbackStageCall -lt [Array]::IndexOf($rollbackOrder,'transition-start')) -Message 'Rollback integration did not repair the pending stage transaction before reading or changing revision state.'
-    foreach($functionName in @('Test-PathWithinOrEqual','Test-PathsOverlap','Get-PhysicalPathDescriptor','Test-PhysicalDescriptorWithinOrEqual','Test-PhysicalDescriptorsEqual','Test-PhysicalDescriptorsOverlap','Test-PhysicalPathWithinOrEqual','Test-PhysicalPathsEqual','Test-PhysicalPathsOverlap','Assert-PackageOutputPlan','Reset-OwnedPackageStage','Assert-PackageZipMatchesStage','Publish-PackageZipAtomically')){
+    foreach($functionName in @('Test-PathWithinOrEqual','Test-PathsOverlap','Get-PhysicalPathDescriptor','Test-PhysicalDescriptorWithinOrEqual','Test-PhysicalDescriptorsEqual','Test-PhysicalDescriptorsOverlap','Test-PhysicalPathWithinOrEqual','Test-PhysicalPathsEqual','Test-PhysicalPathsOverlap','Assert-PackageOutputPlan','Reset-OwnedPackageStage','Assert-PackageZipMatchesStage','Test-JsonIntegerValue','Assert-PackageZipSidecar','Write-NewJsonDurable','Assert-PreparedPackageManifestShape','Repair-PackagePreparedOrphans','Repair-PackageZipPublicationContext','Publish-PackageZipAtomically')){
         $definition=$packageAst.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $functionName},$true)
         if($null -eq $definition){throw "Package safety helper '$functionName' is missing."}
         Invoke-Expression $definition.Extent.Text
@@ -480,6 +484,10 @@ function Clear-RevisionTransition { param([string]$ProjectRoot,[object]$Expected
     $protectedStageRejected=$false
     try{Assert-PackageOutputPlan -Root $developmentLayout -ReleaseRoot (Join-Path $developmentLayout 'scripts') -StageRoot (Join-Path $developmentLayout 'scripts\unsafe') -ZipPath (Join-Path $developmentLayout 'scripts\unsafe.zip') -ProtectedSources @((Join-Path $developmentLayout 'scripts'))|Out-Null}catch{$protectedStageRejected=$true}
     Assert-Fixture -Condition $protectedStageRejected -Message 'Package output inside a protected source subtree was accepted.'
+    $futureBuildOutput=Join-Path $developmentLayout ('build\future-parent-' + [Guid]::NewGuid().ToString('N') + '\portable-candidate-release')
+    $futureBuildPlan=Assert-PackageOutputPlan -Root $developmentLayout -ReleaseRoot $futureBuildOutput -StageRoot (Join-Path $futureBuildOutput 'package') -ZipPath (Join-Path $futureBuildOutput 'package.zip')
+    Assert-Fixture -Condition ([string]$futureBuildPlan.ReleaseRoot -ceq [IO.Path]::GetFullPath($futureBuildOutput)) -Message 'Package output planning rejected the clean-checkout default beneath an absent build parent.'
+    Assert-Fixture -Condition (-not (Test-Path -LiteralPath (Split-Path -Parent $futureBuildOutput))) -Message 'Package output planning created an ignored build parent before the maintenance mutex.'
     $ancestorStageRejected=$false
     try{Assert-PackageOutputPlan -Root $developmentLayout -ReleaseRoot $fixture -StageRoot $developmentLayout -ZipPath (Join-Path $fixture 'ancestor.zip')|Out-Null}catch{$ancestorStageRejected=$true}
     Assert-Fixture -Condition $ancestorStageRejected -Message 'Package output equal to/containing the project root was accepted.'
@@ -499,6 +507,12 @@ function Clear-RevisionTransition { param([string]$ProjectRoot,[object]$Expected
     [IO.File]::WriteAllText((Join-Path $ownedStage '.mql5-chm-package-root'),"mql5-chm-portable-package-v1`n",(New-Object Text.UTF8Encoding($false)))
     Reset-OwnedPackageStage -ReleaseRoot $ownedOutput -StageRoot $ownedStage|Out-Null
     Assert-Fixture -Condition ((Test-Path -LiteralPath (Join-Path $ownedStage '.mql5-chm-package-root')) -and -not (Test-Path -LiteralPath $sentinel)) -Message 'Owned package-stage reset failed.'
+    $ownedPayload=Join-Path $ownedStage 'payload.txt';[IO.File]::WriteAllText($ownedPayload,'owned-package-payload',(New-Object Text.UTF8Encoding($false)))
+    $ownedChecksumLines=@(
+        ((Get-FileHash -LiteralPath (Join-Path $ownedStage '.mql5-chm-package-root') -Algorithm SHA256).Hash.ToLowerInvariant()+' *.mql5-chm-package-root'),
+        ((Get-FileHash -LiteralPath $ownedPayload -Algorithm SHA256).Hash.ToLowerInvariant()+' *payload.txt')
+    )
+    [IO.File]::WriteAllText((Join-Path $ownedStage 'checksums.sha256'),(($ownedChecksumLines -join "`n")+"`n"),(New-Object Text.UTF8Encoding($false)))
     $existingZip=Join-Path $ownedOutput 'package.zip';[IO.File]::WriteAllText($existingZip,'known-good');$existingZipHash=(Get-FileHash -Algorithm SHA256 -LiteralPath $existingZip).Hash
     $zipFailureRejected=$false;try{Publish-PackageZipAtomically -ReleaseRoot $ownedOutput -StageRoot (Join-Path $ownedOutput 'missing-stage') -ZipPath $existingZip|Out-Null}catch{$zipFailureRejected=$true}
     Assert-Fixture -Condition ($zipFailureRejected -and (Get-FileHash -Algorithm SHA256 -LiteralPath $existingZip).Hash -ceq $existingZipHash) -Message 'Failed ZIP publication destroyed or changed the previous known-good ZIP.'
@@ -520,38 +534,20 @@ function Clear-RevisionTransition { param([string]$ProjectRoot,[object]$Expected
     Assert-Fixture -Condition ($mismatchedZipRejected -and (Get-FileHash -Algorithm SHA256 -LiteralPath $existingZip).Hash -ceq $existingZipHash) -Message 'A ZIP with the wrong immutable tree displaced the previous known-good ZIP.'
     Assert-Fixture -Condition (@(Get-ChildItem -LiteralPath $ownedOutput -Filter '.package-*.zip' -Force).Count -eq 0) -Message 'Rejected mismatched ZIP publication left temporary or backup debris.'
 
-    # Force failure after the atomic replacement, then force restoration to
-    # fail. The known-good backup must remain available for manual recovery.
-    $script:restoreFailureZip = [IO.Path]::GetFullPath($existingZip)
-    $script:forcePublishedHashMismatch = $true
-    function Get-FileHash {
-        [CmdletBinding()]
-        param([Parameter(Mandatory)][string]$LiteralPath,[string]$Algorithm='SHA256')
-        $actual = Microsoft.PowerShell.Utility\Get-FileHash -LiteralPath $LiteralPath -Algorithm $Algorithm
-        if ($script:forcePublishedHashMismatch -and [IO.Path]::GetFullPath($LiteralPath).Equals($script:restoreFailureZip,[StringComparison]::OrdinalIgnoreCase)) {
-            return [pscustomobject]@{ Algorithm=$actual.Algorithm; Hash=('0'*64); Path=$actual.Path }
-        }
-        return $actual
-    }
-    function Remove-Item {
-        [CmdletBinding()]
-        param([Parameter(Mandatory,Position=0)][string]$LiteralPath,[switch]$Force,[switch]$Recurse)
-        if ([IO.Path]::GetFullPath($LiteralPath).Equals($script:restoreFailureZip,[StringComparison]::OrdinalIgnoreCase)) { throw 'fixture restoration failure' }
-        Microsoft.PowerShell.Management\Remove-Item -LiteralPath $LiteralPath -Force:$Force -Recurse:$Recurse -ErrorAction Stop
-    }
-    try {
-        $restoreFailureRejected=$false;try{Publish-PackageZipAtomically -ReleaseRoot $ownedOutput -StageRoot $ownedStage -ZipPath $existingZip|Out-Null}catch{$restoreFailureRejected=$true}
-    } finally {
-        Microsoft.PowerShell.Management\Remove-Item Function:\Get-FileHash -ErrorAction SilentlyContinue
-        Microsoft.PowerShell.Management\Remove-Item Function:\Remove-Item -ErrorAction SilentlyContinue
-        Remove-Variable -Name restoreFailureZip -Scope Script -ErrorAction SilentlyContinue
-        Remove-Variable -Name forcePublishedHashMismatch -Scope Script -ErrorAction SilentlyContinue
-    }
-    $retainedBackups = @(Get-ChildItem -LiteralPath $ownedOutput -Filter '.package-*.backup.zip' -Force)
-    Assert-Fixture -Condition ($restoreFailureRejected -and $retainedBackups.Count -eq 1) -Message 'Failed ZIP restoration did not retain exactly one known-good backup.'
-    Microsoft.PowerShell.Management\Remove-Item -LiteralPath $existingZip -Force
-    [IO.File]::Move($retainedBackups[0].FullName,$existingZip)
-    Assert-Fixture -Condition ((Get-FileHash -Algorithm SHA256 -LiteralPath $existingZip).Hash -ceq $existingZipHash) -Message 'The retained ZIP backup was not the previous known-good package.'
+    # A legacy ZIP without a sidecar can be upgraded, after which malformed or
+    # mismatched pairs fail before publication changes either canonical file.
+    $publishedPair=Publish-PackageZipAtomically -ReleaseRoot $ownedOutput -StageRoot $ownedStage -ZipPath $existingZip
+    Assert-PackageZipSidecar -ZipPath $publishedPair.ZipPath -ManifestPath $publishedPair.ManifestPath|Out-Null
+    $publishedHash=(Get-FileHash -LiteralPath $publishedPair.ZipPath -Algorithm SHA256).Hash
+    $validSidecar=[IO.File]::ReadAllText($publishedPair.ManifestPath)
+    $tamperedSidecar=$validSidecar -replace '"sha256"\s*:\s*"[0-9a-f]{64}"','"sha256": "0000000000000000000000000000000000000000000000000000000000000000"'
+    [IO.File]::WriteAllText($publishedPair.ManifestPath,$tamperedSidecar,(New-Object Text.UTF8Encoding($false)))
+    $malformedPairRejected=$false;try{Publish-PackageZipAtomically -ReleaseRoot $ownedOutput -StageRoot $ownedStage -ZipPath $existingZip|Out-Null}catch{$malformedPairRejected=$true}
+    Assert-Fixture -Condition ($malformedPairRejected -and (Get-FileHash -LiteralPath $existingZip -Algorithm SHA256).Hash -ceq $publishedHash) -Message 'A mismatched existing ZIP/sidecar pair was silently overwritten.'
+    [IO.File]::WriteAllText($publishedPair.ManifestPath,($validSidecar -replace '"file"','"File"'),(New-Object Text.UTF8Encoding($false)))
+    $wrongCasePairRejected=$false;try{Publish-PackageZipAtomically -ReleaseRoot $ownedOutput -StageRoot $ownedStage -ZipPath $existingZip|Out-Null}catch{$wrongCasePairRejected=$true}
+    Assert-Fixture -Condition ($wrongCasePairRejected -and (Get-FileHash -LiteralPath $existingZip -Algorithm SHA256).Hash -ceq $publishedHash) -Message 'A ZIP sidecar with non-canonical property casing was accepted or changed the ZIP.'
+    [IO.File]::WriteAllText($publishedPair.ManifestPath,$validSidecar,(New-Object Text.UTF8Encoding($false)))
 
     # Simulate a process killed after creating an atomic JSON temporary but
     # before publication. Temp-only debris is disposable; backup-only debris
@@ -628,6 +624,50 @@ function Clear-RevisionTransition { param([string]$ProjectRoot,[object]$Expected
         }
     }finally{Set-Item Function:\Invoke-AtomicFileReplace -Value $originalAtomicReplace}
     Remove-Item -LiteralPath (Join-Path $fixture 'maintenance\revision-transition.json') -Force
+
+    # A hard kill while bytes are still being written leaves only the strict
+    # target-specific .writing name. It has never crossed the prepared-name
+    # boundary and is reclaimed without changing a valid canonical file.
+    foreach($writingCase in @(
+        [pscustomobject]@{Target=(Join-Path $fixture 'data\active.json');Canonical=$true},
+        [pscustomobject]@{Target=(Join-Path $fixture 'maintenance\update-status.json');Canonical=$true},
+        [pscustomobject]@{Target=(Join-Path $fixture 'maintenance\revision-transition.json');Canonical=$false},
+        [pscustomobject]@{Target=(Join-Path $fixture 'maintenance\revision-stage.json');Canonical=$false},
+        [pscustomobject]@{Target=(Join-Path $fixture 'checksums.sha256');Canonical=$false}
+    )){
+        $leaf=[IO.Path]::GetFileName($writingCase.Target)
+        $writing=Join-Path (Split-Path -Parent $writingCase.Target) (".$leaf.replace.writing-"+[Guid]::NewGuid().ToString('N'))
+        $before=if($writingCase.Canonical){[IO.File]::ReadAllBytes($writingCase.Target)}else{$null}
+        [IO.File]::WriteAllText($writing,'{"partial":',(New-Object Text.UTF8Encoding($false)))
+        Repair-InterruptedMaintenanceArtifacts -ProjectRoot $fixture
+        Assert-Fixture -Condition (-not (Test-Path -LiteralPath $writing)) -Message "Incomplete target-specific write was not reclaimed: $writing"
+        if($writingCase.Canonical){
+            Assert-Fixture -Condition ([Linq.Enumerable]::SequenceEqual([byte[]]$before,[byte[]][IO.File]::ReadAllBytes($writingCase.Target))) -Message "Incomplete write changed canonical bytes: $($writingCase.Target)"
+        }else{
+            Assert-Fixture -Condition (-not (Test-Path -LiteralPath $writingCase.Target)) -Message "Incomplete first write created a canonical target: $($writingCase.Target)"
+        }
+    }
+
+    # A fully flushed legacy/prepared temp can still be promoted, while a
+    # writing leaf that coexists with publication debris is ambiguous.
+    $transitionTarget=Join-Path $fixture 'maintenance\revision-transition.json'
+    $transitionLeaf=[IO.Path]::GetFileName($transitionTarget)
+    $transitionToken=[Guid]::NewGuid().ToString('N')
+    $transitionTemp=Join-Path (Split-Path -Parent $transitionTarget) (".$transitionLeaf.replace.tmp-$transitionToken")
+    $transitionJson=($transitionFixtureValue|ConvertTo-Json -Depth 20)+[Environment]::NewLine
+    [IO.File]::WriteAllText($transitionTemp,$transitionJson,(New-Object Text.UTF8Encoding($false)))
+    Repair-InterruptedMaintenanceArtifacts -ProjectRoot $fixture
+    Assert-Fixture -Condition ((Test-Path -LiteralPath $transitionTarget -PathType Leaf) -and -not (Test-Path -LiteralPath $transitionTemp)) -Message 'A complete prepared transition temp was not promoted.'
+    Remove-Item -LiteralPath $transitionTarget -Force
+    $ambiguousToken=[Guid]::NewGuid().ToString('N')
+    $ambiguousWriting=Join-Path (Split-Path -Parent $transitionTarget) (".$transitionLeaf.replace.writing-$ambiguousToken")
+    $ambiguousTemp=Join-Path (Split-Path -Parent $transitionTarget) (".$transitionLeaf.replace.tmp-$ambiguousToken")
+    [IO.File]::WriteAllText($ambiguousWriting,'partial',(New-Object Text.UTF8Encoding($false)))
+    [IO.File]::WriteAllText($ambiguousTemp,$transitionJson,(New-Object Text.UTF8Encoding($false)))
+    $ambiguousTargetWriteRejected=$false
+    try{Repair-InterruptedMaintenanceArtifacts -ProjectRoot $fixture}catch{$ambiguousTargetWriteRejected=$true}
+    Assert-Fixture -Condition ($ambiguousTargetWriteRejected -and (Test-Path -LiteralPath $ambiguousWriting) -and (Test-Path -LiteralPath $ambiguousTemp)) -Message 'Writing/prepared coexistence was not retained fail-closed.'
+    Remove-Item -LiteralPath $ambiguousWriting,$ambiguousTemp -Force
 
     $recoverablePointerBytes=[IO.File]::ReadAllBytes((Join-Path $fixture 'data\active.json'))
     try{
@@ -915,9 +955,9 @@ function Clear-RevisionTransition { param([string]$ProjectRoot,[object]$Expected
         '.mql5-chm-package-root','runtime\node.exe','runtime\LICENSE','app\server.mjs','app\indexer.mjs',
         'config\mql5-image-policy.json','config\mql5-query-expansions.json','data\active.json','maintenance\.update.lock',
         'Install-Codex.ps1','Rebuild-Index.ps1','Uninstall-Codex.ps1','Package-Portable.ps1','Check-DocumentationUpdates.ps1','Update-Documentation.ps1','Rollback-Documentation.ps1','README.md','SPEC.md',
-        'scripts\build.mjs','scripts\inspect-database.mjs','scripts\Common.ps1','scripts\IndexMaintenance.ps1','scripts\StageInstallRecovery.ps1','scripts\Install-Codex.ps1','scripts\Rebuild-Index.ps1','scripts\Uninstall-Codex.ps1','scripts\Package-Portable.ps1','scripts\Check-DocumentationUpdates.ps1','scripts\Update-Documentation.ps1','scripts\Rollback-Documentation.ps1','scripts\Test-Maintenance.ps1','scripts\Test-StageInstallRecovery.ps1',
-        'licenses\7ZIP-LICENSE.txt','licenses\CHEERIO-LICENSE.txt','licenses\ESBUILD-LICENSE.txt','licenses\ICONV-LITE-LICENSE.txt','licenses\JPEG-JS-LICENSE.txt','licenses\MCP-SDK-LICENSE.txt','licenses\NODE-LICENSE.txt','licenses\THIRD-PARTY-NOTICES.md','licenses\ZOD-LICENSE.txt',
-        'tools\7z.exe','tools\7z.dll',
+        'scripts\build.mjs','scripts\Generate-BundledNotices.mjs','scripts\inspect-database.mjs','scripts\Common.ps1','scripts\IndexMaintenance.ps1','scripts\SevenZipRuntime.ps1','scripts\StageInstallRecovery.ps1','scripts\Install-Codex.ps1','scripts\Rebuild-Index.ps1','scripts\Uninstall-Codex.ps1','scripts\Package-Portable.ps1','scripts\Check-DocumentationUpdates.ps1','scripts\Update-Documentation.ps1','scripts\Rollback-Documentation.ps1','scripts\Test-Maintenance.ps1','scripts\Test-StageInstallRecovery.ps1',
+        'licenses\7ZIP-LICENSE.txt','licenses\BUNDLED-NODE-NOTICES.txt','licenses\bundled-node-dependencies.json','licenses\bundled-node-notice-overrides.json','licenses\overrides\boolbase-1.0.0.txt','licenses\CHEERIO-LICENSE.txt','licenses\ESBUILD-LICENSE.txt','licenses\ICONV-LITE-LICENSE.txt','licenses\JPEG-JS-LICENSE.txt','licenses\MCP-SDK-LICENSE.txt','licenses\NODE-LICENSE.txt','licenses\THIRD-PARTY-NOTICES.md','licenses\ZOD-LICENSE.txt',
+        'tools\7z.exe','tools\7z.dll','tools\7zip.provenance.json',
         "revisions\$packageRevision\manifest.json", "revisions\$packageRevision\mql5-docs.sqlite", "revisions\$packageRevision\mql5.chm", "revisions\$packageRevision\mql5book.chm", "revisions\$packageRevision\neuronetworksbook.chm", "revisions\$packageRevision\corpus.lock.json", "revisions\$packageRevision\assets\mql5\$assetName"
     )
     foreach ($relative in $packageFixtureFiles | Where-Object { $_ -ne 'data\active.json' }) {
@@ -977,6 +1017,13 @@ function Clear-RevisionTransition { param([string]$ProjectRoot,[object]$Expected
         $missingRequiredScriptRejected=$false;try{Assert-PackageChecksums -ProjectRoot $packageFixture|Out-Null}catch{$missingRequiredScriptRejected=$true}
         Assert-Fixture -Condition $missingRequiredScriptRejected -Message 'Package verification accepted a package missing an essential maintenance script and its checksum entry.'
         [IO.File]::WriteAllBytes($commonFixturePath,$commonFixtureBytes);[IO.File]::WriteAllText((Join-Path $packageFixture 'checksums.sha256'),$originalChecksumText,(New-Object Text.UTF8Encoding($false)))
+        $sevenZipRuntimeFixturePath = Join-Path $packageFixture 'scripts\SevenZipRuntime.ps1'; $sevenZipRuntimeFixtureBytes = [IO.File]::ReadAllBytes($sevenZipRuntimeFixturePath)
+        Remove-Item -LiteralPath $sevenZipRuntimeFixturePath -Force
+        $withoutSevenZipRuntime = @($originalChecksumText -split "`r?`n" | Where-Object { $_ -and $_ -notmatch '(?i)\*scripts[/\\]SevenZipRuntime\.ps1$' })
+        [IO.File]::WriteAllLines((Join-Path $packageFixture 'checksums.sha256'), $withoutSevenZipRuntime, (New-Object Text.UTF8Encoding($false)))
+        $missingSevenZipRuntimeRejected=$false;try{Assert-PackageChecksums -ProjectRoot $packageFixture|Out-Null}catch{$missingSevenZipRuntimeRejected=$true}
+        Assert-Fixture -Condition $missingSevenZipRuntimeRejected -Message 'Package verification accepted a package missing SevenZipRuntime.ps1 and its checksum entry.'
+        [IO.File]::WriteAllBytes($sevenZipRuntimeFixturePath,$sevenZipRuntimeFixtureBytes);[IO.File]::WriteAllText((Join-Path $packageFixture 'checksums.sha256'),$originalChecksumText,(New-Object Text.UTF8Encoding($false)))
         $toolFixturePath = Join-Path $packageFixture 'tools\7z.dll'; $toolFixtureBytes = [IO.File]::ReadAllBytes($toolFixturePath)
         Remove-Item -LiteralPath $toolFixturePath -Force
         $withoutTool = @($originalChecksumText -split "`r?`n" | Where-Object { $_ -and $_ -notmatch '(?i)\*tools[/\\]7z\.dll$' })
@@ -984,13 +1031,16 @@ function Clear-RevisionTransition { param([string]$ProjectRoot,[object]$Expected
         $missingToolPairRejected=$false;try{Assert-PackageChecksums -ProjectRoot $packageFixture|Out-Null}catch{$missingToolPairRejected=$true}
         Assert-Fixture -Condition $missingToolPairRejected -Message 'Package verification accepted a missing/mixed 7-Zip tool pair.'
         [IO.File]::WriteAllBytes($toolFixturePath,$toolFixtureBytes);[IO.File]::WriteAllText((Join-Path $packageFixture 'checksums.sha256'),$originalChecksumText,(New-Object Text.UTF8Encoding($false)))
-        $heldPackageLock = Enter-ExclusiveFileLock -Path (Join-Path $packageFixture 'maintenance\.update.lock') -TimeoutSeconds 5
+        $heldPackageLock = Enter-ExclusiveFileLock -Path (Join-Path $packageFixture 'maintenance\.update.lock') -IdentityRoot $packageFixture -TimeoutSeconds 5
         try { Assert-PackageChecksums -ProjectRoot $packageFixture | Out-Null } finally { $heldPackageLock.Dispose() }
         $packageLockPath = Join-Path $packageFixture 'maintenance\.update.lock'
         Remove-Item -LiteralPath $packageLockPath -Force
         $missingLockRejected = $false
-        $missingLockLease = Enter-ExclusiveFileLock -Path $packageLockPath -TimeoutSeconds 5
-        try { Assert-PackageChecksums -ProjectRoot $packageFixture | Out-Null } catch { $missingLockRejected = $true } finally { $missingLockLease.Dispose() }
+        $missingLockLease = $null
+        try {
+            $missingLockLease = Enter-ExclusiveFileLock -Path $packageLockPath -IdentityRoot $packageFixture -TimeoutSeconds 5
+            Assert-PackageChecksums -ProjectRoot $packageFixture | Out-Null
+        } catch { $missingLockRejected = $true } finally { if ($null -ne $missingLockLease) { $missingLockLease.Dispose() } }
         Assert-Fixture -Condition $missingLockRejected -Message 'Package verification silently recreated or accepted a missing immutable lock marker.'
         [IO.File]::WriteAllBytes($packageLockPath, (New-Object byte[] 0))
         $unlistedPackageFile = Join-Path $packageFixture 'unlisted-root-file.txt'; [IO.File]::WriteAllText($unlistedPackageFile,'not checksummed')

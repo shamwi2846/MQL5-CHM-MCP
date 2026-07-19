@@ -217,8 +217,8 @@ try {
         '.mql5-chm-package-root','runtime/node.exe','runtime/LICENSE','app/server.mjs','app/indexer.mjs',
         'config/mql5-image-policy.json','config/mql5-query-expansions.json','maintenance/.update.lock',
         'Install-Codex.ps1','Rebuild-Index.ps1','Uninstall-Codex.ps1','Package-Portable.ps1','Check-DocumentationUpdates.ps1','Update-Documentation.ps1','Rollback-Documentation.ps1','README.md','SPEC.md',
-        'scripts/build.mjs','scripts/inspect-database.mjs','scripts/Common.ps1','scripts/IndexMaintenance.ps1','scripts/StageInstallRecovery.ps1','scripts/Install-Codex.ps1','scripts/Rebuild-Index.ps1','scripts/Uninstall-Codex.ps1','scripts/Package-Portable.ps1','scripts/Check-DocumentationUpdates.ps1','scripts/Update-Documentation.ps1','scripts/Rollback-Documentation.ps1','scripts/Test-Maintenance.ps1','scripts/Test-StageInstallRecovery.ps1',
-        'licenses/7ZIP-LICENSE.txt','licenses/CHEERIO-LICENSE.txt','licenses/ESBUILD-LICENSE.txt','licenses/ICONV-LITE-LICENSE.txt','licenses/JPEG-JS-LICENSE.txt','licenses/MCP-SDK-LICENSE.txt','licenses/NODE-LICENSE.txt','licenses/THIRD-PARTY-NOTICES.md','licenses/ZOD-LICENSE.txt','tools/7z.exe','tools/7z.dll'
+        'scripts/build.mjs','scripts/Generate-BundledNotices.mjs','scripts/inspect-database.mjs','scripts/Common.ps1','scripts/IndexMaintenance.ps1','scripts/SevenZipRuntime.ps1','scripts/StageInstallRecovery.ps1','scripts/Install-Codex.ps1','scripts/Rebuild-Index.ps1','scripts/Uninstall-Codex.ps1','scripts/Package-Portable.ps1','scripts/Check-DocumentationUpdates.ps1','scripts/Update-Documentation.ps1','scripts/Rollback-Documentation.ps1','scripts/Test-Maintenance.ps1','scripts/Test-StageInstallRecovery.ps1',
+        'licenses/7ZIP-LICENSE.txt','licenses/BUNDLED-NODE-NOTICES.txt','licenses/bundled-node-dependencies.json','licenses/bundled-node-notice-overrides.json','licenses/overrides/boolbase-1.0.0.txt','licenses/CHEERIO-LICENSE.txt','licenses/ESBUILD-LICENSE.txt','licenses/ICONV-LITE-LICENSE.txt','licenses/JPEG-JS-LICENSE.txt','licenses/MCP-SDK-LICENSE.txt','licenses/NODE-LICENSE.txt','licenses/THIRD-PARTY-NOTICES.md','licenses/ZOD-LICENSE.txt','tools/7z.exe','tools/7z.dll','tools/7zip.provenance.json'
     )
     foreach ($relative in $boundaryRequired) {
         $path = Join-Path $boundaryFixture $relative.Replace('/','\'); $parent = Split-Path -Parent $path
@@ -491,6 +491,17 @@ try {
     Write-JsonAtomic -Path (Join-Path $fixture "revisions\$baseRevision\manifest.json") -Value (New-StageFixtureManifest -Revision $baseRevision -CorpusRevision $baseCorpus) -ConfinementRoot $fixture
     Set-ActiveRevisionPointer -ProjectRoot $fixture -ActiveRevision $baseRevision -PreviousRevision $null -SchemaVersion 2 -ActivatedAt '2026-07-18T11:00:00.0000000Z' | Out-Null
 
+    $reportWritingRevision=('e'*64)
+    $reportWritingRoot=Join-Path $fixture "revisions\$reportWritingRevision"
+    New-Item -ItemType Directory -Path $reportWritingRoot|Out-Null
+    Write-JsonAtomic -Path (Join-Path $reportWritingRoot 'manifest.json') -Value (New-StageFixtureManifest -Revision $reportWritingRevision -CorpusRevision $candidateCorpus) -ConfinementRoot $fixture
+    $reportWritingManifestHash=(Get-FileHash -LiteralPath (Join-Path $reportWritingRoot 'manifest.json') -Algorithm SHA256).Hash
+    $reportWritingPath=Join-Path $reportWritingRoot '.stage-report.json.replace.writing-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
+    [IO.File]::WriteAllText($reportWritingPath,'{"partial":',(New-Object Text.UTF8Encoding($false)))
+    Repair-InterruptedMaintenanceArtifacts -ProjectRoot $fixture
+    Assert-StageFixture -Condition ((Test-Path -LiteralPath $reportWritingRoot -PathType Container) -and (Get-FileHash -LiteralPath (Join-Path $reportWritingRoot 'manifest.json') -Algorithm SHA256).Hash -ceq $reportWritingManifestHash -and -not (Test-Path -LiteralPath $reportWritingPath) -and -not (Test-Path -LiteralPath (Join-Path $reportWritingRoot 'stage-report.json'))) -Message 'Interrupted first stage-report write damaged its revision or was not reclaimed before publication.'
+    Remove-SafeDirectory -ConfinementRoot (Join-Path $fixture 'revisions') -Path $reportWritingRoot
+
     # Red/green interruption point 1: the intent was durable but publication
     # never happened. Recovery must cancel only that exact pending intent.
     $candidate = New-StageFixtureCandidate -Root $fixture -Revision $candidateRevision -CorpusRevision $candidateCorpus
@@ -729,7 +740,7 @@ Write-StagedRevisionReportValue -RevisionRoot $RevisionRoot -StageReport $journa
     $portableLoadRoot = Join-Path $fixture 'portable path with spaces'
     New-Item -ItemType Directory -Path (Join-Path $portableLoadRoot 'scripts') -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $portableLoadRoot 'maintenance') -Force | Out-Null
-    foreach ($name in @('Common.ps1','IndexMaintenance.ps1','StageInstallRecovery.ps1')) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $portableLoadRoot "scripts\$name") }
+    foreach ($name in @('Common.ps1','SevenZipRuntime.ps1','IndexMaintenance.ps1','StageInstallRecovery.ps1')) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $portableLoadRoot "scripts\$name") }
     $portableLoadHelper = Join-Path $fixture 'portable-load.ps1'
     [IO.File]::WriteAllText($portableLoadHelper, @'
 param([string]$PortableRoot)

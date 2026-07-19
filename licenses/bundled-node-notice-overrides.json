@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "overrides": [
+    {
+      "name": "boolbase",
+      "version": "1.0.0",
+      "instance": "node_modules/boolbase",
+      "license": "ISC",
+      "notice_file": "licenses/overrides/boolbase-1.0.0.txt"
+    }
+  ]
+}

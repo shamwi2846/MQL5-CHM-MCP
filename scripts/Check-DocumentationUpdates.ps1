@@ -11,14 +11,14 @@ $ErrorActionPreference = 'Stop'
 
 $root = Resolve-FullPath -Path $ProjectRoot -MustExist -PathType Container
 Assert-NoReparsePoint -Root $root -Path $root
-$maintenanceRoot = Join-Path $root 'maintenance'; if (-not (Test-Path -LiteralPath $maintenanceRoot -PathType Container)) { New-Item -ItemType Directory -Path $maintenanceRoot | Out-Null }
+$maintenanceRoot = Join-Path $root 'maintenance'
 Assert-NoReparsePoint -Root $root -Path $maintenanceRoot
 $lock = $null; $tempBase = Resolve-FullPath -Path ([IO.Path]::GetTempPath()) -MustExist -PathType Container
 Assert-NoReparsePoint -Root $tempBase -Path $tempBase
 $downloadRoot = Join-Path $tempBase ('mql5-chm-update-check-' + [Guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Path $downloadRoot | Out-Null
 try {
-    $lock = Enter-ExclusiveFileLock -Path (Join-Path $maintenanceRoot '.update.lock') -TimeoutSeconds $LockTimeoutSeconds
+    $lock = Enter-ExclusiveFileLock -Path (Join-Path $maintenanceRoot '.update.lock') -IdentityRoot $root -TimeoutSeconds $LockTimeoutSeconds
+    New-Item -ItemType Directory -Path $downloadRoot -ErrorAction Stop | Out-Null
     Repair-InterruptedMaintenanceArtifacts -ProjectRoot $root
     Convert-DevelopmentLegacyActivePointerForStageRecovery -ProjectRoot $root | Out-Null
     Repair-InterruptedRevisionStageInstall -ProjectRoot $root | Out-Null

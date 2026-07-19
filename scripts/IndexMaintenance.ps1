@@ -2,46 +2,145 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 . (Join-Path $PSScriptRoot 'Common.ps1')
+. (Join-Path $PSScriptRoot 'SevenZipRuntime.ps1')
 . (Join-Path $PSScriptRoot 'StageInstallRecovery.ps1')
 
-function Wait-ExtractionStable {
+function ConvertFrom-SevenZipSltInventory {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string]$Path,
-        [int]$ExpectedHtmlCount = 0,
-        [ValidateRange(10,1800)][int]$TimeoutSeconds = 300,
-        [ValidateRange(2,20)][int]$StablePolls = 8
+        [Parameter(Mandatory)][AllowEmptyString()][string[]]$Lines,
+        [Parameter(Mandatory)][string[]]$IndexExtensions,
+        [string]$Context = '7-Zip CHM listing'
     )
-    $timer = [Diagnostics.Stopwatch]::StartNew(); $last = ''; $stable = 0
-    while ($timer.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
-        $html = @(Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in @('.htm','.html') })
-        [int64]$bytes = 0; foreach ($file in $html) { $bytes += $file.Length }
-        $signature = "$($html.Count):$bytes"
-        $countAccepted = $html.Count -gt 0 -and ($ExpectedHtmlCount -le 0 -or $html.Count -eq $ExpectedHtmlCount)
-        if ($countAccepted -and $signature -eq $last) { $stable++; if ($stable -ge $StablePolls) { return $html.Count } } else { $stable = 0; $last = $signature }
-        Start-Sleep -Milliseconds 250
+    $extensionSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($extension in $IndexExtensions) {
+        $normalizedExtension = ([string]$extension).ToLowerInvariant()
+        if ($normalizedExtension -cnotmatch '^\.[a-z0-9]+$') { throw "$Context contains an invalid index extension '$extension'." }
+        [void]$extensionSet.Add($normalizedExtension)
     }
-    $expectation = if ($ExpectedHtmlCount -gt 0) { "exactly $ExpectedHtmlCount" } else { 'a non-zero stable number of' }
-    throw "Extraction did not reach $expectation HTML topics within $TimeoutSeconds seconds: $Path"
-}
+    foreach ($required in @('.htm','.html','.hhc','.hhk')) {
+        if (-not $extensionSet.Contains($required)) { throw "$Context is missing required index extension '$required'." }
+    }
 
-function Resolve-SevenZipExtractor {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Root)
-    $candidates = @((Join-Path $Root 'tools\7z.exe'),(Join-Path $Root 'tools\7za.exe'),'C:\Program Files\7-Zip\7z.exe','C:\Program Files\NVIDIA Corporation\NVIDIA App\7z.exe')
-    foreach ($candidate in $candidates) {
-        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-            $full = Resolve-FullPath -Path $candidate -MustExist -PathType Leaf
-            $probe = Invoke-NativeCapture -FilePath $full -Arguments @('i')
-            if ($probe.ExitCode -eq 0 -and $probe.Text -match '(?im)^\s*.*Chm\s+chm\b') { return $full }
+    $separator = -1
+    for ($index = 0; $index -lt $Lines.Count; $index++) {
+        if ([string]$Lines[$index] -ceq '----------') { $separator = $index; break }
+    }
+    if ($separator -lt 0) { throw "$Context is invalid: the archive-entry separator is missing." }
+    $allowedTailWarning = $false
+    for ($index = 0; $index -lt $separator; $index++) {
+        if ([string]$Lines[$index] -cne 'WARNINGS:') { continue }
+        if ($allowedTailWarning -or $index + 3 -ge $separator -or
+            [string]$Lines[$index + 1] -cne 'There are data after the end of archive' -or
+            [string]$Lines[$index + 2] -cnotmatch '^Physical Size = \d+$' -or
+            [string]$Lines[$index + 3] -cnotmatch '^Tail Size = ([1-9]\d*)$' -or [int64]$Matches[1] -gt 1048576) {
+            throw "$Context reports an unsupported archive warning."
+        }
+        $allowedTailWarning = $true
+    }
+
+    $records = New-Object 'System.Collections.Generic.List[object]'
+    $record = @{}
+    for ($index = $separator + 1; $index -le $Lines.Count; $index++) {
+        $line = if ($index -eq $Lines.Count) { '' } else { [string]$Lines[$index] }
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            if ($record.Count -gt 0) { [void]$records.Add([hashtable]$record); $record = @{} }
+            continue
+        }
+        if ($record.Count -eq 0 -and $line -match '^Warnings: 0$') {
+            if ($allowedTailWarning) { throw "$Context warning header conflicts with its zero-warning summary." }
+            break
+        }
+        if ($record.Count -eq 0 -and $line -match '^Warnings: 1$') {
+            if (-not $allowedTailWarning) { throw "$Context reports an unsupported archive-listing warning." }
+            break
+        }
+        if ($record.Count -eq 0 -and $line -match '^Warnings: [2-9]\d*$') { throw "$Context reports multiple archive-listing warnings: $line" }
+        if ($record.Count -eq 0 -and $line -match '^Errors: [1-9]\d*$') { throw "$Context reports archive-listing errors: $line" }
+        if ($line -notmatch '^([^=]+?) = (.*)$') { throw "$Context contains an invalid archive record line: $line" }
+        $name = $Matches[1].Trim(); $value = $Matches[2]
+        if ($record.ContainsKey($name)) { throw "$Context contains duplicate '$name' fields in one archive record." }
+        $record[$name] = $value
+    }
+    if ($records.Count -eq 0) { throw "$Context contains no archive entries." }
+
+    $seen = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
+    $entries = New-Object 'System.Collections.Generic.List[object]'
+    $invalidNameCharacters = [IO.Path]::GetInvalidFileNameChars()
+    [int]$htmlCount = 0
+    foreach ($archiveRecord in $records) {
+        if (-not $archiveRecord.ContainsKey('Path') -or -not $archiveRecord.ContainsKey('Size')) { throw "$Context contains an invalid archive record without Path and Size." }
+        $archivePath = [string]$archiveRecord['Path']
+        if ([string]::IsNullOrWhiteSpace($archivePath) -or $archivePath.IndexOf([char]0) -ge 0 -or $archivePath -match '[\x00-\x1f]') { throw "$Context contains an invalid archive path." }
+        $normalizedPath = $archivePath.Replace('\','/')
+        if ($normalizedPath.StartsWith('/') -or $normalizedPath.StartsWith('//') -or $normalizedPath -match '^[A-Za-z]:') { throw "$Context contains a rooted archive path: $archivePath" }
+        $segments = @($normalizedPath.Split([char]'/'))
+        if ($segments.Count -eq 0 -or @($segments | Where-Object { [string]::IsNullOrEmpty($_) }).Count -gt 0) { throw "$Context contains an invalid archive path: $archivePath" }
+        if (@($segments | Where-Object { $_ -ceq '.' -or $_ -ceq '..' }).Count -gt 0) { throw "$Context contains a traversal archive path: $archivePath" }
+        foreach ($segment in $segments) {
+            if ($segment.IndexOfAny($invalidNameCharacters) -ge 0 -or $segment.EndsWith(' ') -or $segment.EndsWith('.') -or $segment -match '^(?i:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)') {
+                throw "$Context contains an invalid archive path: $archivePath"
+            }
+        }
+
+        $existing = $null
+        if ($seen.TryGetValue($normalizedPath, [ref]$existing)) {
+            if ([string]$existing -ceq $normalizedPath) { throw "$Context contains a duplicate archive path: $normalizedPath" }
+            throw "$Context contains a case collision between '$existing' and '$normalizedPath'."
+        }
+        $seen.Add($normalizedPath, $normalizedPath)
+
+        $sizeText = [string]$archiveRecord['Size']; [int64]$size = 0
+        if ($sizeText -cnotmatch '^\d+$' -or -not [int64]::TryParse($sizeText, [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$size)) {
+            throw "$Context contains an invalid size for '$normalizedPath': $sizeText"
+        }
+        $extension = [IO.Path]::GetExtension($normalizedPath).ToLowerInvariant()
+        if ($extensionSet.Contains($extension)) {
+            [void]$entries.Add([pscustomobject]@{ Path=$normalizedPath; Size=$size })
+            if ($extension -ceq '.htm' -or $extension -ceq '.html') { $htmlCount++ }
         }
     }
-    return $null
+    if ($htmlCount -le 0) { throw "$Context contains no HTML topics." }
+    return [pscustomobject]@{ Entries=@($entries | Sort-Object Path); Extensions=@($extensionSet | Sort-Object); HtmlCount=$htmlCount }
 }
 
-function Get-ChmHtmlTopicCount {
+function Get-ChmIndexInputExtensions {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ProjectRoot)
+    $root = Resolve-FullPath -Path $ProjectRoot -MustExist -PathType Container
+    $policy = Read-JsonFile -Path (Join-Path $root 'config\mql5-image-policy.json') -Context 'MQL5 image policy'
+    $catalogProperty = $policy.PSObject.Properties['catalog_extensions']
+    if ($null -eq $catalogProperty -or $catalogProperty.Value -is [string] -or -not ($catalogProperty.Value -is [Collections.IEnumerable])) {
+        throw 'MQL5 image policy catalog_extensions must be an array.'
+    }
+    $extensions = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($required in @('.htm','.html','.hhc','.hhk')) { [void]$extensions.Add($required) }
+    foreach ($extension in @($catalogProperty.Value)) {
+        $value = ([string]$extension).ToLowerInvariant()
+        if ($value -cnotmatch '^\.[a-z0-9]+$') { throw "MQL5 image policy contains invalid catalog extension '$extension'." }
+        if (-not $extensions.Add($value)) { throw "MQL5 image policy contains duplicate catalog extension '$extension'." }
+    }
+    return @($extensions | Sort-Object)
+}
+
+function Get-CanonicalImagePolicySha256 {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ProjectRoot)
+    $root = Resolve-FullPath -Path $ProjectRoot -MustExist -PathType Container
+    $policyPath = Resolve-FullPath -Path (Join-Path $root 'config\mql5-image-policy.json') -MustExist -PathType Leaf
+    Assert-NoReparsePoint -Root $root -Path $policyPath
+    $utf8 = New-Object Text.UTF8Encoding($false,$true)
+    try { $text = [IO.File]::ReadAllText($policyPath,$utf8) } catch { throw "MQL5 image policy is not valid UTF-8: $($_.Exception.Message)" }
+    $canonicalText = $text.Replace("`r`n","`n").Replace("`r","`n")
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($utf8.GetBytes($canonicalText)))).Replace('-','').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+}
+
+function Get-ChmIndexInputInventory {
     [CmdletBinding()]
     param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
         [Parameter(Mandatory)][string]$SevenZip,
         [Parameter(Mandatory)][string]$ChmPath
     )
@@ -49,12 +148,249 @@ function Get-ChmHtmlTopicCount {
     $archive = Resolve-FullPath -Path $ChmPath -MustExist -PathType Leaf
     $listing = Invoke-NativeCapture -FilePath $extractor -Arguments @('l','-slt',$archive)
     if ($listing.ExitCode -ne 0) { throw "Could not enumerate CHM contents before extraction: $archive. $($listing.Text)" }
-    $paths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    foreach ($line in $listing.Lines) {
-        if ($line -match '^Path = (.+\.(?:htm|html))$') { [void]$paths.Add($Matches[1].Replace('\','/')) }
+    $extensions = Get-ChmIndexInputExtensions -ProjectRoot $ProjectRoot
+    return ConvertFrom-SevenZipSltInventory -Lines $listing.Lines -IndexExtensions $extensions -Context "CHM directory listing '$archive'"
+}
+
+function Get-ExtractionClosureState {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][object]$Inventory)
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return [pscustomobject]@{ Complete=$false; Digest=$null; HtmlCount=0; Reason='candidate directory does not exist' } }
+    $root = Resolve-FullPath -Path $Path -MustExist -PathType Container
+    $reparse = @(Get-ChildItem -LiteralPath $root -Recurse -Force -ErrorAction Stop | Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 })
+    if ($reparse.Count -gt 0) { throw "Extraction candidate contains a reparse point: $($reparse[0].FullName)" }
+
+    $extensionSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($extension in @($Inventory.Extensions)) { [void]$extensionSet.Add(([string]$extension).ToLowerInvariant()) }
+    $expected = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in @($Inventory.Entries)) {
+        $entryPath = [string]$entry.Path
+        if ($expected.ContainsKey($entryPath)) { throw "Extraction inventory contains a duplicate path: $entryPath" }
+        $expected.Add($entryPath, $entry)
     }
-    if ($paths.Count -le 0) { throw "CHM directory listing contains no HTML topics: $archive" }
-    return $paths.Count
+    $actual = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($file in Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction Stop) {
+        if (-not $extensionSet.Contains($file.Extension.ToLowerInvariant())) { continue }
+        $relative = $file.FullName.Substring($root.TrimEnd('\','/').Length).TrimStart('\','/').Replace('\','/')
+        if ($actual.ContainsKey($relative)) { throw "Extraction candidate contains a case-colliding path: $relative" }
+        $actual.Add($relative, $file)
+        if (-not $expected.ContainsKey($relative)) { return [pscustomobject]@{ Complete=$false; Digest=$null; HtmlCount=0; Reason="unexpected index input '$relative'" } }
+    }
+    if ($actual.Count -ne $expected.Count) { return [pscustomobject]@{ Complete=$false; Digest=$null; HtmlCount=0; Reason="expected $($expected.Count) index inputs but found $($actual.Count)" } }
+
+    $builder = [Text.StringBuilder]::new(); $fileSha = [Security.Cryptography.SHA256]::Create()
+    try {
+        foreach ($entry in @($Inventory.Entries | Sort-Object Path)) {
+            $entryPath = [string]$entry.Path; $file = $null
+            if (-not $actual.TryGetValue($entryPath, [ref]$file)) { return [pscustomobject]@{ Complete=$false; Digest=$null; HtmlCount=0; Reason="missing index input '$entryPath'" } }
+            $expectedSize = [int64]$entry.Size
+            if ([int64]$file.Length -ne $expectedSize) { return [pscustomobject]@{ Complete=$false; Digest=$null; HtmlCount=0; Reason="size mismatch for '$entryPath'" } }
+            $stream = $null
+            try {
+                $stream = [IO.File]::Open($file.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+                $fileSha.Initialize(); $fileHash = ([BitConverter]::ToString($fileSha.ComputeHash($stream))).Replace('-','').ToLowerInvariant()
+            } catch {
+                return [pscustomobject]@{ Complete=$false; Digest=$null; HtmlCount=0; Reason="could not hash '$entryPath'" }
+            } finally {
+                if ($null -ne $stream) { $stream.Dispose() }
+            }
+            $afterHash = Get-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+            if ([int64]$afterHash.Length -ne $expectedSize) { return [pscustomobject]@{ Complete=$false; Digest=$null; HtmlCount=0; Reason="size changed while hashing '$entryPath'" } }
+            [void]$builder.Append($entryPath).Append([char]0).Append($expectedSize).Append([char]0).Append($fileHash).Append("`n")
+        }
+    } finally { $fileSha.Dispose() }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $digest = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($builder.ToString())))).Replace('-','').ToLowerInvariant() } finally { $sha.Dispose() }
+    return [pscustomobject]@{ Complete=$true; Digest=$digest; HtmlCount=[int]$Inventory.HtmlCount; Reason='' }
+}
+
+function Wait-ExtractionStable {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][object]$Inventory,
+        [ValidateRange(1,1800)][int]$TimeoutSeconds = 300,
+        [ValidateRange(2,20)][int]$StablePolls = 2,
+        [ValidateRange(1,1000)][int]$PollMilliseconds = 250
+    )
+    $timer = [Diagnostics.Stopwatch]::StartNew(); $lastDigest = $null; $stableSamples = 0; $lastReason = 'not inspected'
+    while ($timer.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        $state = Get-ExtractionClosureState -Path $Path -Inventory $Inventory
+        $lastReason = [string]$state.Reason
+        if ([bool]$state.Complete) {
+            if ($null -ne $lastDigest -and [string]$state.Digest -ceq [string]$lastDigest) { $stableSamples++ } else { $lastDigest = [string]$state.Digest; $stableSamples = 1 }
+            if ($stableSamples -ge $StablePolls) { return $state }
+        } else {
+            $lastDigest = $null; $stableSamples = 0
+        }
+        Start-Sleep -Milliseconds $PollMilliseconds
+    }
+    throw "Extraction did not reach a stable exact index-input closure within $TimeoutSeconds seconds: $Path. Last state: $lastReason"
+}
+
+function New-VerifiedExtractionSnapshot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$CandidatePath,
+        [Parameter(Mandatory)][string]$SnapshotRoot,
+        [Parameter(Mandatory)][object]$Inventory,
+        [ValidateRange(1,1800)][int]$TimeoutSeconds = 300,
+        [ValidateRange(2,20)][int]$StablePolls = 2,
+        [ValidateRange(1,1000)][int]$PollMilliseconds = 250,
+        [scriptblock]$AfterCopyHook
+    )
+    $candidate = Resolve-FullPath -Path $CandidatePath -MustExist -PathType Container
+    $snapshotRootFull = Resolve-FullPath -Path $SnapshotRoot -MustExist -PathType Container
+    $stable = Wait-ExtractionStable -Path $candidate -Inventory $Inventory -TimeoutSeconds $TimeoutSeconds -StablePolls $StablePolls -PollMilliseconds $PollMilliseconds
+    $snapshot = Assert-PathWithin -Root $snapshotRootFull -Path (Join-Path $snapshotRootFull ('.extract-snapshot-' + [Guid]::NewGuid().ToString('N')))
+    try {
+        New-Item -ItemType Directory -Path $snapshot -ErrorAction Stop | Out-Null
+        foreach ($entry in @($Inventory.Entries | Sort-Object Path)) {
+            $relative = ([string]$entry.Path).Replace('/', [IO.Path]::DirectorySeparatorChar)
+            $source = Join-Path $candidate $relative; $sourceItem = Get-Item -LiteralPath $source -Force -ErrorAction Stop
+            if ($sourceItem.PSIsContainer -or ($sourceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Extraction input is not a regular file: $source" }
+            $target = Join-Path $snapshot $relative; $parent = Split-Path -Parent $target
+            if (-not (Test-Path -LiteralPath $parent -PathType Container)) { New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null }
+            Copy-Item -LiteralPath $source -Destination $target -Force -ErrorAction Stop
+            if ($null -ne $AfterCopyHook) { & $AfterCopyHook $source $target $entry }
+        }
+        $copied = Get-ExtractionClosureState -Path $snapshot -Inventory $Inventory
+        if (-not [bool]$copied.Complete -or [string]$copied.Digest -cne [string]$stable.Digest) { throw 'Extraction source changed while its immutable snapshot was being created.' }
+        return [pscustomobject]@{ Path=$snapshot; Digest=[string]$copied.Digest; HtmlCount=[int]$copied.HtmlCount }
+    } catch {
+        if (Test-Path -LiteralPath $snapshot -PathType Container) { Remove-SafeDirectory -ConfinementRoot $snapshotRootFull -Path $snapshot }
+        throw
+    }
+}
+
+function Resolve-SevenZipExtractor {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Root)
+    return [string](Ensure-PinnedSevenZipRuntime -ProjectRoot $Root).Extractor
+}
+
+function Get-ChmHtmlTopicCount {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$SevenZip,
+        [Parameter(Mandatory)][string]$ChmPath,
+        [string]$ProjectRoot = (Split-Path -Parent $PSScriptRoot)
+    )
+    return [int](Get-ChmIndexInputInventory -ProjectRoot $ProjectRoot -SevenZip $SevenZip -ChmPath $ChmPath).HtmlCount
+}
+
+function ConvertTo-WindowsNativeArgument {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+    if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') { return $Value }
+    $builder = New-Object Text.StringBuilder
+    [void]$builder.Append('"')
+    $slashes = 0
+    foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq '\') {
+            $slashes++
+            continue
+        }
+        if ($character -eq '"') {
+            [void]$builder.Append(('\' * (($slashes * 2) + 1)))
+            [void]$builder.Append('"')
+            $slashes = 0
+            continue
+        }
+        if ($slashes -gt 0) { [void]$builder.Append(('\' * $slashes)); $slashes = 0 }
+        [void]$builder.Append($character)
+    }
+    if ($slashes -gt 0) { [void]$builder.Append(('\' * ($slashes * 2))) }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function Get-NativeDiagnosticTail {
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$Text,[ValidateRange(1,32768)][int]$MaximumCharacters = 4096)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
+    $trimmed = $Text.Trim()
+    if ($trimmed.Length -le $MaximumCharacters) { return $trimmed }
+    return '[output tail] ' + $trimmed.Substring($trimmed.Length - $MaximumCharacters)
+}
+
+function Invoke-NativeProcessWithTimeout {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$Arguments = @(),
+        [ValidateRange(1,1800)][int]$TimeoutSeconds,
+        [string]$FailureMessage = 'Native process failed.'
+    )
+    $executable = Resolve-FullPath -Path $FilePath -MustExist -PathType Leaf
+    $startInfo = New-Object Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $executable
+    $startInfo.Arguments = (@($Arguments | ForEach-Object { ConvertTo-WindowsNativeArgument -Value ([string]$_) }) -join ' ')
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $startInfo
+    $stdoutTask = $null
+    $stderrTask = $null
+    try {
+        if (-not $process.Start()) { throw "Could not start native process: $executable" }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            try {
+                if (-not $process.HasExited) { $process.Kill() }
+            } catch {
+                throw [TimeoutException]::new("Native process exceeded its $TimeoutSeconds-second deadline and could not be terminated: $executable", $_.Exception)
+            }
+            if (-not $process.WaitForExit(5000)) {
+                throw [TimeoutException]::new("Native process exceeded its $TimeoutSeconds-second deadline and did not terminate: $executable")
+            }
+            throw [TimeoutException]::new("Native process exceeded its $TimeoutSeconds-second deadline: $executable")
+        }
+        $process.WaitForExit()
+        $stdout = [string]$stdoutTask.GetAwaiter().GetResult()
+        $stderr = [string]$stderrTask.GetAwaiter().GetResult()
+        $diagnostic = Get-NativeDiagnosticTail -Text (($stdout,$stderr | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join [Environment]::NewLine)
+        if ($process.ExitCode -ne 0) {
+            $suffix = if ([string]::IsNullOrWhiteSpace($diagnostic)) { '' } else { " $diagnostic" }
+            throw "$FailureMessage Exit code: $($process.ExitCode).$suffix"
+        }
+        return [pscustomobject]@{ExitCode=[int]$process.ExitCode;Text=$diagnostic}
+    } finally {
+        $process.Dispose()
+    }
+}
+
+function Invoke-HtmlHelpExtraction {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$HtmlHelpPath,
+        [Parameter(Mandatory)][string]$Destination,
+        [Parameter(Mandatory)][string]$ArchivePath,
+        [ValidateRange(1,300)][int]$TimeoutSeconds
+    )
+    Invoke-NativeProcessWithTimeout -FilePath $HtmlHelpPath -Arguments @('-decompile',$Destination,$ArchivePath) -TimeoutSeconds $TimeoutSeconds -FailureMessage 'hh.exe extraction failed.' | Out-Null
+}
+
+function Invoke-SevenZipExtraction {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$SevenZip,
+        [Parameter(Mandatory)][string]$Destination,
+        [Parameter(Mandatory)][string]$ArchivePath,
+        [Parameter(Mandatory)][string]$SourceName,
+        [ValidateRange(1,1800)][int]$TimeoutSeconds
+    )
+    Invoke-NativeProcessWithTimeout -FilePath $SevenZip -Arguments @('x','-y',"-o$Destination",$ArchivePath) -TimeoutSeconds $TimeoutSeconds -FailureMessage "7-Zip extraction failed for '$SourceName'." | Out-Null
+}
+
+function Remove-ExtractionTemporaryDirectory {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ExtractionRoot, [AllowNull()][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Container)) { return }
+    try { Remove-SafeDirectory -ConfinementRoot $ExtractionRoot -Path $Path } catch { Write-Warning "Could not remove owned extraction temporary directory '$Path': $($_.Exception.Message)" }
 }
 
 function Invoke-ChmExtraction {
@@ -67,27 +403,54 @@ function Invoke-ChmExtraction {
         [ValidateRange(10,1800)][int]$ExtractionTimeoutSeconds = 300,
         [ValidateRange(10,300)][int]$HhTimeoutSeconds = 60
     )
-    $sourceDirectory = Join-Path $WorkingRoot 'sources'; $extractedDirectory = Join-Path $WorkingRoot 'extracted'
-    $destination = Join-Path $extractedDirectory $SourceRecord.Id
-    Reset-SafeDirectory -ConfinementRoot $extractedDirectory -Path $destination | Out-Null
+    $sourceDirectory = Resolve-FullPath -Path (Join-Path $WorkingRoot 'sources') -MustExist -PathType Container
+    $extractedDirectory = Resolve-FullPath -Path (Join-Path $WorkingRoot 'extracted') -MustExist -PathType Container
+    $destination = Assert-PathWithin -Root $extractedDirectory -Path (Join-Path $extractedDirectory $SourceRecord.Id)
+    if (Test-Path -LiteralPath $destination) { Remove-SafeDirectory -ConfinementRoot $extractedDirectory -Path $destination }
     if ([string]::IsNullOrWhiteSpace($SevenZip)) { throw "A CHM-capable 7-Zip executable is required to independently enumerate '$($SourceRecord.FileName)' before extraction." }
     $archivePath = Join-Path $sourceDirectory $SourceRecord.FileName
-    $expected = Get-ChmHtmlTopicCount -SevenZip $SevenZip -ChmPath $archivePath
-    if ($null -ne $SourceRecord.TopicCount -and $expected -ne [int]$SourceRecord.TopicCount) {
-        throw "CHM directory listing for '$($SourceRecord.FileName)' contains $expected HTML topics; expected $($SourceRecord.TopicCount)."
+    $inventory = Get-ChmIndexInputInventory -ProjectRoot $ProjectRoot -SevenZip $SevenZip -ChmPath $archivePath
+    if ($null -ne $SourceRecord.TopicCount -and [int]$inventory.HtmlCount -ne [int]$SourceRecord.TopicCount) {
+        throw "CHM directory listing for '$($SourceRecord.FileName)' contains $($inventory.HtmlCount) HTML topics; expected $($SourceRecord.TopicCount)."
     }
-    $hhSucceeded = $false; $hh = 'C:\Windows\hh.exe'
-    if (Test-Path -LiteralPath $hh -PathType Leaf) {
-        Push-Location -LiteralPath $WorkingRoot
-        try { & $hh '-decompile' "extracted\$($SourceRecord.Id)" "sources\$($SourceRecord.FileName)" | Out-Null } finally { Pop-Location }
-        try { Wait-ExtractionStable -Path $destination -ExpectedHtmlCount $expected -TimeoutSeconds $HhTimeoutSeconds | Out-Null; $hhSucceeded = $true } catch { Write-Warning "hh.exe extraction was incomplete for '$($SourceRecord.FileName)'; using 7-Zip fallback." }
+    $hhCandidate = $null; $sevenZipCandidate = $null; $snapshotPath = $null; $published = $false
+    try {
+        $windowsRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::Windows)
+        $hh = if ([string]::IsNullOrWhiteSpace($windowsRoot)) { '' } else { Join-Path $windowsRoot 'hh.exe' }
+        if (Test-Path -LiteralPath $hh -PathType Leaf) {
+            $hhCandidate = Assert-PathWithin -Root $extractedDirectory -Path (Join-Path $extractedDirectory ('.extract-' + $SourceRecord.Id + '-hh-' + [Guid]::NewGuid().ToString('N')))
+            New-Item -ItemType Directory -Path $hhCandidate -ErrorAction Stop | Out-Null
+            try {
+                $hhTimer = [Diagnostics.Stopwatch]::StartNew()
+                Invoke-HtmlHelpExtraction -HtmlHelpPath $hh -Destination $hhCandidate -ArchivePath $archivePath -TimeoutSeconds $HhTimeoutSeconds
+                $hhRemaining = [int][Math]::Floor($HhTimeoutSeconds - $hhTimer.Elapsed.TotalSeconds)
+                if ($hhRemaining -lt 1) { throw "hh.exe extraction exceeded its $HhTimeoutSeconds-second deadline." }
+                $snapshot = New-VerifiedExtractionSnapshot -CandidatePath $hhCandidate -SnapshotRoot $extractedDirectory -Inventory $inventory -TimeoutSeconds $hhRemaining
+                $snapshotPath = [string]$snapshot.Path
+                if (Test-Path -LiteralPath $destination) { throw "Extraction destination appeared before publication: $destination" }
+                [IO.Directory]::Move($snapshotPath, $destination); $snapshotPath = $null; $published = $true
+            } catch {
+                Write-Warning "hh.exe extraction was incomplete for '$($SourceRecord.FileName)'; using isolated 7-Zip fallback. $($_.Exception.Message)"
+            }
+        }
+        if (-not $published) {
+            $sevenZipCandidate = Assert-PathWithin -Root $extractedDirectory -Path (Join-Path $extractedDirectory ('.extract-' + $SourceRecord.Id + '-7z-' + [Guid]::NewGuid().ToString('N')))
+            New-Item -ItemType Directory -Path $sevenZipCandidate -ErrorAction Stop | Out-Null
+            $sevenZipTimer = [Diagnostics.Stopwatch]::StartNew()
+            Invoke-SevenZipExtraction -SevenZip $SevenZip -Destination $sevenZipCandidate -ArchivePath $archivePath -SourceName ([string]$SourceRecord.FileName) -TimeoutSeconds $ExtractionTimeoutSeconds
+            $sevenZipRemaining = [int][Math]::Floor($ExtractionTimeoutSeconds - $sevenZipTimer.Elapsed.TotalSeconds)
+            if ($sevenZipRemaining -lt 1) { throw "7-Zip extraction exceeded its $ExtractionTimeoutSeconds-second deadline for '$($SourceRecord.FileName)'." }
+            $snapshot = New-VerifiedExtractionSnapshot -CandidatePath $sevenZipCandidate -SnapshotRoot $extractedDirectory -Inventory $inventory -TimeoutSeconds $sevenZipRemaining
+            $snapshotPath = [string]$snapshot.Path
+            if (Test-Path -LiteralPath $destination) { throw "Extraction destination appeared before publication: $destination" }
+            [IO.Directory]::Move($snapshotPath, $destination); $snapshotPath = $null; $published = $true
+        }
+        return [int]$inventory.HtmlCount
+    } finally {
+        Remove-ExtractionTemporaryDirectory -ExtractionRoot $extractedDirectory -Path $snapshotPath
+        Remove-ExtractionTemporaryDirectory -ExtractionRoot $extractedDirectory -Path $hhCandidate
+        Remove-ExtractionTemporaryDirectory -ExtractionRoot $extractedDirectory -Path $sevenZipCandidate
     }
-    if (-not $hhSucceeded) {
-        Reset-SafeDirectory -ConfinementRoot $extractedDirectory -Path $destination | Out-Null
-        Invoke-NativeChecked -FilePath $SevenZip -Arguments @('x','-y',"-o$destination",(Join-Path $sourceDirectory $SourceRecord.FileName)) -FailureMessage "7-Zip extraction failed for '$($SourceRecord.FileName)'."
-        Wait-ExtractionStable -Path $destination -ExpectedHtmlCount $expected -TimeoutSeconds $ExtractionTimeoutSeconds | Out-Null
-    }
-    return @(Get-ChildItem -LiteralPath $destination -Recurse -File | Where-Object { $_.Extension -in @('.htm','.html') }).Count
 }
 
 function Get-SourceRecordsFromActiveRevision {
@@ -271,6 +634,12 @@ function Assert-StagedReportMatchesVerification {
         [Parameter(Mandatory)][object]$CandidateInspection,
         [switch]$AcceptAssetReduction
     )
+    # Re-run the identity determinism gate at every semantic acceptance
+    # boundary. This protects Apply and interrupted-stage recovery from a
+    # candidate staged by an older build that did not yet enforce the gate.
+    if ($null -ne $BaseRevision) {
+        [void](Assert-DeterministicRebuildResult -BaseRevision $BaseRevision -CandidateRevision $CandidateRevision)
+    }
     $topicChanges = if ($null -eq $BaseRevision) {
         Get-TopicChangeReport -BaseInspection $null -CandidateInspection $CandidateInspection
     } else {
@@ -324,6 +693,27 @@ function Assert-NoRevisionTopicLoss {
     return $changes
 }
 
+function Assert-DeterministicRebuildResult {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$BaseRevision,
+        [Parameter(Mandatory)][object]$CandidateRevision
+    )
+    $sameIdentityInputs = (
+        [int]$BaseRevision.ManifestSchemaVersion -eq $script:ManifestSchemaVersion -and
+        [int]$CandidateRevision.ManifestSchemaVersion -eq $script:ManifestSchemaVersion -and
+        [string]$BaseRevision.Manifest.index_contract -ceq $script:IndexContract -and
+        [string]$CandidateRevision.Manifest.index_contract -ceq $script:IndexContract -and
+        [string]$BaseRevision.CorpusRevision -ceq [string]$CandidateRevision.CorpusRevision -and
+        [string]$BaseRevision.Manifest.assets.policy_sha256 -ceq [string]$CandidateRevision.Manifest.assets.policy_sha256
+    )
+    if (-not $sameIdentityInputs) { return $false }
+    if ([string]$BaseRevision.IndexRevision -cne [string]$CandidateRevision.IndexRevision) {
+        throw "Deterministic rebuild failure: identical corpus '$($BaseRevision.CorpusRevision)', manifest schema '$($script:ManifestSchemaVersion)', index contract '$($script:IndexContract)', and image policy '$($BaseRevision.Manifest.assets.policy_sha256)' produced index '$($CandidateRevision.IndexRevision)' instead of '$($BaseRevision.IndexRevision)'. If the output change is intentional, change an identity-bearing index contract or policy before staging it."
+    }
+    return $true
+}
+
 function New-RevisionCandidate {
     [CmdletBinding()]
     param(
@@ -355,7 +745,7 @@ function New-RevisionCandidate {
     $inspection = Invoke-DatabaseInspection -NodePath $node -DatabasePath $validated.DatabasePath -RequireAssets
     if ([string]$inspection.metadata.corpus_sha256 -cne $corpusRevision -or [string]$inspection.metadata.image_policy_sha256 -cne [string]$validated.Manifest.assets.policy_sha256 -or [string]$inspection.metadata.asset_catalog_sha256 -cne [string]$validated.Manifest.assets.catalog_sha256 -or [string]$inspection.metadata.asset_tree_sha256 -cne [string]$validated.Manifest.assets.tree_sha256) { throw 'Candidate database asset metadata does not match its manifest.' }
     if ([int]$inspection.asset_count -ne [int]$validated.Manifest.assets.cataloged_count -or [int]$inspection.topic_asset_count -ne [int]$validated.Manifest.assets.occurrence_count) { throw 'Candidate database asset counts do not match its manifest.' }
-    return [pscustomobject]@{ Revision=$indexRevision; IndexRevision=$indexRevision; CorpusRevision=$corpusRevision; Root=$candidateRoot.FullName; Manifest=$validated.Manifest; Inspection=$inspection; TopicCounts=$counts; WorkRoot=$work }
+    return [pscustomobject]@{ Revision=$indexRevision; IndexRevision=$indexRevision; CorpusRevision=$corpusRevision; ManifestSchemaVersion=[int]$validated.ManifestSchemaVersion; Root=$candidateRoot.FullName; Manifest=$validated.Manifest; Inspection=$inspection; TopicCounts=$counts; WorkRoot=$work }
 }
 
 function Install-RevisionCandidate {

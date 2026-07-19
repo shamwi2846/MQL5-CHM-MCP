@@ -26,7 +26,7 @@ var IMAGE_SCHEMA_VERSION = 3;
 var LEGACY_INDEX_CONTRACT = "mql5-chm-index-v3-assets-v1";
 export const SUPPORTED_INDEX_CONTRACT = "mql5-chm-index-v3-assets-v2";
 var ACCEPTED_INDEX_CONTRACTS = /* @__PURE__ */ new Set([LEGACY_INDEX_CONTRACT, SUPPORTED_INDEX_CONTRACT]);
-var CURSOR_DOMAIN = "mql5-chm-read-cursor-v1\0";
+var CURSOR_DOMAIN = "mql5-chm-read-cursor-v2\0";
 var IMAGE_CURSOR_DOMAIN = "mql5-chm-image-cursor-v1\0";
 var TOPIC_ID_PATTERN = /^(mql5|mql5book|neuronetworksbook):[0-9a-f]{24}$/;
 var SECTION_ID_PATTERN = /^(mql5|mql5book|neuronetworksbook):[0-9a-f]{24}:s\d{3}$/;
@@ -1252,13 +1252,15 @@ function validateReadImageInput(input) {
 function cursorTag(body) {
   return createHash("sha256").update(CURSOR_DOMAIN).update(body).digest("hex").slice(0, 24);
 }
-function encodeCursor({ topicId, sectionId = null, offset }) {
-  if (!TOPIC_ID_PATTERN.test(topicId)) fail("INVALID_CURSOR", "Cannot encode an invalid topic cursor.");
+function encodeCursor({ indexRevision, topicId, sectionId = null, offset }) {
+  if (!REVISION_PATTERN.test(indexRevision) || !TOPIC_ID_PATTERN.test(topicId)) {
+    fail("INVALID_CURSOR", "Cannot encode an invalid topic cursor.");
+  }
   if (sectionId !== null && (!SECTION_ID_PATTERN.test(sectionId) || !sectionId.startsWith(`${topicId}:`))) {
     fail("INVALID_CURSOR", "Cannot encode an invalid section cursor.");
   }
   if (!Number.isSafeInteger(offset) || offset < 0) fail("INVALID_CURSOR", "Cannot encode an invalid offset.");
-  const body = Buffer.from(JSON.stringify({ v: 1, t: topicId, s: sectionId, o: offset }), "utf8").toString(
+  const body = Buffer.from(JSON.stringify({ v: 2, i: indexRevision, t: topicId, s: sectionId, o: offset }), "utf8").toString(
     "base64url"
   );
   return `${body}.${cursorTag(body)}`;
@@ -1285,10 +1287,10 @@ function decodeCursor(cursor) {
     if (error51 instanceof Mql5ChmError) throw error51;
     fail("INVALID_CURSOR", "The continuation cursor payload is invalid.", { cause: error51 });
   }
-  if (!isRecord(payload) || payload.v !== 1 || typeof payload.t !== "string" || !TOPIC_ID_PATTERN.test(payload.t) || payload.s !== null && (typeof payload.s !== "string" || !SECTION_ID_PATTERN.test(payload.s) || !payload.s.startsWith(`${payload.t}:`)) || !Number.isSafeInteger(payload.o) || payload.o < 0) {
+  if (!isRecord(payload) || payload.v !== 2 || typeof payload.i !== "string" || !REVISION_PATTERN.test(payload.i) || typeof payload.t !== "string" || !TOPIC_ID_PATTERN.test(payload.t) || payload.s !== null && (typeof payload.s !== "string" || !SECTION_ID_PATTERN.test(payload.s) || !payload.s.startsWith(`${payload.t}:`)) || !Number.isSafeInteger(payload.o) || payload.o < 0) {
     fail("INVALID_CURSOR", "The continuation cursor payload is invalid.");
   }
-  return { topicId: payload.t, sectionId: payload.s, offset: payload.o };
+  return { indexRevision: payload.i, topicId: payload.t, sectionId: payload.s, offset: payload.o };
 }
 function imageCursorTag(body) {
   return createHash("sha256").update(IMAGE_CURSOR_DOMAIN).update(body).digest("hex").slice(0, 24);
@@ -1383,7 +1385,7 @@ function locateFocusOffset(text, focus, maxChars) {
     at = lowerText.indexOf(term.toLowerCase());
     if (at >= 0) break;
   }
-  return at < 0 ? 0 : Math.max(0, at - Math.floor(maxChars * 0.2));
+  return at < 0 ? 0 : safeUtf16Boundary(text, Math.max(0, at - Math.floor(maxChars * 0.2)));
 }
 function boundedEnd(text, start, maximum) {
   const hardEnd = Math.min(text.length, start + maximum);
@@ -1391,9 +1393,18 @@ function boundedEnd(text, start, maximum) {
   const minimumEnd = start + Math.floor(maximum * 0.72);
   const window = text.slice(minimumEnd, hardEnd);
   const newline = window.lastIndexOf("\n");
-  if (newline >= 0) return minimumEnd + newline + 1;
+  if (newline >= 0) return safeUtf16Boundary(text, minimumEnd + newline + 1);
   const whitespace = Math.max(window.lastIndexOf(". "), window.lastIndexOf(" "));
-  return whitespace >= 0 ? minimumEnd + whitespace + 1 : hardEnd;
+  return safeUtf16Boundary(text, whitespace >= 0 ? minimumEnd + whitespace + 1 : hardEnd);
+}
+function splitsSurrogatePair(text, offset) {
+  if (offset <= 0 || offset >= text.length) return false;
+  const before = text.charCodeAt(offset - 1);
+  const after = text.charCodeAt(offset);
+  return before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff;
+}
+function safeUtf16Boundary(text, offset) {
+  return splitsSurrogatePair(text, offset) ? offset - 1 : offset;
 }
 var Mql5ChmSearchService = class {
   constructor(database, packageInfo) {
@@ -1761,6 +1772,26 @@ var Mql5ChmSearchService = class {
   read(input) {
     this.#assertOpen();
     const { topicId, sectionId, focus, cursor, maxChars, includeRelated, relatedLimit, includeImages, imageLimit, imageCursor } = validateReadInput(input);
+    let continuation = null;
+    let imageContinuation = null;
+    if (imageCursor) {
+      if (!this.assetSupportAvailable) fail("ASSET_CATALOG_UNAVAILABLE", "This verified revision does not contain an image catalog.");
+      imageContinuation = decodeImageCursor(imageCursor);
+      if (imageContinuation.indexRevision !== this.indexSha256) fail("INVALID_IMAGE_CURSOR", "The image cursor belongs to a different index revision.");
+      if (imageContinuation.topicId !== topicId) fail("INVALID_IMAGE_CURSOR", "The image cursor belongs to a different topic.");
+      if (sectionId && imageContinuation.sectionId !== sectionId) fail("INVALID_IMAGE_CURSOR", "The image cursor belongs to a different section.");
+    } else if (cursor) {
+      continuation = decodeCursor(cursor);
+      if (continuation.indexRevision !== this.indexSha256) {
+        fail("INVALID_CURSOR", "The continuation cursor belongs to a different index revision.");
+      }
+      if (continuation.topicId !== topicId) {
+        fail("INVALID_CURSOR", "The continuation cursor belongs to a different topic.");
+      }
+      if (sectionId && continuation.sectionId !== sectionId) {
+        fail("INVALID_CURSOR", "The continuation cursor belongs to a different section.");
+      }
+    }
     const topic = this.database.prepare("SELECT topic_id, source, title, breadcrumb, signature, content, content_length FROM topics WHERE topic_id=?").get(topicId);
     if (!topic) fail("TOPIC_NOT_FOUND", "No documentation topic exists for topic_id.");
     let selectedSectionId = sectionId ?? null;
@@ -1770,21 +1801,9 @@ var Mql5ChmSearchService = class {
     let offset = 0;
     let imageStart = 0;
     if (imageCursor) {
-      if (!this.assetSupportAvailable) fail("ASSET_CATALOG_UNAVAILABLE", "This verified revision does not contain an image catalog.");
-      const imageContinuation = decodeImageCursor(imageCursor);
-      if (imageContinuation.indexRevision !== this.indexSha256) fail("INVALID_IMAGE_CURSOR", "The image cursor belongs to a different index revision.");
-      if (imageContinuation.topicId !== topicId) fail("INVALID_IMAGE_CURSOR", "The image cursor belongs to a different topic.");
-      if (sectionId && imageContinuation.sectionId !== sectionId) fail("INVALID_IMAGE_CURSOR", "The image cursor belongs to a different section.");
       selectedSectionId = imageContinuation.sectionId;
       imageStart = imageContinuation.offset;
     } else if (cursor) {
-      const continuation = decodeCursor(cursor);
-      if (continuation.topicId !== topicId) {
-        fail("INVALID_CURSOR", "The continuation cursor belongs to a different topic.");
-      }
-      if (sectionId && continuation.sectionId !== sectionId) {
-        fail("INVALID_CURSOR", "The continuation cursor belongs to a different section.");
-      }
       selectedSectionId = continuation.sectionId;
       offset = continuation.offset;
     } else if (!sectionId && focus) {
@@ -1804,9 +1823,12 @@ var Mql5ChmSearchService = class {
     if (offset < 0 || offset >= selectedText.length + (selectedText.length === 0 ? 1 : 0)) {
       fail("INVALID_CURSOR", "The continuation cursor offset is outside the selected documentation text.");
     }
+    if (splitsSurrogatePair(selectedText, offset)) {
+      fail("INVALID_CURSOR", "The continuation cursor offset splits a UTF-16 surrogate pair.");
+    }
     const end = imageCursor ? offset : boundedEnd(selectedText, offset, maxChars);
     const text = imageCursor ? "" : selectedText.slice(offset, end);
-    const nextCursor = !imageCursor && end < selectedText.length ? encodeCursor({ topicId, sectionId: selectedSectionId, offset: end }) : null;
+    const nextCursor = !imageCursor && end < selectedText.length ? encodeCursor({ indexRevision: this.indexSha256, topicId, sectionId: selectedSectionId, offset: end }) : null;
     const imagePage = includeImages
       ? this.#topicImages(topic, selectedSectionId, imageStart, imageLimit)
       : { images: [], imageCount: 0, nextImageCursor: null };

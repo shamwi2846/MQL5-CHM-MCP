@@ -36,11 +36,11 @@ function Assert-ApplyTransitionAccepted {
 
 $root = Resolve-FullPath -Path $ProjectRoot -MustExist -PathType Container
 Assert-NoReparsePoint -Root $root -Path $root
-$maintenanceRoot = Join-Path $root 'maintenance'; if (-not (Test-Path -LiteralPath $maintenanceRoot -PathType Container)) { New-Item -ItemType Directory -Path $maintenanceRoot | Out-Null }
+$maintenanceRoot = Join-Path $root 'maintenance'
 Assert-NoReparsePoint -Root $root -Path $maintenanceRoot
 $lock = $null
 try {
-    $lock = Enter-ExclusiveFileLock -Path (Join-Path $maintenanceRoot '.update.lock') -TimeoutSeconds $LockTimeoutSeconds
+    $lock = Enter-ExclusiveFileLock -Path (Join-Path $maintenanceRoot '.update.lock') -IdentityRoot $root -TimeoutSeconds $LockTimeoutSeconds
     Repair-InterruptedMaintenanceArtifacts -ProjectRoot $root
     if ($PSCmdlet.ParameterSetName -eq 'Stage') { Convert-DevelopmentLegacyActivePointerForStageRecovery -ProjectRoot $root | Out-Null }
     $stageRecovery = Repair-InterruptedRevisionStageInstall -ProjectRoot $root
@@ -94,8 +94,7 @@ try {
         $records = Get-DownloadedSourceRecords -DownloadRoot $downloadRoot -TimeoutSeconds $TimeoutSeconds
         $candidateCorpusRevision = Get-RevisionFromSourceRecords -SourceRecords $records
         $activeContract = if ([int]$active.ManifestSchemaVersion -eq 3 -and $null -ne $active.Manifest.PSObject.Properties['index_contract']) { [string]$active.Manifest.index_contract } else { '' }
-        $policyPath = Resolve-FullPath -Path (Join-Path $root 'config\mql5-image-policy.json') -MustExist -PathType Leaf
-        $currentPolicyDigest = (Get-FileHash -Algorithm SHA256 -LiteralPath $policyPath).Hash.ToLowerInvariant()
+        $currentPolicyDigest = Get-CanonicalImagePolicySha256 -ProjectRoot $root
         $activePolicyDigest = if ([int]$active.ManifestSchemaVersion -eq 3 -and $null -ne $active.Manifest.PSObject.Properties['assets']) { [string]$active.Manifest.assets.policy_sha256 } else { '' }
         if ($candidateCorpusRevision -eq [string]$active.CorpusRevision -and $activeContract -ceq $script:IndexContract -and $activePolicyDigest -ceq $currentPolicyDigest) {
             Set-UpdateStatus -ProjectRoot $root -Status 'up-to-date' -ActiveRevision ([string]$active.IndexRevision) -ActiveCorpusRevision ([string]$active.CorpusRevision) -CandidateRevision ([string]$active.IndexRevision) -CandidateCorpusRevision $candidateCorpusRevision -Message 'The official CHM downloads and local index contract match the active revision.' | Out-Null
@@ -105,10 +104,17 @@ try {
         }
         $candidate = New-RevisionCandidate -ProjectRoot $root -SourceRecords $records -WorkingRoot $work -ExtractionTimeoutSeconds $ExtractionTimeoutSeconds -HhTimeoutSeconds $HhTimeoutSeconds
         if ([string]$candidate.CorpusRevision -cne $candidateCorpusRevision) { throw 'Staged index corpus revision does not match the downloaded CHM revision.' }
+        $candidateAlreadyCurrent = Assert-DeterministicRebuildResult -BaseRevision $active -CandidateRevision $candidate
+        if ($candidateAlreadyCurrent) {
+            Set-UpdateStatus -ProjectRoot $root -Status 'up-to-date' -ActiveRevision ([string]$active.IndexRevision) -ActiveCorpusRevision ([string]$active.CorpusRevision) -CandidateRevision ([string]$active.IndexRevision) -CandidateCorpusRevision $candidateCorpusRevision -Message 'The rebuilt official CHMs and identity-bearing index inputs match the active revision.' | Out-Null
+            if ([int]$pointer.schema_version -eq 2) { Update-ManagedChecksumsIfPresent -ProjectRoot $root }
+            Write-Host "Official documentation and index are already active: $($active.IndexRevision)"
+            return
+        }
         $node = Resolve-NodeExecutable -ProjectRoot $root
         $baseInspection = Invoke-DatabaseInspection -NodePath $node -DatabasePath $active.DatabasePath
         Assert-NoRevisionTopicLoss -BaseRevision $active -CandidateRevision $candidate -BaseInspection $baseInspection -CandidateInspection $candidate.Inspection -Context 'stage' | Out-Null
-        if ([string]$candidate.IndexRevision -ceq [string]$active.IndexRevision) { throw 'Candidate index revision equals the active index despite a changed corpus or index contract.' }
+        if ([string]$candidate.IndexRevision -ceq [string]$active.IndexRevision) { throw 'Candidate index revision equals the active index despite changed identity-bearing inputs.' }
         $sourceCounts = [ordered]@{}
         foreach ($definition in Get-Mql5CorpusDefinition) {
             $baseCount = [int]$active.Manifest.sources.PSObject.Properties[$definition.Id].Value.topic_count

@@ -1,0 +1,444 @@
+{
+  "schema_version": 1,
+  "metafile": "build/esbuild-meta.json",
+  "package_count": 24,
+  "packages": [
+    {
+      "name": "@modelcontextprotocol/sdk",
+      "version": "1.29.0",
+      "instance": "node_modules/@modelcontextprotocol/sdk",
+      "license": "MIT",
+      "bundles": [
+        {
+          "name": "server.mjs",
+          "bytes_in_output": 156657
+        }
+      ],
+      "notices": [
+        {
+          "source": "node_modules/@modelcontextprotocol/sdk/LICENSE",
+          "sha256": "5e13dbbc1d120fc2a03cecde7c91424ae2d7de11b63d58ded2f4431e261ee50d"
+        }
+      ]
+    },
+    {
+      "name": "ajv",
+      "version": "8.20.0",
+      "instance": "node_modules/ajv",
+      "license": "MIT",
+      "bundles": [
+        {
+          "name": "server.mjs",
+          "bytes_in_output": 211559
+        }
+      ],
+      "notices": [
+        {
+          "source": "node_modules/ajv/LICENSE",
+          "sha256": "9b6a90e9be78799534e4030d71b6817271fb99aa10e261f9f9f6dec1cff4177a"
+        }
+      ]
+    },
+    {
+      "name": "ajv-formats",
+      "version": "3.0.1",
+      "instance": "node_modules/ajv-formats",
+      "license": "MIT",
+      "bundles": [
+        {
+          "name": "server.mjs",
+          "bytes_in_output": 16859
+        }
+      ],
+      "notices": [
+        {
+          "source": "node_modules/ajv-formats/LICENSE",
+          "sha256": "9df3bb69929a3b650ed73b3bfa1756725aaff0ac296461605753547004eafeaf"
+        }
+      ]
+    },
+    {
+      "name": "boolbase",
+      "version": "1.0.0",
+      "instance": "node_modules/boolbase",
+      "license": "ISC",
+      "bundles": [
+        {
+          "name": "indexer.mjs",
+          "bytes_in_output": 267
+        }
+      ],
+      "notices": [
+        {
+          "source": "licenses/overrides/boolbase-1.0.0.txt",
+          "sha256": "a03fc69d4164ac878e1bb16a818608e6ab8b8241175b8ffae69f63c81218c9aa",
+          "override": true
+        }
+      ]
+    },
+    {
+      "name": "cheerio",
+      "version": "1.2.0",
+      "instance": "node_modules/cheerio",
+      "license": "MIT",
+      "bundles": [
+        {
+          "name": "indexer.mjs",
+          "bytes_in_output": 45649
+        }
+      ],
+      "notices": [
+        {
+          "source": "node_modules/cheerio/LICENSE",
+          "sha256": "61c1e21d3a8ff20f9b69abe15104a75584688080febc22f60a4cbf3854becf4e"
+        }
+      ]
+    },
+    {
+      "name": "cheerio-select",
+      "version": "2.1.0",
+      "instance": "node_modules/cheerio-select",
+      "license": "BSD-2-Clause",
+      "bundles": [
+        {
+          "name": "indexer.mjs",
+          "bytes_in_output": 8320
+        }
+      ],
+      "notices": [
+        {
+          "source": "node_modules/cheerio-select/LICENSE",
+          "sha256": "cb992345949ccd6e8394b2cd6c465f7b897c864f845937dbf64e8997f389e164"
+        }
+      ]
+    },
+    {
+      "name": "css-select",
+      "version": "5.2.2",
+      "instance": "node_modules/css-select",
+      "license": "BSD-2-Clause",
+      "bundles": [
+        {
+          "name": "indexer.mjs",
+          "bytes_in_output": 30186
+        }
+      ],
+      "notices": [
+        {
+          "source": "node_modules/css-select/LICENSE",
+          "sha256": "cb992345949ccd6e8394b2cd6c465f7b897c864f845937dbf64e8997f389e164"
+        }
+      ]
+    },
+    {
+      "name": "css-what",
+      "version": "6.2.2",
+      "instance": "node_modules/css-what",
+      "license": "BSD-2-Clause",
+      "bundles": [
+        {
+          "name": "indexer.mjs",
+          "bytes_in_output": 21370
+        }
+      ],
+      "notices": [
+        {
+          "source": "node_modules/css-what/LICENSE",
+          "sha256": "cb992345949ccd6e8394b2cd6c465f7b897c864f845937dbf64e8997f389e164"
+        }
+      ]
+    },
+    {
+      "name": "dom-serializer",
+      "version": "2.0.0",
+      "instance": "node_modules/dom-serializer",
+      "license": "MIT",
+      "bundles": [
+        {
+          "name": "indexer.mjs",
+          "bytes_in_output": 5726
+        }
+      ],
+      "notices": [
+        {
+          "source": "node_modules/dom-serializer/LICENSE",
+          "sha256": "94cfe87de9b178e8fee313a19178e625129e2ce559db32e772e7bd95114ee6ff"
+        }
+      ]
+    },
+    {
+      "name": "domelementtype",
+      "version": "2.3.0",
+      "instance": "node_modules/domelementtype",
+      "license": "BSD-2-Clause",
+      "bundles": [
+        {
+          "name": "indexer.mjs",
+          "bytes_in_output": 1145
+        }
+      ],
+      "notices": [
+        {
+          "source": "node_modules/domelementtype/LICENSE",
+          "sha256": "cb992345949ccd6e8394b2cd6c465f7b897c864f845937dbf64e8997f389e164"
+        }
+      ]
+    },
+    {
+      "name": "domhandler",
+      "version": "5.0.3",
+      "instance": "node_modules/domhandler",
+      "license": "BSD-2-Clause",
+      "bundles": [
+        {
+          "name": "indexer.mjs",
+          "bytes_in_output": 10343
+        }
+      ],
+      "notices": [
+        {
+          "source": "node_modules/domhandler/LICENSE",
+          "sha256": "cb992345949ccd6e8394b2cd6c465f7b897c864f845937dbf64e8997f389e164"
+        }
+      ]
+    },
+    {
+      "name": "domutils",
+      "version": "3.2.2",
+      "instance": "node_modules/domutils",
+      "license": "BSD-2-Clause",
+      "bundles": [
+        {
+          "name": "indexer.mjs",
+          "bytes_in_output": 16588
+        }
+      ],
+      "notices": [
+        {
+          "source": "node_modules/domutils/LICENSE",
+          "sha256": "cb992345949ccd6e8394b2cd6c465f7b897c864f845937dbf64e8997f389e164"
+        }
+      ]
+    },
+    {
+      "name": "entities",
+      "version": "4.5.0",
+      "instance": "node_modules/entities",
+      "license": "BSD-2-Clause",
+      "bundles": [
+        {
+          "name": "indexer.mjs",
+          "bytes_in_output": 91728
+        }
+      ],
+      "notices": [
+        {
+          "source": "node_modules/entities/LICENSE",
+          "sha256": "cb992345949ccd6e8394b2cd6c465f7b897c864f845937dbf64e8997f389e164"
+        }
+      ]
+    },
+    {
+      "name": "entities",
+      "version": "7.0.1",
+      "instance": "node_modules/htmlparser2/node_modules/entities",
+      "license": "BSD-2-Clause",
+      "bundles": [
+        {
+          "name": "indexer.mjs",
+          "bytes_in_output": 49259
+        }
+      ],
+      "notices": [
+        {
+          "source": "node_modules/htmlparser2/node_modules/entities/LICENSE",
+          "sha256": "cb992345949ccd6e8394b2cd6c465f7b897c864f845937dbf64e8997f389e164"
+        }
+      ]
+    },
+    {
+      "name": "fast-deep-equal",
+      "version": "3.1.3",
+      "instance": "node_modules/fast-deep-equal",
+      "license": "MIT",
+      "bundles": [
+        {
+          "name": "server.mjs",
+          "bytes_in_output": 1303
+        }
+      ],
+      "notices": [
+        {
+          "source": "node_modules/fast-deep-equal/LICENSE",
+          "sha256": "7bf9b2de73a6b356761c948d0e9eeb4be6c1270bd04c79cd489c1e400ffdfc1a"
+        }
+      ]
+    },
+    {
+      "name": "fast-uri",
+      "version": "3.1.3",
+      "instance": "node_modules/fast-uri",
+      "license": "BSD-3-Clause",
+      "bundles": [
+        {
+          "name": "server.mjs",
+          "bytes_in_output": 26788
+        }
+      ],
+      "notices": [
+        {
+          "source": "node_modules/fast-uri/LICENSE",
+          "sha256": "df7464922225c9b286167fa692d305e5ba98bf71613525d4d031649a344a3f3f"
+        }
+      ]
+    },
+    {
+      "name": "htmlparser2",
+      "version": "10.1.0",
+      "instance": "node_modules/htmlparser2",
+      "license": "MIT",
+      "bundles": [
+        {
+          "name": "indexer.mjs",
+          "bytes_in_output": 38159
+        }
+      ],
+      "notices": [
+        {
+          "source": "node_modules/htmlparser2/LICENSE",
+          "sha256": "4a0a45a44970739bd335dd29d149f895cbb97355e8b95da3d2f5346ea014e9c0"
+        }
+      ]
+    },
+    {
+      "name": "iconv-lite",
+      "version": "0.7.3",
+      "instance": "node_modules/iconv-lite",
+      "license": "MIT",
+      "bundles": [
+        {
+          "name": "indexer.mjs",
+          "bytes_in_output": 551800
+        }
+      ],
+      "notices": [
+        {
+          "source": "node_modules/iconv-lite/LICENSE",
+          "sha256": "f9c6da891840e8951696e472b3c7d6f6d3ab2c7325f1dd30c0813244c15b288c"
+        }
+      ]
+    },
+    {
+      "name": "jpeg-js",
+      "version": "0.4.4",
+      "instance": "node_modules/jpeg-js",
+      "license": "BSD-3-Clause",
+      "bundles": [
+        {
+          "name": "indexer.mjs",
+          "bytes_in_output": 65482
+        },
+        {
+          "name": "server.mjs",
+          "bytes_in_output": 65427
+        }
+      ],
+      "notices": [
+        {
+          "source": "node_modules/jpeg-js/LICENSE",
+          "sha256": "8aa50650686b74f5ad73392b6db2a120982329dfb378b4464b57d6d72ce3a70c"
+        }
+      ]
+    },
+    {
+      "name": "json-schema-traverse",
+      "version": "1.0.0",
+      "instance": "node_modules/json-schema-traverse",
+      "license": "MIT",
+      "bundles": [
+        {
+          "name": "server.mjs",
+          "bytes_in_output": 2827
+        }
+      ],
+      "notices": [
+        {
+          "source": "node_modules/json-schema-traverse/LICENSE",
+          "sha256": "7bf9b2de73a6b356761c948d0e9eeb4be6c1270bd04c79cd489c1e400ffdfc1a"
+        }
+      ]
+    },
+    {
+      "name": "nth-check",
+      "version": "2.1.1",
+      "instance": "node_modules/nth-check",
+      "license": "BSD-2-Clause",
+      "bundles": [
+        {
+          "name": "indexer.mjs",
+          "bytes_in_output": 2110
+        }
+      ],
+      "notices": [
+        {
+          "source": "node_modules/nth-check/LICENSE",
+          "sha256": "cb992345949ccd6e8394b2cd6c465f7b897c864f845937dbf64e8997f389e164"
+        }
+      ]
+    },
+    {
+      "name": "safer-buffer",
+      "version": "2.1.2",
+      "instance": "node_modules/safer-buffer",
+      "license": "MIT",
+      "bundles": [
+        {
+          "name": "indexer.mjs",
+          "bytes_in_output": 2313
+        }
+      ],
+      "notices": [
+        {
+          "source": "node_modules/safer-buffer/LICENSE",
+          "sha256": "4bc935e71be198c67ddf3c2b5fddb195f6edc182bfc155a96a6db61b44b494b9"
+        }
+      ]
+    },
+    {
+      "name": "zod",
+      "version": "4.4.3",
+      "instance": "node_modules/zod",
+      "license": "MIT",
+      "bundles": [
+        {
+          "name": "server.mjs",
+          "bytes_in_output": 655941
+        }
+      ],
+      "notices": [
+        {
+          "source": "node_modules/zod/LICENSE",
+          "sha256": "3f1189b28e3866e0d979968d466b78f813f76827cfdca1fbb124cc0a5c8841f8"
+        }
+      ]
+    },
+    {
+      "name": "zod-to-json-schema",
+      "version": "3.25.2",
+      "instance": "node_modules/zod-to-json-schema",
+      "license": "ISC",
+      "bundles": [
+        {
+          "name": "server.mjs",
+          "bytes_in_output": 39560
+        }
+      ],
+      "notices": [
+        {
+          "source": "node_modules/zod-to-json-schema/LICENSE",
+          "sha256": "7beaa85b57d7211f6684af6c1d97e6d9ef7ec1851f779152043a47a8700306a9"
+        }
+      ]
+    }
+  ]
+}

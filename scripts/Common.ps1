@@ -3,6 +3,14 @@ $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1') -ErrorAction Stop
 
 $script:PinnedNodeVersion = 'v24.17.0'
+$script:PinnedNodeArchiveSha256 = 'f2aa33b35b75aca5f3f7b85675a6f6423201053e9381911e64961f3bda2528ab'
+$script:PinnedNodeExecutableSha256 = 'c6335d08331c23d68b9f2b18adb102002d76ef150b47248e954c507e0d033664'
+$script:PinnedNodeLicenseSha256 = '8efdacdc1cfa3460aeb7fe98e3c54337b971d5da70e6eee292b73b981acb220c'
+$script:PinnedSevenZipVersion = '26.02'
+$script:PinnedSevenZipArtifactSha256 = 'db407a4f6d4999e5c7bc00ce8a882be94717b56e7fa68140fe3f12605d91643e'
+$script:PinnedSevenZipExecutableSha256 = '83967f1b02b43c4efeda302795722c809e0e81b8307de73558d10484d5676a7d'
+$script:PinnedSevenZipLibrarySha256 = '69fd4df057985c40e510e2fac182881c7f85e90aa13ec703f763a8fdb2ce61f8'
+$script:PinnedSevenZipLicenseSha256 = '519ac0a4bded9c18ea02e0afb71f663d8c47373bd9facd3ac96a79f51d77765d'
 $script:ManifestSchemaVersion = 3
 $script:LegacyManifestSchemaVersion = 2
 $script:ActivePointerSchemaVersion = 2
@@ -373,32 +381,84 @@ namespace Mql5ChmMcp
 
 function Enter-ExclusiveFileLock {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Path, [ValidateRange(1, 3600)][int]$TimeoutSeconds = 120)
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [ValidateRange(1, 3600)][int]$TimeoutSeconds = 120,
+        [string]$IdentityRoot,
+        [scriptblock]$InternalMutexFactory
+    )
     $fullPath = [IO.Path]::GetFullPath($Path)
     $parent = Split-Path -Parent $fullPath
-    $volumeRoot = [IO.Path]::GetPathRoot($parent)
-    if ([string]::IsNullOrWhiteSpace($volumeRoot)) { throw "Cannot determine the filesystem root for lock path: $fullPath" }
-    Assert-NoReparsePoint -Root $volumeRoot -Path $parent
-    if (-not (Test-Path -LiteralPath $parent -PathType Container)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-    $parent = Resolve-FullPath -Path $parent -MustExist -PathType Container
-    Assert-NoReparsePoint -Root $parent -Path $parent
+    $parentExistedAtEntry = Test-Path -LiteralPath $parent -PathType Container
+    if ((Test-Path -LiteralPath $parent) -and -not $parentExistedAtEntry) { throw "Maintenance lock parent is not a directory: $parent" }
     $lockName = [IO.Path]::GetFileName($fullPath)
     if ([string]::IsNullOrWhiteSpace($lockName)) { throw "Lock path must identify a file name: $fullPath" }
-    $fullPath = [IO.Path]::GetFullPath((Join-Path $parent $lockName))
-    Assert-NoReparsePoint -Root $parent -Path $fullPath
+    if ([string]::IsNullOrWhiteSpace($IdentityRoot)) {
+        if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+            throw 'IdentityRoot is required when the maintenance lock directory does not yet exist.'
+        }
+        $IdentityRoot = $parent
+    }
+    $identityRootFull = Resolve-FullPath -Path $IdentityRoot -MustExist -PathType Container
+    Assert-NoReparsePoint -Root $identityRootFull -Path $identityRootFull
+    $fullPath = Assert-PathWithin -Root $identityRootFull -Path $fullPath
+    Assert-NoReparsePoint -Root $identityRootFull -Path $fullPath
+    $rootPrefix = $identityRootFull.TrimEnd('\','/') + [IO.Path]::DirectorySeparatorChar
+    $relativeLockPath = $fullPath.Substring($rootPrefix.Length).Replace('/','\')
     # Lexical paths are not a safe mutex identity on Windows: DOS, SUBST,
     # 8.3, and volume-GUID spellings can identify the same physical directory.
-    # Bind the mutex to the filesystem's directory ID plus the fixed lock leaf.
-    $physicalParentIdentity = Get-PhysicalDirectoryIdentity -Path $parent
-    $mutexIdentity = $physicalParentIdentity + "`n" + $lockName.ToLowerInvariant()
+    # Bind the mutex to the existing project's filesystem ID plus the intended
+    # relative lock path. This identity is stable before and after creation of
+    # a fresh clone's maintenance directory.
+    $physicalRootIdentity = Get-PhysicalDirectoryIdentity -Path $identityRootFull
+    $mutexIdentity = $physicalRootIdentity + "`n" + $relativeLockPath.ToLowerInvariant()
     $sha = [Security.Cryptography.SHA256]::Create()
     try { $digest = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($mutexIdentity)))).Replace('-','').ToLowerInvariant() } finally { $sha.Dispose() }
-    $mutex = New-Object Threading.Mutex($false, "Local\Mql5ChmMcp-$digest")
+    $mutexName = "Global\Mql5ChmMcp-$digest"
+    try {
+        $mutex = if ($null -eq $InternalMutexFactory) { New-Object Threading.Mutex($false, $mutexName) } else { & $InternalMutexFactory $mutexName }
+    } catch { throw "Could not open the machine-global maintenance mutex '$mutexName'; no maintenance files were changed. $($_.Exception.Message)" }
+    if ($null -eq $mutex -or $null -eq $mutex.PSObject.Methods['WaitOne'] -or $null -eq $mutex.PSObject.Methods['ReleaseMutex']) {
+        if ($null -ne $mutex -and $null -ne $mutex.PSObject.Methods['Dispose']) { $mutex.Dispose() }
+        throw 'The machine-global maintenance mutex factory returned an invalid mutex; no maintenance files were changed.'
+    }
     $acquired = $false
     try {
         try { $acquired = $mutex.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds)) } catch [Threading.AbandonedMutexException] { $acquired = $true }
         if (-not $acquired) { throw "Timed out waiting for the exclusive lock after $TimeoutSeconds seconds: $fullPath" }
-        $lease = [pscustomobject]@{ Mutex=$mutex; Released=$false; Path=$fullPath }
+        if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+            if (Test-Path -LiteralPath $parent) { throw "Maintenance lock parent is not a directory: $parent" }
+            New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null
+        }
+        $parent = Resolve-FullPath -Path $parent -MustExist -PathType Container
+        Assert-NoReparsePoint -Root $identityRootFull -Path $parent
+        Assert-NoReparsePoint -Root $identityRootFull -Path $fullPath
+        if (Test-Path -LiteralPath $fullPath) {
+            if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) { throw "Maintenance lock marker is not a regular file: $fullPath" }
+            $marker = Get-Item -LiteralPath $fullPath -Force
+            if (($marker.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or [int64]$marker.Length -ne 0) {
+                throw "Maintenance lock marker must be a zero-byte regular file: $fullPath"
+            }
+        } elseif ($parentExistedAtEntry) {
+            # A first-use crash can occur after this process creates the
+            # development maintenance directory but before it creates the
+            # marker. Recover only that narrow, empty-directory state. A tree
+            # carrying either portable trust marker must continue to fail
+            # closed when its checksummed marker is missing.
+            $layoutMode = Get-Mql5ChmLayoutMode -ProjectRoot $identityRootFull
+            $expectedMaintenanceParent = [IO.Path]::GetFullPath((Join-Path $identityRootFull 'maintenance'))
+            $parentEntries = @(Get-ChildItem -LiteralPath $parent -Force -ErrorAction Stop)
+            if ($lockName -cne '.update.lock' -or $parent -cne $expectedMaintenanceParent -or
+                $layoutMode -cnotin @('development','incomplete-development') -or $parentEntries.Count -ne 0) {
+                throw "Existing maintenance directory is missing its zero-byte lock marker: $fullPath"
+            }
+            $markerStream = New-Object IO.FileStream($fullPath,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None,1,[IO.FileOptions]::WriteThrough)
+            try { $markerStream.Flush($true) } finally { $markerStream.Dispose() }
+        } else {
+            $markerStream = New-Object IO.FileStream($fullPath,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None,1,[IO.FileOptions]::WriteThrough)
+            try { $markerStream.Flush($true) } finally { $markerStream.Dispose() }
+        }
+        $lease = [pscustomobject]@{ Mutex=$mutex; Name=$mutexName; Released=$false; Path=$fullPath }
         $lease | Add-Member -MemberType ScriptMethod -Name Dispose -Value {
             if (-not $this.Released) {
                 $this.Mutex.ReleaseMutex()
@@ -408,7 +468,9 @@ function Enter-ExclusiveFileLock {
         }
         return $lease
     } catch {
-        if (-not $acquired) { $mutex.Dispose() }
+        if ($acquired) {
+            try { $mutex.ReleaseMutex() } finally { $mutex.Dispose() }
+        } else { $mutex.Dispose() }
         throw
     }
 }
@@ -422,7 +484,302 @@ function Get-RequiredJsonProperty {
     return $property.Value
 }
 
-function Test-Mql5ChmRegistrationMatches {
+function Resolve-CodexExecutable {
+    [CmdletBinding()]
+    param()
+
+    # Prefer the npm command shim. Windows App Execution Aliases can expose an
+    # inaccessible codex.exe that resolves but fails when executed.
+    $command = Get-Command codex.cmd -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $command) { $command = Get-Command codex -ErrorAction SilentlyContinue | Select-Object -First 1 }
+    if ($null -eq $command) { $command = Get-Command codex.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1 }
+    if ($null -eq $command) { throw 'Codex CLI was not found on PATH.' }
+    return Resolve-FullPath -Path $command.Source -MustExist -PathType Leaf
+}
+
+function Enter-CodexRegistrationMutex {
+    [CmdletBinding()]
+    param([ValidateRange(1,3600)][int]$TimeoutSeconds = 120)
+
+    $mutexName = 'Global\Mql5ChmMcp-CodexRegistration-v1'
+    try { $mutex = New-Object Threading.Mutex($false, $mutexName) } catch {
+        throw "Unable to open the machine-global Codex registration mutex '$mutexName': $($_.Exception.Message)"
+    }
+    $acquired = $false
+    try {
+        try { $acquired = $mutex.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds)) }
+        catch [Threading.AbandonedMutexException] { $acquired = $true }
+        if (-not $acquired) { throw "Timed out waiting for the machine-global Codex registration mutex '$mutexName'." }
+        $lease = [pscustomobject]@{ Mutex=$mutex; Name=$mutexName; Released=$false }
+        $lease | Add-Member ScriptMethod Dispose {
+            if (-not $this.Released) {
+                $this.Mutex.ReleaseMutex()
+                $this.Mutex.Dispose()
+                $this.Released = $true
+            }
+        }
+        return $lease
+    } catch {
+        if ($acquired) {
+            try { $mutex.ReleaseMutex() } finally { $mutex.Dispose() }
+        } else { $mutex.Dispose() }
+        throw
+    }
+}
+
+function Copy-StreamToFileBounded {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][IO.Stream]$Stream,
+        [Parameter(Mandatory)][string]$Destination,
+        [Parameter(Mandatory)][ValidateRange(1,67108864)][int64]$MaximumBytes,
+        [Parameter(Mandatory)][Threading.CancellationToken]$CancellationToken
+    )
+    $destinationFull = Resolve-FullPath -Path $Destination
+    $parent = Resolve-FullPath -Path (Split-Path -Parent $destinationFull) -MustExist -PathType Container
+    if (Test-Path -LiteralPath $destinationFull) { throw "Download destination already exists: $destinationFull" }
+    $output = $null
+    try {
+        $output = New-Object IO.FileStream($destinationFull, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None, 1048576, [IO.FileOptions]::WriteThrough)
+        $buffer = New-Object byte[] 1048576
+        [int64]$total = 0
+        while ($true) {
+            $CancellationToken.ThrowIfCancellationRequested()
+            $read = $Stream.ReadAsync($buffer, 0, $buffer.Length, $CancellationToken).GetAwaiter().GetResult()
+            if ($read -eq 0) { break }
+            if ($total -gt ($MaximumBytes - $read)) { throw "Download exceeded the $MaximumBytes-byte limit." }
+            $output.Write($buffer, 0, $read)
+            $total += $read
+        }
+        $output.Flush($true)
+        return $total
+    } catch {
+        if ($null -ne $output) { $output.Dispose(); $output = $null }
+        if (Test-Path -LiteralPath $destinationFull -PathType Leaf) { Remove-Item -LiteralPath $destinationFull -Force }
+        throw
+    } finally {
+        if ($null -ne $output) { $output.Dispose() }
+    }
+}
+
+function Invoke-BoundedNodeJsDownload {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][Uri]$Uri,
+        [Parameter(Mandatory)][string]$Destination,
+        [ValidateRange(1,300)][int]$TimeoutSeconds = 300,
+        [ValidateRange(1,67108864)][int64]$MaximumBytes = 67108864
+    )
+    if (-not $Uri.IsAbsoluteUri -or $Uri.Scheme -cne 'https' -or $Uri.Host -cne 'nodejs.org' -or
+        -not $Uri.IsDefaultPort -or -not [string]::IsNullOrEmpty($Uri.UserInfo) -or -not [string]::IsNullOrEmpty($Uri.Fragment)) {
+        throw 'Node.js downloads must use a credential-free HTTPS URL on nodejs.org with the default port.'
+    }
+    Add-Type -AssemblyName System.Net.Http -ErrorAction Stop
+    $handler = New-Object Net.Http.HttpClientHandler
+    $handler.AllowAutoRedirect = $false
+    $handler.AutomaticDecompression = [Net.DecompressionMethods]::None
+    if ($handler.PSObject.Properties.Name -contains 'SslProtocols') {
+        $handler.SslProtocols = [Security.Authentication.SslProtocols]::Tls12
+    }
+    $client = New-Object Net.Http.HttpClient($handler, $true)
+    $client.Timeout = [Threading.Timeout]::InfiniteTimeSpan
+    $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Get, $Uri)
+    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.2.2')
+    $response = $null
+    $stream = $null
+    $deadline = New-Object Threading.CancellationTokenSource([TimeSpan]::FromSeconds($TimeoutSeconds))
+    try {
+        $response = $client.SendAsync($request, [Net.Http.HttpCompletionOption]::ResponseHeadersRead, $deadline.Token).GetAwaiter().GetResult()
+        if ($response.StatusCode -ne [Net.HttpStatusCode]::OK) { throw "Node.js download returned HTTP $([int]$response.StatusCode)." }
+        $contentLength = $response.Content.Headers.ContentLength
+        if ($null -ne $contentLength -and [int64]$contentLength -gt $MaximumBytes) {
+            throw "Node.js download declares $contentLength bytes, above the $MaximumBytes-byte limit."
+        }
+        $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+        return Copy-StreamToFileBounded -Stream $stream -Destination $Destination -MaximumBytes $MaximumBytes -CancellationToken $deadline.Token
+    } catch {
+        if ($deadline.IsCancellationRequested) { throw "Node.js download exceeded its $TimeoutSeconds-second deadline." }
+        throw
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        if ($null -ne $response) { $response.Dispose() }
+        $request.Dispose()
+        $client.Dispose()
+        $deadline.Dispose()
+    }
+}
+
+function Copy-FileDurable {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Source, [Parameter(Mandatory)][string]$Destination)
+    $sourceFull = Resolve-FullPath -Path $Source -MustExist -PathType Leaf
+    $destinationFull = Resolve-FullPath -Path $Destination
+    if (Test-Path -LiteralPath $destinationFull) { throw "Durable copy destination already exists: $destinationFull" }
+    $input = [IO.File]::Open($sourceFull, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $output = $null
+    try {
+        $output = New-Object IO.FileStream($destinationFull, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None, 1048576, [IO.FileOptions]::WriteThrough)
+        $input.CopyTo($output, 1048576)
+        $output.Flush($true)
+    } catch {
+        if ($null -ne $output) { $output.Dispose(); $output = $null }
+        if (Test-Path -LiteralPath $destinationFull -PathType Leaf) { Remove-Item -LiteralPath $destinationFull -Force }
+        throw
+    } finally {
+        if ($null -ne $output) { $output.Dispose() }
+        $input.Dispose()
+    }
+    return $destinationFull
+}
+
+function Assert-InternalNodeRuntimeTestHooks {
+    [CmdletBinding()]
+    param([hashtable]$Hooks)
+
+    if ($null -eq $Hooks) { return }
+    $allowed = @(
+        'ExpectedArchiveSha256',
+        'DownloadArchive',
+        'ExpandArchive',
+        'PeMachineTypeProbe',
+        'FileVersionProbe',
+        'NativeVersionProbe',
+        'PublicationCheckpoint'
+    )
+    foreach ($key in @($Hooks.Keys)) {
+        if ($key -isnot [string] -or $allowed -cnotcontains [string]$key) {
+            throw "Unsupported internal Node runtime test hook '$key'."
+        }
+    }
+    foreach ($required in @('ExpectedArchiveSha256','DownloadArchive','ExpandArchive')) {
+        if (-not $Hooks.ContainsKey($required)) { throw "Internal Node runtime test hooks are missing '$required'." }
+    }
+    if ($Hooks.ExpectedArchiveSha256 -isnot [string] -or [string]$Hooks.ExpectedArchiveSha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'Internal Node runtime archive SHA-256 must be a lowercase 64-character hexadecimal string.'
+    }
+    foreach ($scriptblockName in @('DownloadArchive','ExpandArchive','PeMachineTypeProbe','FileVersionProbe','NativeVersionProbe','PublicationCheckpoint')) {
+        if ($Hooks.ContainsKey($scriptblockName) -and $Hooks[$scriptblockName] -isnot [scriptblock]) {
+            throw "Internal Node runtime test hook '$scriptblockName' must be a script block."
+        }
+    }
+}
+
+function Test-PinnedNodeRuntimePair {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$NodePath,
+        [Parameter(Mandatory)][string]$LicensePath,
+        [scriptblock]$InternalPeMachineTypeProbe,
+        [scriptblock]$InternalFileVersionProbe,
+        [scriptblock]$InternalNativeVersionProbe
+    )
+    if (-not (Test-Path -LiteralPath $NodePath -PathType Leaf) -or -not (Test-Path -LiteralPath $LicensePath -PathType Leaf)) { return $false }
+    $node = Get-Item -LiteralPath $NodePath -Force
+    $license = Get-Item -LiteralPath $LicensePath -Force
+    if (($node.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or ($license.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'Refusing a Node.js runtime pair containing a reparse point.'
+    }
+    if ([int64]$node.Length -ne 92299080 -or [int64]$license.Length -ne 159872) { return $false }
+    if ((Get-FileHash -LiteralPath $node.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -cne $script:PinnedNodeExecutableSha256 -or
+        (Get-FileHash -LiteralPath $license.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -cne $script:PinnedNodeLicenseSha256) { return $false }
+    $machineType = if ($null -eq $InternalPeMachineTypeProbe) { Get-PeMachineType -Path $node.FullName } else { & $InternalPeMachineTypeProbe $node.FullName }
+    $fileVersion = if ($null -eq $InternalFileVersionProbe) { [string]$node.VersionInfo.FileVersion } else { [string](& $InternalFileVersionProbe $node.FullName) }
+    if ([int]$machineType -ne 0x8664 -or $fileVersion -cne '24.17.0') { return $false }
+    $version = if ($null -eq $InternalNativeVersionProbe) {
+        Invoke-NativeCapture -FilePath $node.FullName -Arguments @('--version')
+    } else {
+        & $InternalNativeVersionProbe $node.FullName
+    }
+    if ($null -eq $version -or $null -eq $version.PSObject.Properties['ExitCode'] -or $null -eq $version.PSObject.Properties['Text']) { return $false }
+    return $version.ExitCode -eq 0 -and $version.Text.Trim() -ceq $script:PinnedNodeVersion
+}
+
+function Test-Mql5ChmRegistrationStructure {
+    [CmdletBinding()]
+    param([AllowNull()][object]$Registration)
+    if ($null -eq $Registration -or $Registration -is [array] -or $Registration -isnot [pscustomobject]) { return $false }
+    $nameProperty = $Registration.PSObject.Properties['name']
+    $enabledProperty = $Registration.PSObject.Properties['enabled']
+    $transportProperty = $Registration.PSObject.Properties['transport']
+    if ($null -eq $nameProperty -or $nameProperty.Value -isnot [string] -or [string]$nameProperty.Value -cne 'mql5-chm' -or
+        $null -eq $enabledProperty -or $enabledProperty.Value -isnot [bool] -or $null -eq $transportProperty) { return $false }
+    $transport = $transportProperty.Value
+    if ($null -eq $transport -or $transport -is [array] -or $transport -isnot [pscustomobject]) { return $false }
+    foreach ($requiredString in @('type','command')) {
+        $property = $transport.PSObject.Properties[$requiredString]
+        if ($null -eq $property -or $property.Value -isnot [string]) { return $false }
+    }
+    $argsProperty = $transport.PSObject.Properties['args']
+    if ($null -eq $argsProperty -or $argsProperty.Value -isnot [array]) { return $false }
+    foreach ($value in @($argsProperty.Value)) { if ($value -isnot [string]) { return $false } }
+
+    $envProperty = $transport.PSObject.Properties['env']
+    if ($null -ne $envProperty -and $null -ne $envProperty.Value) {
+        $envValue = $envProperty.Value
+        if ($envValue -is [array] -or -not ($envValue -is [pscustomobject] -or $envValue -is [Collections.IDictionary])) { return $false }
+        $envEntries = if ($envValue -is [Collections.IDictionary]) {
+            @($envValue.Keys | ForEach-Object { [pscustomobject]@{Name=[string]$_;Value=$envValue[$_]} })
+        } else { @($envValue.PSObject.Properties) }
+        foreach ($entry in $envEntries) {
+            if ([string]::IsNullOrWhiteSpace([string]$entry.Name) -or $entry.Value -isnot [string]) { return $false }
+        }
+    }
+    $envVarsProperty = $transport.PSObject.Properties['env_vars']
+    if ($null -ne $envVarsProperty -and $null -ne $envVarsProperty.Value) {
+        if ($envVarsProperty.Value -isnot [array]) { return $false }
+        foreach ($value in @($envVarsProperty.Value)) { if ($value -isnot [string]) { return $false } }
+    }
+    $cwdProperty = $transport.PSObject.Properties['cwd']
+    if ($null -ne $cwdProperty -and $null -ne $cwdProperty.Value -and $cwdProperty.Value -isnot [string]) { return $false }
+    foreach ($filterName in @('enabled_tools','disabled_tools')) {
+        $filterProperty = $Registration.PSObject.Properties[$filterName]
+        if ($null -eq $filterProperty -or $null -eq $filterProperty.Value) { continue }
+        if ($filterProperty.Value -isnot [array]) { return $false }
+        foreach ($value in @($filterProperty.Value)) { if ($value -isnot [string]) { return $false } }
+    }
+    return $true
+}
+
+function Get-CodexMcpRegistration {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$CodexPath)
+
+    $result = Invoke-NativeCapture -FilePath $CodexPath -Arguments @('mcp', 'list', '--json')
+    if ($result.ExitCode -ne 0) { throw "Unable to list Codex MCP registrations. $($result.Text)" }
+    $listText = $result.Text.Trim()
+    if (-not $listText.StartsWith('[') -or -not $listText.EndsWith(']')) {
+        throw 'Codex returned a non-array JSON value for its MCP registrations.'
+    }
+    try { $registrations = @($listText | ConvertFrom-Json -ErrorAction Stop) } catch {
+        throw "Codex returned invalid JSON for its MCP registrations: $($_.Exception.Message)"
+    }
+    $matches = @()
+    foreach ($registration in $registrations) {
+        if ($null -eq $registration -or $null -eq $registration.PSObject.Properties['name'] -or
+            -not ($registration.name -is [string])) {
+            throw 'Codex returned a malformed MCP registration list entry.'
+        }
+        if ([string]$registration.name -ceq 'mql5-chm') { $matches += $registration }
+    }
+    if ($matches.Count -gt 1) { throw 'Codex returned duplicate mql5-chm registrations.' }
+    if ($matches.Count -eq 0) { return $null }
+
+    $details = Invoke-NativeCapture -FilePath $CodexPath -Arguments @('mcp', 'get', 'mql5-chm', '--json')
+    if ($details.ExitCode -ne 0) { throw "Codex listed mql5-chm but could not read it. $($details.Text)" }
+    $detailText = $details.Text.Trim()
+    if (-not $detailText.StartsWith('{') -or -not $detailText.EndsWith('}')) {
+        throw 'Codex returned a non-object JSON value for the mql5-chm registration.'
+    }
+    try { $detail = $detailText | ConvertFrom-Json -ErrorAction Stop } catch {
+        throw "Codex returned invalid JSON for the mql5-chm registration: $($_.Exception.Message)"
+    }
+    if (-not (Test-Mql5ChmRegistrationStructure -Registration $detail)) {
+        throw 'Codex returned registration details that are malformed or do not identify the exact mql5-chm entry.'
+    }
+    return $detail
+}
+
+function Test-Mql5ChmRegistrationOwned {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][object]$Registration,
@@ -431,18 +788,59 @@ function Test-Mql5ChmRegistrationMatches {
     )
 
     try {
-        $transport = Get-RequiredJsonProperty -Object $Registration -Name 'transport' -Context 'Codex registration'
-        $type = [string](Get-RequiredJsonProperty -Object $transport -Name 'type' -Context 'Codex registration transport')
-        $command = [string](Get-RequiredJsonProperty -Object $transport -Name 'command' -Context 'Codex registration transport')
-        $arguments = @(Get-RequiredJsonProperty -Object $transport -Name 'args' -Context 'Codex registration transport')
+        $transportProperty = $Registration.PSObject.Properties['transport']
+        if ($null -eq $transportProperty) { return $false }
+        $transport = $transportProperty.Value
+        if ($null -eq $transport -or $transport -is [array] -or
+            -not ($transport -is [pscustomobject] -or $transport -is [Collections.IDictionary])) { return $false }
+        $typeProperty = $transport.PSObject.Properties['type']
+        $commandProperty = $transport.PSObject.Properties['command']
+        if ($null -eq $typeProperty -or $null -eq $commandProperty) { return $false }
+        $typeValue = $typeProperty.Value
+        $commandValue = $commandProperty.Value
+        if ($typeValue -isnot [string] -or $commandValue -isnot [string]) { return $false }
+        $type = [string]$typeValue
+        $command = [string]$commandValue
+        $argumentsProperty = $transport.PSObject.Properties['args']
+        if ($null -eq $argumentsProperty) { return $false }
+        $rawArguments = $argumentsProperty.Value
+        if ($null -eq $rawArguments -or -not ($rawArguments -is [Array])) { return $false }
+        $arguments = @($rawArguments)
+        if ($arguments.Count -ne 1 -or -not ($arguments[0] -is [string])) { return $false }
         $serverArgument = [string]$arguments[0]
         $commandIsAbsolute = [IO.Path]::IsPathRooted($command) -and
             ($command -match '^[A-Za-z]:[\\/]' -or $command -match '^\\\\[^\\/]+[\\/][^\\/]+')
         $serverIsAbsolute = [IO.Path]::IsPathRooted($serverArgument) -and
             ($serverArgument -match '^[A-Za-z]:[\\/]' -or $serverArgument -match '^\\\\[^\\/]+[\\/][^\\/]+')
-        if ($type -cne 'stdio' -or $arguments.Count -ne 1 -or
+        if ($type -cne 'stdio' -or
             -not $commandIsAbsolute -or -not $serverIsAbsolute) { return $false }
 
+        $registeredNode = [IO.Path]::GetFullPath($command)
+        $registeredServer = [IO.Path]::GetFullPath([string]$arguments[0])
+        $expectedNode = [IO.Path]::GetFullPath($NodePath)
+        $expectedServer = [IO.Path]::GetFullPath($ServerPath)
+        return (
+            $registeredNode.Equals($expectedNode, [StringComparison]::OrdinalIgnoreCase) -and
+            $registeredServer.Equals($expectedServer, [StringComparison]::OrdinalIgnoreCase)
+        )
+    } catch {
+        return $false
+    }
+}
+
+function Test-Mql5ChmRegistrationEquivalent {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Registration,
+        [Parameter(Mandatory)][string]$NodePath,
+        [Parameter(Mandatory)][string]$ServerPath
+    )
+
+    if (-not (Test-Mql5ChmRegistrationOwned -Registration $Registration -NodePath $NodePath -ServerPath $ServerPath)) {
+        return $false
+    }
+    try {
+        $transport = Get-RequiredJsonProperty -Object $Registration -Name 'transport' -Context 'Codex registration'
         $envProperty = $transport.PSObject.Properties['env']
         if ($null -ne $envProperty -and $null -ne $envProperty.Value) {
             $envValue = $envProperty.Value
@@ -471,16 +869,115 @@ function Test-Mql5ChmRegistrationMatches {
             if ($filterValue -is [string] -or -not ($filterValue -is [Collections.IEnumerable]) -or @($filterValue).Count -ne 0) { return $false }
         }
 
-        $registeredNode = [IO.Path]::GetFullPath($command)
-        $registeredServer = [IO.Path]::GetFullPath([string]$arguments[0])
-        $expectedNode = [IO.Path]::GetFullPath($NodePath)
-        $expectedServer = [IO.Path]::GetFullPath($ServerPath)
-        return (
-            $registeredNode.Equals($expectedNode, [StringComparison]::OrdinalIgnoreCase) -and
-            $registeredServer.Equals($expectedServer, [StringComparison]::OrdinalIgnoreCase)
-        )
+        return $true
     } catch {
         return $false
+    }
+}
+
+function Test-Mql5ChmRegistrationMatches {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Registration,
+        [Parameter(Mandatory)][string]$NodePath,
+        [Parameter(Mandatory)][string]$ServerPath
+    )
+    return Test-Mql5ChmRegistrationEquivalent -Registration $Registration -NodePath $NodePath -ServerPath $ServerPath
+}
+
+function Install-CodexMql5ChmRegistration {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$CodexPath,
+        [Parameter(Mandatory)][string]$NodePath,
+        [Parameter(Mandatory)][string]$ServerPath
+    )
+
+    $registrationLock = Enter-CodexRegistrationMutex
+    try {
+    $existing = Get-CodexMcpRegistration -CodexPath $CodexPath
+    if ($null -ne $existing) {
+        if (-not (Test-Mql5ChmRegistrationEquivalent -Registration $existing -NodePath $NodePath -ServerPath $ServerPath)) {
+            throw "A conflicting Codex MCP registration named 'mql5-chm' already exists. Remove it explicitly before installing this package."
+        }
+        $enabled = Get-RequiredJsonProperty -Object $existing -Name 'enabled' -Context 'Codex registration'
+        if (-not ($enabled -is [bool]) -or -not $enabled) {
+            throw 'The existing mql5-chm registration points to this package but is disabled or malformed. Refusing to replace it automatically.'
+        }
+        return [pscustomobject]@{ State='already-installed'; Registration=$existing }
+    }
+
+    $failureMessage = $null
+    $add = Invoke-NativeCapture -FilePath $CodexPath -Arguments @('mcp', 'add', 'mql5-chm', '--', $NodePath, $ServerPath)
+    if ($add.ExitCode -ne 0) {
+        $failureMessage = "Failed to register mql5-chm with Codex. Exit code: $($add.ExitCode). $($add.Text)"
+    } else {
+        try {
+            $installed = Get-CodexMcpRegistration -CodexPath $CodexPath
+            $enabled = if ($null -eq $installed) { $null } else { Get-RequiredJsonProperty -Object $installed -Name 'enabled' -Context 'Codex registration' }
+            if ($null -ne $installed -and
+                (Test-Mql5ChmRegistrationEquivalent -Registration $installed -NodePath $NodePath -ServerPath $ServerPath) -and
+                $enabled -is [bool] -and $enabled) {
+                return [pscustomobject]@{ State='installed'; Registration=$installed }
+            }
+            $failureMessage = 'Codex reported success, but the installed mql5-chm registration was missing, disabled, malformed, or did not match the verified package paths.'
+        } catch {
+            $failureMessage = "Codex reported success, but post-install validation failed: $($_.Exception.Message)"
+        }
+    }
+
+    try { $current = Get-CodexMcpRegistration -CodexPath $CodexPath } catch {
+        throw "$failureMessage Rollback was withheld because the current registration could not be inspected safely: $($_.Exception.Message)"
+    }
+    if ($null -eq $current) { throw "$failureMessage No mql5-chm registration remains." }
+    if (-not (Test-Mql5ChmRegistrationOwned -Registration $current -NodePath $NodePath -ServerPath $ServerPath)) {
+        throw "$failureMessage Rollback was withheld because the registration now targets a different package."
+    }
+
+    $remove = Invoke-NativeCapture -FilePath $CodexPath -Arguments @('mcp', 'remove', 'mql5-chm')
+    $removeFailure = if ($remove.ExitCode -ne 0) { " Automatic rollback command reported exit code $($remove.ExitCode): $($remove.Text)" } else { '' }
+    try { $afterRemoval = Get-CodexMcpRegistration -CodexPath $CodexPath } catch {
+        throw "$failureMessage$removeFailure Automatic rollback ran, but its postcondition could not be verified: $($_.Exception.Message)"
+    }
+    if ($null -ne $afterRemoval) {
+        throw "$failureMessage$removeFailure Automatic rollback did not leave the registration absent; the observed entry was preserved and no second removal was attempted."
+    }
+    if ($remove.ExitCode -ne 0) { throw "$failureMessage$removeFailure The registration is nevertheless confirmed absent." }
+    throw "$failureMessage The newly created registration was rolled back."
+    } finally {
+        $registrationLock.Dispose()
+    }
+}
+
+function Uninstall-CodexMql5ChmRegistration {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$CodexPath,
+        [Parameter(Mandatory)][string]$NodePath,
+        [Parameter(Mandatory)][string]$ServerPath
+    )
+
+    $registrationLock = Enter-CodexRegistrationMutex
+    try {
+    $existing = Get-CodexMcpRegistration -CodexPath $CodexPath
+    if ($null -eq $existing) { return [pscustomobject]@{ State='absent' } }
+    if (-not (Test-Mql5ChmRegistrationOwned -Registration $existing -NodePath $NodePath -ServerPath $ServerPath)) {
+        throw "The mql5-chm registration belongs to a different package path; refusing to remove it."
+    }
+    $remove = Invoke-NativeCapture -FilePath $CodexPath -Arguments @('mcp', 'remove', 'mql5-chm')
+    $removeFailure = if ($remove.ExitCode -ne 0) { "Codex remove reported exit code $($remove.ExitCode): $($remove.Text)" } else { $null }
+    try { $afterRemoval = Get-CodexMcpRegistration -CodexPath $CodexPath } catch {
+        $prefix = if ($null -eq $removeFailure) { 'Codex remove ran' } else { $removeFailure }
+        throw "$prefix, but the uninstall postcondition could not be inspected safely: $($_.Exception.Message)"
+    }
+    if ($null -ne $afterRemoval) {
+        $prefix = if ($null -eq $removeFailure) { 'Codex reported successful removal' } else { $removeFailure }
+        throw "$prefix, but an mql5-chm registration is still present; the observed entry was preserved and no second removal was attempted."
+    }
+    if ($null -ne $removeFailure) { throw "$removeFailure, but the mql5-chm registration is confirmed absent." }
+    return [pscustomobject]@{ State='removed' }
+    } finally {
+        $registrationLock.Dispose()
     }
 }
 
@@ -488,8 +985,8 @@ function Assert-ExactJsonProperties {
     [CmdletBinding()]
     param([Parameter(Mandatory)][object]$Object, [Parameter(Mandatory)][string[]]$Names, [string]$Context = 'JSON object')
     $actual = @($Object.PSObject.Properties.Name)
-    foreach ($name in $Names) { if ($actual -notcontains $name) { throw "$Context is missing required property '$name'." } }
-    foreach ($name in $actual) { if ($Names -notcontains $name) { throw "$Context contains unsupported property '$name'." } }
+    foreach ($name in $Names) { if ($actual -cnotcontains $name) { throw "$Context is missing required property '$name'." } }
+    foreach ($name in $actual) { if ($Names -cnotcontains $name) { throw "$Context contains unsupported property '$name'." } }
 }
 
 function Read-JsonFile {
@@ -501,6 +998,76 @@ function Read-JsonFile {
         if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')) { return ConvertFrom-Json -InputObject $json -DateKind String -ErrorAction Stop }
         return ConvertFrom-Json -InputObject $json -ErrorAction Stop
     } catch { throw "Invalid $Context '$full': $($_.Exception.Message)" }
+}
+
+function Get-PeMachineType {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    $full = Resolve-FullPath -Path $Path -MustExist -PathType Leaf
+    $stream = [IO.File]::OpenRead($full)
+    $reader = New-Object IO.BinaryReader($stream)
+    try {
+        if ($stream.Length -lt 64 -or $reader.ReadUInt16() -ne 0x5A4D) { throw "File is not a PE image: $full" }
+        $stream.Position = 0x3C
+        $peOffset = $reader.ReadInt32()
+        if ($peOffset -lt 64 -or $peOffset -gt ($stream.Length - 6)) { throw "PE header offset is invalid: $full" }
+        $stream.Position = $peOffset
+        if ($reader.ReadUInt32() -ne 0x00004550) { throw "PE signature is invalid: $full" }
+        return $reader.ReadUInt16()
+    } finally {
+        $reader.Dispose()
+        $stream.Dispose()
+    }
+}
+
+function Assert-SevenZipProvenance {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ProjectRoot)
+
+    $root = Resolve-FullPath -Path $ProjectRoot -MustExist -PathType Container
+    $provenancePath = Join-Path $root 'tools\7zip.provenance.json'
+    $provenance = Read-JsonFile -Path $provenancePath -Context '7-Zip provenance manifest'
+    Assert-ExactJsonProperties -Object $provenance -Names @('schema_version','distribution','version','architecture','upstream_url','artifact_bytes','artifact_sha256','files','required_format') -Context '7-Zip provenance manifest'
+    if ([int]$provenance.schema_version -ne 1 -or [string]$provenance.distribution -cne 'official-windows-x64-msi' -or
+        [string]$provenance.version -cne $script:PinnedSevenZipVersion -or [string]$provenance.architecture -cne 'x64' -or
+        [string]$provenance.upstream_url -cne 'https://github.com/ip7z/7zip/releases/download/26.02/7z2602-x64.msi' -or
+        [int64]$provenance.artifact_bytes -ne 1999872 -or [string]$provenance.artifact_sha256 -cne $script:PinnedSevenZipArtifactSha256 -or
+        [string]$provenance.required_format -cne 'Chm') {
+        throw '7-Zip provenance manifest does not match the pinned official Windows x64 26.02 distribution.'
+    }
+    Assert-ExactJsonProperties -Object $provenance.files -Names @('tools/7z.exe','tools/7z.dll','licenses/7ZIP-LICENSE.txt') -Context '7-Zip provenance files'
+    $expectations = @(
+        [pscustomobject]@{Relative='tools/7z.exe';Bytes=576000;Sha256=$script:PinnedSevenZipExecutableSha256;Version=$script:PinnedSevenZipVersion;Pe=$true},
+        [pscustomobject]@{Relative='tools/7z.dll';Bytes=1906688;Sha256=$script:PinnedSevenZipLibrarySha256;Version=$script:PinnedSevenZipVersion;Pe=$true},
+        [pscustomobject]@{Relative='licenses/7ZIP-LICENSE.txt';Bytes=6031;Sha256=$script:PinnedSevenZipLicenseSha256;Version=$null;Pe=$false}
+    )
+    foreach ($expected in $expectations) {
+        $entry = $provenance.files.PSObject.Properties[$expected.Relative].Value
+        $names = if ($expected.Pe) { @('bytes','sha256','file_version') } else { @('bytes','sha256') }
+        Assert-ExactJsonProperties -Object $entry -Names $names -Context "7-Zip provenance entry '$($expected.Relative)'"
+        if ([int64]$entry.bytes -ne [int64]$expected.Bytes -or [string]$entry.sha256 -cne [string]$expected.Sha256 -or
+            ($expected.Pe -and [string]$entry.file_version -cne [string]$expected.Version)) {
+            throw "7-Zip provenance entry does not match the pinned distribution: $($expected.Relative)"
+        }
+        $filePath = Resolve-FullPath -Path (Join-Path $root $expected.Relative.Replace('/','\')) -MustExist -PathType Leaf
+        $item = Get-Item -LiteralPath $filePath
+        if ([int64]$item.Length -ne [int64]$expected.Bytes -or
+            (Get-FileHash -LiteralPath $filePath -Algorithm SHA256).Hash.ToLowerInvariant() -cne [string]$expected.Sha256) {
+            throw "Pinned 7-Zip file failed provenance validation: $filePath"
+        }
+        if ($expected.Pe) {
+            if ([string]$item.VersionInfo.FileVersion -cne [string]$expected.Version -or (Get-PeMachineType -Path $filePath) -ne 0x8664) {
+                throw "Pinned 7-Zip file has the wrong version or architecture: $filePath"
+            }
+        }
+    }
+    $extractor = Resolve-FullPath -Path (Join-Path $root 'tools\7z.exe') -MustExist -PathType Leaf
+    $probe = Invoke-NativeCapture -FilePath $extractor -Arguments @('i')
+    if ($probe.ExitCode -ne 0 -or $probe.Text -notmatch '(?m)^7-Zip 26\.02 \(x64\)' -or
+        $probe.Text -notmatch '(?im)^\s*.*Chm\s+chm\b') {
+        throw "Pinned 7-Zip executable failed version or CHM-capability validation: $extractor"
+    }
+    return [pscustomobject]@{ ExeName='7z.exe'; DllName='7z.dll'; Extractor=$extractor; Provenance=$provenancePath }
 }
 
 function Assert-UtcIsoTimestamp {
@@ -573,19 +1140,894 @@ function Write-JsonAtomic {
     Assert-NoReparsePoint -Root $root -Path $parent
     $leaf = [IO.Path]::GetFileName($target)
     $transactionId = [Guid]::NewGuid().ToString('N')
+    $writing = Assert-PathWithin -Root $root -Path (Join-Path $parent (".$leaf.replace.writing-$transactionId"))
     $temporary = Assert-PathWithin -Root $root -Path (Join-Path $parent (".$leaf.replace.tmp-$transactionId"))
     $backup = Assert-PathWithin -Root $root -Path (Join-Path $parent (".$leaf.replace.backup-$transactionId"))
     $utf8 = New-Object System.Text.UTF8Encoding($false)
     $json = ($Value | ConvertTo-Json -Depth 20) + [Environment]::NewLine
     $prepared = $false
     try {
-        $stream = New-Object System.IO.FileStream($temporary, 'CreateNew', 'Write', 'None')
+        $stream = New-Object System.IO.FileStream($writing, 'CreateNew', 'Write', 'None')
         try { $bytes = $utf8.GetBytes($json); $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+        [IO.File]::Move($writing, $temporary)
         $prepared = $true
         Publish-PreparedAtomicFile -TemporaryPath $temporary -TargetPath $target -BackupPath $backup
     } catch {
-        if (-not $prepared -and (Test-Path -LiteralPath $temporary -PathType Leaf)) { Remove-Item -LiteralPath $temporary -Force -ErrorAction Stop }
+        if (-not $prepared) {
+            foreach ($incomplete in @($writing,$temporary)) {
+                if (Test-Path -LiteralPath $incomplete -PathType Leaf) { Remove-Item -LiteralPath $incomplete -Force -ErrorAction Stop }
+            }
+        }
         throw
+    }
+}
+
+function Assert-TransactionLeafName {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Name, [string]$Context = 'transaction file')
+    if ([string]::IsNullOrWhiteSpace($Name) -or $Name -in @('.','..') -or
+        [IO.Path]::GetFileName($Name) -cne $Name -or $Name.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) {
+        throw "$Context must be one safe leaf name."
+    }
+    return $Name
+}
+
+function Test-FileDescriptorMatch {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][int64]$Bytes,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$Sha256
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    $item = Get-Item -LiteralPath $Path
+    return [int64]$item.Length -eq $Bytes -and
+        (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $Sha256
+}
+
+function Assert-ExactTransactionTargetSet {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string[]]$Actual,
+        [Parameter(Mandatory)][string[]]$Expected
+    )
+    if ($Actual.Count -ne $Expected.Count) { throw 'Prepared file-set transaction target set does not match its intended context.' }
+    $actualSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    foreach ($name in $Actual) {
+        $leaf = Assert-TransactionLeafName -Name $name -Context 'transaction target'
+        if (-not $actualSet.Add($leaf)) { throw 'Prepared file-set transaction contains duplicate target names.' }
+    }
+    $expectedSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    foreach ($name in $Expected) {
+        $leaf = Assert-TransactionLeafName -Name $name -Context 'expected transaction target'
+        if (-not $expectedSet.Add($leaf)) { throw 'Expected transaction target set contains duplicate names.' }
+    }
+    if (-not $actualSet.SetEquals($expectedSet)) { throw 'Prepared file-set transaction target set does not match its intended context.' }
+}
+
+function Assert-PreparedFileSetTransactionContext {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$JournalName,
+        [Parameter(Mandatory)][object]$Journal,
+        [Parameter(Mandatory)][object[]]$States,
+        [Parameter(Mandatory)][ValidateSet('node-runtime','sevenzip-license','sevenzip-runtime','portable-zip')][string]$ExpectedRole,
+        [Parameter(Mandatory)][string[]]$ExpectedTargetNames
+    )
+    if ([int]$Journal.schema_version -ne 2 -or [string]$Journal.role -cne $ExpectedRole) {
+        throw "Prepared file-set transaction is not bound to the expected '$ExpectedRole' context."
+    }
+    Assert-ExactTransactionTargetSet -Actual @($States | ForEach-Object { [string]$_.Item.target }) -Expected $ExpectedTargetNames
+    $journalLeaf = Assert-TransactionLeafName -Name $JournalName -Context 'transaction journal'
+    $transactionId = [string]$Journal.transaction_id
+    $byTarget = @{}
+    foreach ($state in $States) { $byTarget[[string]$state.Item.target] = $state }
+
+    if ($ExpectedRole -ceq 'node-runtime') {
+        Assert-ExactTransactionTargetSet -Actual $ExpectedTargetNames -Expected @('LICENSE','node.exe')
+        if ($journalLeaf -cne '.node-runtime-transaction.json') { throw 'Node runtime transaction journal name is invalid for its context.' }
+        $licensePrepared = [string]$byTarget['LICENSE'].Item.prepared
+        $nodePrepared = [string]$byTarget['node.exe'].Item.prepared
+        if ($licensePrepared -cnotmatch '^\.node-license-([0-9a-f]{32})\.prepared$') { throw 'Node runtime license prepared name is not token-bound.' }
+        $preparedToken = $Matches[1]
+        if ($nodePrepared -cnotmatch '^\.node-([0-9a-f]{32})\.prepared$' -or $Matches[1] -cne $preparedToken) {
+            throw 'Node runtime executable prepared name is not bound to the same token.'
+        }
+        $licenseItem = $byTarget['LICENSE'].Item
+        $nodeItem = $byTarget['node.exe'].Item
+        if ([int64]$licenseItem.new_bytes -ne 159872 -or [string]$licenseItem.new_sha256 -cne $script:PinnedNodeLicenseSha256 -or
+            [int64]$nodeItem.new_bytes -ne 92299080 -or [string]$nodeItem.new_sha256 -cne $script:PinnedNodeExecutableSha256) {
+            throw 'Node runtime transaction candidate descriptors do not match the pinned runtime pair.'
+        }
+    } elseif ($ExpectedRole -ceq 'sevenzip-license') {
+        Assert-ExactTransactionTargetSet -Actual $ExpectedTargetNames -Expected @('7ZIP-LICENSE.txt')
+        if ($journalLeaf -cne '.7zip-license-transaction.json') { throw '7-Zip license transaction journal name is invalid for its context.' }
+        $licensePrepared = [string]$byTarget['7ZIP-LICENSE.txt'].Item.prepared
+        if ($licensePrepared -cnotmatch '^\.7zip-license-([0-9a-f]{32})\.prepared$') { throw '7-Zip license prepared name is not token-bound.' }
+        $licenseItem = $byTarget['7ZIP-LICENSE.txt'].Item
+        if ([int64]$licenseItem.new_bytes -ne 6031 -or [string]$licenseItem.new_sha256 -cne $script:PinnedSevenZipLicenseSha256) {
+            throw '7-Zip license transaction candidate descriptor does not match the pinned official license.'
+        }
+    } elseif ($ExpectedRole -ceq 'sevenzip-runtime') {
+        Assert-ExactTransactionTargetSet -Actual $ExpectedTargetNames -Expected @('7z.dll','7z.exe')
+        if ($journalLeaf -cne '.7zip-runtime-transaction.json') { throw '7-Zip runtime transaction journal name is invalid for its context.' }
+        $dllPrepared = [string]$byTarget['7z.dll'].Item.prepared
+        $exePrepared = [string]$byTarget['7z.exe'].Item.prepared
+        if ($dllPrepared -cnotmatch '^\.7z-dll-([0-9a-f]{32})\.prepared$') { throw '7-Zip library prepared name is not token-bound.' }
+        $preparedToken = $Matches[1]
+        if ($exePrepared -cnotmatch '^\.7z-exe-([0-9a-f]{32})\.prepared$' -or $Matches[1] -cne $preparedToken) {
+            throw '7-Zip executable prepared name is not bound to the same token.'
+        }
+        $dllItem = $byTarget['7z.dll'].Item
+        $exeItem = $byTarget['7z.exe'].Item
+        if ([int64]$dllItem.new_bytes -ne 1906688 -or [string]$dllItem.new_sha256 -cne $script:PinnedSevenZipLibrarySha256 -or
+            [int64]$exeItem.new_bytes -ne 576000 -or [string]$exeItem.new_sha256 -cne $script:PinnedSevenZipExecutableSha256) {
+            throw '7-Zip runtime transaction candidate descriptors do not match the pinned runtime pair.'
+        }
+    } else {
+        if ($ExpectedTargetNames.Count -ne 2) { throw 'Portable ZIP transaction must have exactly two intended targets.' }
+        $zipTarget = @($ExpectedTargetNames | Where-Object { $_.EndsWith('.zip', [StringComparison]::Ordinal) })
+        if ($zipTarget.Count -ne 1) { throw 'Portable ZIP transaction has an invalid ZIP target.' }
+        $zipLeaf = [string]$zipTarget[0]
+        $manifestLeaf = "$zipLeaf.manifest.json"
+        Assert-ExactTransactionTargetSet -Actual $ExpectedTargetNames -Expected @($zipLeaf,$manifestLeaf)
+        if ($journalLeaf -cne ".$zipLeaf.publication-transaction.json") { throw 'Portable ZIP transaction journal name is invalid for its release target.' }
+        $zipPrepared = [string]$byTarget[$zipLeaf].Item.prepared
+        $manifestPrepared = [string]$byTarget[$manifestLeaf].Item.prepared
+        if ($zipPrepared -cnotmatch '^\.package-([0-9a-f]{32})\.prepared\.zip$') { throw 'Portable ZIP prepared name is not token-bound.' }
+        $preparedToken = $Matches[1]
+        if ($manifestPrepared -cnotmatch '^\.package-([0-9a-f]{32})\.prepared\.manifest\.json$' -or $Matches[1] -cne $preparedToken) {
+            throw 'Portable ZIP sidecar prepared name is not bound to the same token.'
+        }
+    }
+
+    foreach ($state in $States) {
+        $expectedBackup = ".$([string]$state.Item.target).backup-$transactionId"
+        if ([string]$state.Item.backup -cne $expectedBackup) { throw 'Prepared file-set transaction backup name is not bound to its target and transaction.' }
+    }
+}
+
+function Test-TransactionJsonInteger {
+    param([AllowNull()][object]$Value)
+    return $Value -is [byte] -or $Value -is [sbyte] -or $Value -is [int16] -or $Value -is [uint16] -or
+        $Value -is [int32] -or $Value -is [uint32] -or $Value -is [int64]
+}
+
+function Assert-PortableZipInternalChecksumClosure {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ZipPath)
+
+    $zipFull = Resolve-FullPath -Path $ZipPath -MustExist -PathType Leaf
+    $zipItem = Get-Item -LiteralPath $zipFull -Force
+    if (($zipItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Portable ZIP must not be a reparse point.' }
+    Add-Type -AssemblyName System.IO.Compression -ErrorAction Stop
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+    $archive = [IO.Compression.ZipFile]::OpenRead($zipFull)
+    try {
+        if ($archive.Entries.Count -eq 0) { throw 'Portable ZIP contains no entries.' }
+        $entries = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
+        $rootName = $null
+        $totalUncompressed = [int64]0
+        foreach ($entry in $archive.Entries) {
+            $entryName = [string]$entry.FullName.Replace('\','/')
+            if ([string]::IsNullOrWhiteSpace($entryName) -or $entryName.StartsWith('/') -or $entryName.Contains([char]0) -or
+                $entryName -match '(^|/)\.\.?(/|$)' -or $entryName -match '//') {
+                throw "Portable ZIP contains an unsafe entry name: $entryName"
+            }
+            $segments = @($entryName.TrimEnd('/') -split '/')
+            if ($segments.Count -lt 1 -or @($segments | Where-Object { [string]::IsNullOrWhiteSpace($_) -or $_ -match '[<>:"|?*\x00-\x1f]' }).Count -gt 0) {
+                throw "Portable ZIP contains an invalid Windows entry path: $entryName"
+            }
+            if ($null -eq $rootName) { $rootName = [string]$segments[0] }
+            if ([string]$segments[0] -cne $rootName) { throw 'Portable ZIP contains more than one top-level package root.' }
+            $isDirectory = $entryName.EndsWith('/') -or [string]::IsNullOrEmpty($entry.Name)
+            if ($isDirectory) { continue }
+            if ($segments.Count -lt 2) { throw 'Portable ZIP contains a file outside its top-level package directory.' }
+            if ([int64]$entry.Length -lt 0 -or [int64]$entry.Length -gt 536870912) { throw "Portable ZIP entry has an unsafe uncompressed size: $entryName" }
+            $totalUncompressed += [int64]$entry.Length
+            if ($totalUncompressed -gt 1073741824) { throw 'Portable ZIP exceeds the 1 GiB uncompressed package limit.' }
+            if ($entries.ContainsKey($entryName)) {
+                $existing = $entries[$entryName]
+                $kind = if ([string]$existing.FullName -ceq $entryName) { 'duplicate' } else { 'case-colliding' }
+                throw "Portable ZIP contains a $kind file entry: $entryName"
+            }
+            $entries.Add($entryName,$entry)
+        }
+        if ([string]::IsNullOrWhiteSpace($rootName)) { throw 'Portable ZIP has no package root.' }
+        $checksumEntryName = "$rootName/checksums.sha256"
+        if (-not $entries.ContainsKey($checksumEntryName) -or [string]$entries[$checksumEntryName].FullName.Replace('\','/') -cne $checksumEntryName) {
+            throw 'Portable ZIP is missing its root checksums.sha256 file or changed its path casing.'
+        }
+        $checksumEntry = $entries[$checksumEntryName]
+        if ([int64]$checksumEntry.Length -le 0 -or [int64]$checksumEntry.Length -gt 67108864) { throw 'Portable ZIP checksums.sha256 has an invalid size.' }
+        $checksumStream = $checksumEntry.Open()
+        try {
+            $checksumBytes = New-Object byte[] ([int]$checksumEntry.Length)
+            $offset = 0
+            while ($offset -lt $checksumBytes.Length) {
+                $read = $checksumStream.Read($checksumBytes,$offset,$checksumBytes.Length-$offset)
+                if ($read -le 0) { throw 'Portable ZIP checksums.sha256 ended unexpectedly.' }
+                $offset += $read
+            }
+        } finally { $checksumStream.Dispose() }
+        $utf8 = New-Object Text.UTF8Encoding($false,$true)
+        try { $checksumText = $utf8.GetString($checksumBytes) } catch { throw 'Portable ZIP checksums.sha256 is not valid UTF-8.' }
+        $lines = @($checksumText -split "`r?`n")
+        if ($lines.Count -gt 0 -and $lines[$lines.Count-1] -ceq '') { $lines = @($lines[0..($lines.Count-2)]) }
+        if ($lines.Count -eq 0 -or @($lines | Where-Object { [string]::IsNullOrWhiteSpace($_) }).Count -gt 0) {
+            throw 'Portable ZIP checksums.sha256 is empty or contains blank lines.'
+        }
+        $checksummed = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($line in $lines) {
+            if ([string]$line -cnotmatch '^([0-9a-f]{64}) \*([^\r\n]+)$') { throw 'Portable ZIP checksums.sha256 contains a malformed line.' }
+            $expectedHash = [string]$Matches[1]
+            $relative = [string]$Matches[2].Replace('\','/')
+            if ($relative -ceq 'checksums.sha256' -or $relative.StartsWith('/') -or $relative -match '(^|/)\.\.?(/|$)' -or $relative -match '//') {
+                throw "Portable ZIP checksums.sha256 contains an unsafe path: $relative"
+            }
+            $entryName = "$rootName/$relative"
+            if (-not $checksummed.Add($entryName)) { throw "Portable ZIP checksums.sha256 contains a duplicate or case-colliding path: $relative" }
+            if (-not $entries.ContainsKey($entryName) -or [string]$entries[$entryName].FullName.Replace('\','/') -cne $entryName) {
+                throw "Portable ZIP checksums.sha256 references a missing or case-changed file: $relative"
+            }
+            $stream = $entries[$entryName].Open()
+            $sha = [Security.Cryptography.SHA256]::Create()
+            try { $actualHash = ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-','').ToLowerInvariant() }
+            finally { $sha.Dispose(); $stream.Dispose() }
+            if ($actualHash -cne $expectedHash) { throw "Portable ZIP internal checksum mismatch: $relative" }
+        }
+        $allowedUnlisted = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($relative in @('checksums.sha256','maintenance/update-status.json','maintenance/revision-transition.json','maintenance/revision-stage.json')) {
+            [void]$allowedUnlisted.Add("$rootName/$relative")
+        }
+        $unlisted = @($entries.Keys | Where-Object { -not $checksummed.Contains($_) -and -not $allowedUnlisted.Contains($_) } | Sort-Object)
+        if ($unlisted.Count -gt 0) { throw "Portable ZIP contains file(s) outside its internal checksum closure: $($unlisted -join ', ')" }
+        return $true
+    } finally { $archive.Dispose() }
+}
+
+function Assert-PortableTransactionPairSemantics {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object[]]$States,
+        [Parameter(Mandatory)][ValidateSet('candidate','prior')][string]$SetKind
+    )
+    $zipStates = @($States | Where-Object { ([string]$_.Item.target).EndsWith('.zip', [StringComparison]::Ordinal) })
+    if ($zipStates.Count -ne 1) { throw 'Portable transaction does not have exactly one ZIP target.' }
+    $zipState = $zipStates[0]
+    $zipLeaf = [string]$zipState.Item.target
+    $manifestStates = @($States | Where-Object { [string]$_.Item.target -ceq "$zipLeaf.manifest.json" })
+    if ($manifestStates.Count -ne 1) { throw 'Portable transaction does not have the matching ZIP sidecar target.' }
+    $manifestState = $manifestStates[0]
+
+    if ($SetKind -ceq 'candidate') {
+        $zipPresent = $null -ne $zipState.CandidateSource
+        $manifestPresent = $null -ne $manifestState.CandidateSource
+        $zipPath = $zipState.CandidateSource
+        $manifestPath = $manifestState.CandidateSource
+        $zipBytes = [int64]$zipState.Item.new_bytes
+        $zipSha256 = [string]$zipState.Item.new_sha256
+        $manifestBytes = [int64]$manifestState.Item.new_bytes
+        $manifestSha256 = [string]$manifestState.Item.new_sha256
+    } else {
+        $zipPresent = [bool]$zipState.Item.old_present
+        $manifestPresent = [bool]$manifestState.Item.old_present
+        if (-not $zipPresent -and $manifestPresent) { throw 'Portable transaction prior set contains a sidecar without its ZIP.' }
+        if (-not $zipPresent -or -not $manifestPresent) { return }
+        $zipPath = $zipState.PriorSource
+        $manifestPath = $manifestState.PriorSource
+        $zipBytes = [int64]$zipState.Item.old_bytes
+        $zipSha256 = [string]$zipState.Item.old_sha256
+        $manifestBytes = [int64]$manifestState.Item.old_bytes
+        $manifestSha256 = [string]$manifestState.Item.old_sha256
+    }
+    if (-not $zipPresent -or -not $manifestPresent -or $null -eq $zipPath -or $null -eq $manifestPath) {
+        throw "Portable transaction $SetKind set is incomplete."
+    }
+    if (-not (Test-FileDescriptorMatch -Path $zipPath -Bytes $zipBytes -Sha256 $zipSha256) -or
+        -not (Test-FileDescriptorMatch -Path $manifestPath -Bytes $manifestBytes -Sha256 $manifestSha256)) {
+        throw "Portable transaction $SetKind pair does not match its journal descriptors."
+    }
+    Assert-PortableZipInternalChecksumClosure -ZipPath $zipPath | Out-Null
+    $sidecar = Read-JsonFile -Path $manifestPath -Context "portable transaction $SetKind sidecar"
+    Assert-ExactJsonProperties -Object $sidecar -Names @('schema_version','file','bytes','sha256') -Context "portable transaction $SetKind sidecar"
+    if (-not (Test-TransactionJsonInteger $sidecar.schema_version) -or [int64]$sidecar.schema_version -ne 1 -or
+        -not ($sidecar.file -is [string]) -or [string]$sidecar.file -cne $zipLeaf -or
+        -not (Test-TransactionJsonInteger $sidecar.bytes) -or [int64]$sidecar.bytes -ne $zipBytes -or
+        -not ($sidecar.sha256 -is [string]) -or [string]$sidecar.sha256 -cne $zipSha256) {
+        throw "Portable transaction $SetKind sidecar does not strictly describe its ZIP target and descriptor."
+    }
+}
+
+function Get-PreparedFileSetTransactionDefinition {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$JournalName,
+        [Parameter(Mandatory)][string]$JournalPath,
+        [ValidateSet('node-runtime','sevenzip-license','sevenzip-runtime','portable-zip')][string]$ExpectedRole,
+        [string[]]$ExpectedTargetNames
+    )
+    $rootFull = Resolve-FullPath -Path $Root -MustExist -PathType Container
+    $journalLeaf = Assert-TransactionLeafName -Name $JournalName -Context 'transaction journal'
+    $sourcePath = Assert-PathWithin -Root $rootFull -Path $JournalPath
+    Assert-NoReparsePoint -Root $rootFull -Path $sourcePath
+    if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) { throw 'Prepared file-set transaction journal is not a regular file.' }
+    $journal = Read-JsonFile -Path $sourcePath -Context 'prepared file-set transaction journal'
+    $schemaVersion = [int]$journal.schema_version
+    if ($schemaVersion -eq 1) {
+        Assert-ExactJsonProperties -Object $journal -Names @('schema_version','operation','transaction_id','items') -Context 'prepared file-set transaction journal'
+    } elseif ($schemaVersion -eq 2) {
+        Assert-ExactJsonProperties -Object $journal -Names @('schema_version','operation','transaction_id','role','items') -Context 'prepared file-set transaction journal'
+        if ([string]$journal.role -cnotin @('node-runtime','sevenzip-license','sevenzip-runtime','portable-zip')) { throw 'Prepared file-set transaction journal role is invalid.' }
+        if ([string]::IsNullOrWhiteSpace($ExpectedRole)) { throw 'Role-bound transaction recovery requires its explicit expected context.' }
+    } else {
+        throw 'Prepared file-set transaction journal schema is invalid.'
+    }
+    if ([string]$journal.operation -cne 'publish-prepared-file-set' -or [string]$journal.transaction_id -cnotmatch '^[0-9a-f]{32}$') {
+        throw 'Prepared file-set transaction journal header is invalid.'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedRole) -and ($null -eq $ExpectedTargetNames -or $ExpectedTargetNames.Count -eq 0)) {
+        throw 'Context-bound transaction recovery requires its exact intended target set.'
+    }
+    $items = @($journal.items)
+    if ($items.Count -lt 1 -or $items.Count -gt 16) { throw 'Prepared file-set transaction item count is invalid.' }
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    [void]$seen.Add($journalLeaf)
+    $states = @()
+    foreach ($item in $items) {
+        Assert-ExactJsonProperties -Object $item -Names @('target','prepared','backup','old_present','old_bytes','old_sha256','new_bytes','new_sha256') -Context 'prepared file-set transaction item'
+        $targetLeaf = Assert-TransactionLeafName -Name ([string]$item.target) -Context 'transaction target'
+        $preparedLeaf = Assert-TransactionLeafName -Name ([string]$item.prepared) -Context 'transaction prepared file'
+        $backupLeaf = Assert-TransactionLeafName -Name ([string]$item.backup) -Context 'transaction backup file'
+        foreach ($leaf in @($targetLeaf,$preparedLeaf,$backupLeaf)) { if (-not $seen.Add($leaf)) { throw 'Prepared file-set transaction contains duplicate paths.' } }
+        if (-not ($item.old_present -is [bool]) -or [int64]$item.new_bytes -lt 0 -or [string]$item.new_sha256 -cnotmatch '^[0-9a-f]{64}$') {
+            throw 'Prepared file-set transaction item descriptor is invalid.'
+        }
+        if ([bool]$item.old_present) {
+            if ([int64]$item.old_bytes -lt 0 -or [string]$item.old_sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'Prepared file-set transaction prior descriptor is invalid.' }
+        } elseif ($null -ne $item.old_bytes -or $null -ne $item.old_sha256) {
+            throw 'Prepared file-set transaction absent prior descriptor is invalid.'
+        }
+        $states += [pscustomobject]@{
+            Item=$item
+            Target=(Join-Path $rootFull $targetLeaf)
+            Prepared=(Join-Path $rootFull $preparedLeaf)
+            Backup=(Join-Path $rootFull $backupLeaf)
+            CandidateSource=$null
+            PriorSource=$null
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedRole)) {
+        Assert-PreparedFileSetTransactionContext -JournalName $journalLeaf -Journal $journal -States $states -ExpectedRole $ExpectedRole -ExpectedTargetNames $ExpectedTargetNames
+    }
+    foreach ($state in $states) {
+        foreach ($path in @($state.Target,$state.Prepared,$state.Backup)) {
+            if (Test-Path -LiteralPath $path) {
+                Assert-NoReparsePoint -Root $rootFull -Path $path
+                if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Transaction path is not a regular file: $path" }
+            }
+        }
+    }
+    return [pscustomobject]@{Journal=$journal;States=$states;Root=$rootFull;JournalLeaf=$journalLeaf}
+}
+
+function Repair-PreparedFileSetTransaction {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$JournalName,
+        [ValidateSet('node-runtime','sevenzip-license','sevenzip-runtime','portable-zip')][string]$ExpectedRole,
+        [string[]]$ExpectedTargetNames
+    )
+    $rootFull = Resolve-FullPath -Path $Root -MustExist -PathType Container
+    $journalLeaf = Assert-TransactionLeafName -Name $JournalName -Context 'transaction journal'
+    $journalPath = Assert-PathWithin -Root $rootFull -Path (Join-Path $rootFull $journalLeaf)
+    if ((Test-Path -LiteralPath $journalPath) -and -not (Test-Path -LiteralPath $journalPath -PathType Leaf)) {
+        throw 'Prepared file-set transaction journal is not a regular file.'
+    }
+    $escapedJournalLeaf = [Regex]::Escape($journalLeaf)
+    $writingJournals = @(Get-ChildItem -LiteralPath $rootFull -Force | Where-Object {
+        $_.Name -cmatch ("^" + $escapedJournalLeaf + "\.writing-([0-9a-f]{32})$")
+    })
+    $preparedJournals = @(Get-ChildItem -LiteralPath $rootFull -Force | Where-Object {
+        $_.Name -cmatch ("^" + $escapedJournalLeaf + "\.prepared-([0-9a-f]{32})$") -or
+        $_.Name -cmatch ("^\." + $escapedJournalLeaf + "\.replace\.tmp-([0-9a-f]{32})$")
+    })
+    if ($writingJournals.Count -gt 0) {
+        if ($writingJournals.Count -ne 1 -or $preparedJournals.Count -gt 0 -or (Test-Path -LiteralPath $journalPath -PathType Leaf)) {
+            throw 'A partial journal write coexists with other file-set transaction state; all evidence was preserved.'
+        }
+        $writingJournal = $writingJournals[0]
+        if (-not (Test-Path -LiteralPath $writingJournal.FullName -PathType Leaf)) { throw 'Partial file-set transaction journal is not a regular file.' }
+        Assert-NoReparsePoint -Root $rootFull -Path $writingJournal.FullName
+        [void]($writingJournal.Name -cmatch ("^" + $escapedJournalLeaf + "\.writing-([0-9a-f]{32})$"))
+        $writingToken = $Matches[1]
+        $writingBackups = @(Get-ChildItem -LiteralPath $rootFull -Force | Where-Object { $_.Name.EndsWith(".backup-$writingToken",[StringComparison]::OrdinalIgnoreCase) })
+        if ($writingBackups.Count -gt 0) { throw 'A partial journal write has target-backup debris; state is ambiguous and was preserved.' }
+        Remove-Item -LiteralPath $writingJournal.FullName -Force
+    }
+    if ((Test-Path -LiteralPath $journalPath -PathType Leaf) -and $preparedJournals.Count -gt 0) {
+        throw 'Canonical and prepared file-set transaction journals coexist; state is ambiguous and was preserved.'
+    }
+    if (-not (Test-Path -LiteralPath $journalPath -PathType Leaf) -and $preparedJournals.Count -gt 0) {
+        if ($preparedJournals.Count -ne 1) { throw 'Multiple prepared file-set transaction journals exist; state is ambiguous and was preserved.' }
+        $preparedJournal = $preparedJournals[0]
+        if (-not (Test-Path -LiteralPath $preparedJournal.FullName -PathType Leaf)) { throw 'Prepared file-set transaction journal is not a regular file.' }
+        $definitionContext = @{}
+        if (-not [string]::IsNullOrWhiteSpace($ExpectedRole)) { $definitionContext=@{ExpectedRole=$ExpectedRole;ExpectedTargetNames=$ExpectedTargetNames} }
+        $preparedDefinition = Get-PreparedFileSetTransactionDefinition -Root $rootFull -JournalName $journalLeaf -JournalPath $preparedJournal.FullName @definitionContext
+        if ($preparedJournal.Name -cmatch ("^" + $escapedJournalLeaf + "\.prepared-([0-9a-f]{32})$") -and
+            [string]$preparedDefinition.Journal.transaction_id -cne $Matches[1]) {
+            throw 'Prepared file-set transaction journal name is not bound to its transaction id.'
+        }
+        [IO.File]::Move($preparedJournal.FullName, $journalPath)
+    }
+    if (-not (Test-Path -LiteralPath $journalPath -PathType Leaf)) { return [pscustomobject]@{State='none'} }
+    $definitionContext = @{}
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedRole)) { $definitionContext=@{ExpectedRole=$ExpectedRole;ExpectedTargetNames=$ExpectedTargetNames} }
+    $definition = Get-PreparedFileSetTransactionDefinition -Root $rootFull -JournalName $journalLeaf -JournalPath $journalPath @definitionContext
+    $journal = $definition.Journal
+    $states = @($definition.States)
+
+    $candidateComplete = $true
+    foreach ($state in $states) {
+        $item = $state.Item
+        if (Test-FileDescriptorMatch -Path $state.Target -Bytes ([int64]$item.new_bytes) -Sha256 ([string]$item.new_sha256)) {
+            $state.CandidateSource = $state.Target
+        } elseif (Test-FileDescriptorMatch -Path $state.Prepared -Bytes ([int64]$item.new_bytes) -Sha256 ([string]$item.new_sha256)) {
+            $state.CandidateSource = $state.Prepared
+        } else {
+            $candidateComplete = $false
+        }
+    }
+    if ($candidateComplete) {
+        if ([string]$ExpectedRole -ceq 'portable-zip') {
+            Assert-PortableTransactionPairSemantics -States $states -SetKind candidate
+        }
+        # Validate every path before moving any file. Recovery must not partially
+        # mutate one item and only then discover ambiguous debris in another.
+        foreach ($state in $states) {
+            $item = $state.Item
+            if (Test-Path -LiteralPath $state.Target -PathType Leaf) {
+                $targetIsCandidate = Test-FileDescriptorMatch -Path $state.Target -Bytes ([int64]$item.new_bytes) -Sha256 ([string]$item.new_sha256)
+                $targetIsPrior = [bool]$item.old_present -and
+                    (Test-FileDescriptorMatch -Path $state.Target -Bytes ([int64]$item.old_bytes) -Sha256 ([string]$item.old_sha256))
+                if (-not $targetIsCandidate -and -not $targetIsPrior) { throw "Transaction target contains unknown bytes: $($state.Target)" }
+                if ($state.CandidateSource -ceq $state.Prepared -and -not $targetIsPrior) {
+                    throw "Prepared candidate cannot replace the current transaction target: $($state.Target)"
+                }
+            }
+            if (Test-Path -LiteralPath $state.Prepared -PathType Leaf) {
+                if (-not (Test-FileDescriptorMatch -Path $state.Prepared -Bytes ([int64]$item.new_bytes) -Sha256 ([string]$item.new_sha256))) {
+                    throw "Prepared transaction debris contains unknown bytes: $($state.Prepared)"
+                }
+            }
+            if (Test-Path -LiteralPath $state.Backup -PathType Leaf) {
+                if (-not [bool]$item.old_present -or
+                    -not (Test-FileDescriptorMatch -Path $state.Backup -Bytes ([int64]$item.old_bytes) -Sha256 ([string]$item.old_sha256))) {
+                    throw "Backup transaction debris contains unknown bytes: $($state.Backup)"
+                }
+                if ($state.CandidateSource -ceq $state.Prepared -and (Test-Path -LiteralPath $state.Target -PathType Leaf)) {
+                    throw "Transaction contains both a prior target and a prior backup: $($state.Target)"
+                }
+            }
+        }
+        foreach ($state in $states) {
+            $item = $state.Item
+            if ($state.CandidateSource -ceq $state.Prepared) {
+                if (Test-Path -LiteralPath $state.Target -PathType Leaf) { [IO.File]::Move($state.Target, $state.Backup) }
+                [IO.File]::Move($state.Prepared, $state.Target)
+            }
+        }
+        foreach ($state in $states) {
+            $item=$state.Item
+            if (-not (Test-FileDescriptorMatch -Path $state.Target -Bytes ([int64]$item.new_bytes) -Sha256 ([string]$item.new_sha256))) {
+                throw "Published file set failed candidate validation: $($state.Target)"
+            }
+        }
+        foreach ($state in $states) {
+            if (Test-Path -LiteralPath $state.Prepared -PathType Leaf) {
+                if (-not (Test-FileDescriptorMatch -Path $state.Prepared -Bytes ([int64]$state.Item.new_bytes) -Sha256 ([string]$state.Item.new_sha256))) { throw "Prepared transaction debris contains unknown bytes: $($state.Prepared)" }
+                Remove-Item -LiteralPath $state.Prepared -Force
+            }
+            if (Test-Path -LiteralPath $state.Backup -PathType Leaf) {
+                if (-not [bool]$state.Item.old_present -or
+                    -not (Test-FileDescriptorMatch -Path $state.Backup -Bytes ([int64]$state.Item.old_bytes) -Sha256 ([string]$state.Item.old_sha256))) { throw "Backup transaction debris contains unknown bytes: $($state.Backup)" }
+                Remove-Item -LiteralPath $state.Backup -Force
+            }
+        }
+        Remove-Item -LiteralPath $journalPath -Force
+        return [pscustomobject]@{State='committed'}
+    }
+
+    $oldComplete = $true
+    foreach ($state in $states) {
+        $item=$state.Item
+        if (-not [bool]$item.old_present) { continue }
+        $backupIsPrior = Test-FileDescriptorMatch -Path $state.Backup -Bytes ([int64]$item.old_bytes) -Sha256 ([string]$item.old_sha256)
+        $targetIsPrior = Test-FileDescriptorMatch -Path $state.Target -Bytes ([int64]$item.old_bytes) -Sha256 ([string]$item.old_sha256)
+        if ($backupIsPrior -and $targetIsPrior) { throw "Transaction contains duplicate prior files: $($state.Target)" }
+        if ($backupIsPrior) { $state.PriorSource = $state.Backup }
+        elseif ($targetIsPrior) { $state.PriorSource = $state.Target }
+        else { $oldComplete=$false }
+    }
+    if (-not $oldComplete) { throw 'Prepared file-set transaction contains neither a complete candidate nor a complete prior set; all artifacts were preserved.' }
+    if ([string]$ExpectedRole -ceq 'portable-zip') {
+        Assert-PortableTransactionPairSemantics -States $states -SetKind prior
+    }
+
+    # Preflight the complete rollback before changing any canonical path.
+    foreach ($state in $states) {
+        $item = $state.Item
+        if (Test-Path -LiteralPath $state.Prepared -PathType Leaf) {
+            if (-not (Test-FileDescriptorMatch -Path $state.Prepared -Bytes ([int64]$item.new_bytes) -Sha256 ([string]$item.new_sha256))) {
+                throw "Prepared transaction debris contains unknown bytes: $($state.Prepared)"
+            }
+        }
+        if (Test-Path -LiteralPath $state.Target -PathType Leaf) {
+            $targetIsCandidate = Test-FileDescriptorMatch -Path $state.Target -Bytes ([int64]$item.new_bytes) -Sha256 ([string]$item.new_sha256)
+            $targetIsPrior = [bool]$item.old_present -and
+                (Test-FileDescriptorMatch -Path $state.Target -Bytes ([int64]$item.old_bytes) -Sha256 ([string]$item.old_sha256))
+            if (-not $targetIsCandidate -and -not $targetIsPrior) { throw "Transaction target contains unknown bytes: $($state.Target)" }
+        }
+        if (Test-Path -LiteralPath $state.Backup -PathType Leaf) {
+            if (-not [bool]$item.old_present -or
+                -not (Test-FileDescriptorMatch -Path $state.Backup -Bytes ([int64]$item.old_bytes) -Sha256 ([string]$item.old_sha256))) {
+                throw "Backup transaction debris contains unknown bytes: $($state.Backup)"
+            }
+        }
+    }
+    foreach ($state in $states) {
+        $item = $state.Item
+        if ((Test-Path -LiteralPath $state.Target -PathType Leaf) -and $state.PriorSource -cne $state.Target) {
+            Remove-Item -LiteralPath $state.Target -Force
+        }
+        if ([bool]$item.old_present -and $state.PriorSource -ceq $state.Backup) { [IO.File]::Move($state.Backup, $state.Target) }
+    }
+    foreach ($state in $states) {
+        $item=$state.Item
+        if ([bool]$item.old_present) {
+            if (-not (Test-FileDescriptorMatch -Path $state.Target -Bytes ([int64]$item.old_bytes) -Sha256 ([string]$item.old_sha256))) { throw "Restored file set failed prior-state validation: $($state.Target)" }
+        } elseif (Test-Path -LiteralPath $state.Target) { throw "Restored file set retained a target that was previously absent: $($state.Target)" }
+        if (Test-Path -LiteralPath $state.Prepared -PathType Leaf) {
+            if (-not (Test-FileDescriptorMatch -Path $state.Prepared -Bytes ([int64]$item.new_bytes) -Sha256 ([string]$item.new_sha256))) { throw "Prepared transaction debris contains unknown bytes: $($state.Prepared)" }
+            Remove-Item -LiteralPath $state.Prepared -Force
+        }
+        if (Test-Path -LiteralPath $state.Backup -PathType Leaf) { throw "Restored file set retained an unexpected backup: $($state.Backup)" }
+    }
+    Remove-Item -LiteralPath $journalPath -Force
+    return [pscustomobject]@{State='rolled-back'}
+}
+
+function Publish-PreparedFileSetTransaction {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$JournalName,
+        [Parameter(Mandatory)][object[]]$Items,
+        [ValidateSet('node-runtime','sevenzip-license','sevenzip-runtime','portable-zip')][string]$TransactionRole,
+        [string[]]$ExpectedTargetNames,
+        [scriptblock]$InternalCheckpoint
+    )
+    $rootFull = Resolve-FullPath -Path $Root -MustExist -PathType Container
+    $journalLeaf = Assert-TransactionLeafName -Name $JournalName -Context 'transaction journal'
+    $journalPath = Join-Path $rootFull $journalLeaf
+    if ($Items.Count -lt 1 -or $Items.Count -gt 16) { throw 'Prepared file-set publication item count is invalid.' }
+    if (-not [string]::IsNullOrWhiteSpace($TransactionRole)) {
+        if ($null -eq $ExpectedTargetNames -or $ExpectedTargetNames.Count -eq 0) { throw 'Context-bound publication requires its exact intended target set.' }
+        $requestedTargets = @($Items | ForEach-Object { Assert-TransactionLeafName -Name ([IO.Path]::GetFileName([string]$_.TargetPath)) -Context 'transaction target' })
+        Assert-ExactTransactionTargetSet -Actual $requestedTargets -Expected $ExpectedTargetNames
+    }
+    if (Test-Path -LiteralPath $journalPath -PathType Leaf) {
+        $repairParameters = @{}
+        if (-not [string]::IsNullOrWhiteSpace($TransactionRole)) {
+            $repairParameters.ExpectedRole = $TransactionRole
+            $repairParameters.ExpectedTargetNames = $ExpectedTargetNames
+        }
+        Repair-PreparedFileSetTransaction -Root $rootFull -JournalName $journalLeaf @repairParameters | Out-Null
+    }
+    $transactionId = [Guid]::NewGuid().ToString('N')
+    $journalItems = @(); $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($item in $Items) {
+        $prepared = Resolve-FullPath -Path ([string]$item.PreparedPath) -MustExist -PathType Leaf
+        $target = Resolve-FullPath -Path ([string]$item.TargetPath)
+        if ((Split-Path -Parent $prepared) -cne $rootFull -or (Split-Path -Parent $target) -cne $rootFull) { throw 'Prepared and target files must be direct children of the transaction root.' }
+        $preparedLeaf=Assert-TransactionLeafName ([IO.Path]::GetFileName($prepared)); $targetLeaf=Assert-TransactionLeafName ([IO.Path]::GetFileName($target))
+        if (-not $seen.Add($preparedLeaf) -or -not $seen.Add($targetLeaf)) { throw 'Prepared file-set publication contains duplicate paths.' }
+        $backupLeaf = ".$targetLeaf.backup-$transactionId"
+        if (-not $seen.Add($backupLeaf)) { throw 'Prepared file-set publication backup path collided.' }
+        $newItem=Get-Item -LiteralPath $prepared
+        $oldPresent=Test-Path -LiteralPath $target -PathType Leaf
+        if ((Test-Path -LiteralPath $target) -and -not $oldPresent) { throw "Transaction target is not a regular file: $target" }
+        $oldItem=if($oldPresent){Get-Item -LiteralPath $target}else{$null}
+        $journalItems += [ordered]@{
+            target=$targetLeaf;prepared=$preparedLeaf;backup=$backupLeaf;old_present=[bool]$oldPresent
+            old_bytes=if($oldPresent){[int64]$oldItem.Length}else{$null}
+            old_sha256=if($oldPresent){(Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant()}else{$null}
+            new_bytes=[int64]$newItem.Length;new_sha256=(Get-FileHash -LiteralPath $prepared -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($TransactionRole)) {
+        $journal=[ordered]@{schema_version=1;operation='publish-prepared-file-set';transaction_id=$transactionId;items=$journalItems}
+    } else {
+        $journal=[ordered]@{schema_version=2;operation='publish-prepared-file-set';transaction_id=$transactionId;role=$TransactionRole;items=$journalItems}
+        $contextStates = @($journalItems | ForEach-Object {
+            [pscustomobject]@{
+                Item=$_
+                CandidateSource=(Join-Path $rootFull $_.prepared)
+                PriorSource=if ([bool]$_.old_present) { Join-Path $rootFull $_.target } else { $null }
+            }
+        })
+        Assert-PreparedFileSetTransactionContext -JournalName $journalLeaf -Journal $journal -States $contextStates -ExpectedRole $TransactionRole -ExpectedTargetNames $ExpectedTargetNames
+        if ($TransactionRole -ceq 'portable-zip') { Assert-PortableTransactionPairSemantics -States $contextStates -SetKind candidate }
+    }
+    $journalWritingPath = Join-Path $rootFull ("$journalLeaf.writing-$transactionId")
+    $journalPreparedPath = Join-Path $rootFull ("$journalLeaf.prepared-$transactionId")
+    $journalUtf8 = New-Object Text.UTF8Encoding($false)
+    $journalJson = ($journal | ConvertTo-Json -Depth 20) + [Environment]::NewLine
+    $journalStream = New-Object IO.FileStream($journalWritingPath,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+    try {
+        $journalBytes = $journalUtf8.GetBytes($journalJson)
+        $journalStream.Write($journalBytes,0,$journalBytes.Length)
+        $journalStream.Flush($true)
+    } finally { $journalStream.Dispose() }
+    [IO.File]::Move($journalWritingPath,$journalPreparedPath)
+    if ($null -ne $InternalCheckpoint) { & $InternalCheckpoint 'journal-prepared' -1 $journalPreparedPath $null | Out-Null }
+    [IO.File]::Move($journalPreparedPath,$journalPath)
+    $repairParameters = @{}
+    if (-not [string]::IsNullOrWhiteSpace($TransactionRole)) { $repairParameters=@{ExpectedRole=$TransactionRole;ExpectedTargetNames=$ExpectedTargetNames} }
+    try {
+        if ($null -ne $InternalCheckpoint) { & $InternalCheckpoint 'journal-written' -1 $journalPath $null | Out-Null }
+        for ($index=0; $index -lt $journalItems.Count; $index++) {
+            $item=$journalItems[$index];$target=Join-Path $rootFull $item.target;$backup=Join-Path $rootFull $item.backup
+            if ([bool]$item.old_present) {[IO.File]::Move($target,$backup)}
+            if ($null -ne $InternalCheckpoint) { & $InternalCheckpoint 'prior-backed-up' $index $target $backup | Out-Null }
+        }
+        for ($index=0; $index -lt $journalItems.Count; $index++) {
+            $item=$journalItems[$index];$prepared=Join-Path $rootFull $item.prepared;$target=Join-Path $rootFull $item.target
+            if ($null -ne $InternalCheckpoint) { & $InternalCheckpoint 'before-candidate-publish' $index $target $prepared | Out-Null }
+            [IO.File]::Move($prepared,$target)
+            if ($null -ne $InternalCheckpoint) { & $InternalCheckpoint 'candidate-published' $index $target $prepared | Out-Null }
+        }
+        $recovery=Repair-PreparedFileSetTransaction -Root $rootFull -JournalName $journalLeaf @repairParameters
+        if([string]$recovery.State -cne 'committed'){throw 'Prepared file-set publication unexpectedly rolled back.'}
+    } catch {
+        $publicationError=$_
+        try{$recovery=Repair-PreparedFileSetTransaction -Root $rootFull -JournalName $journalLeaf @repairParameters}catch{throw "File-set publication failed and recovery was incomplete. Publication: $($publicationError.Exception.Message) Recovery: $($_.Exception.Message)"}
+        if([string]$recovery.State -cne 'committed'){throw $publicationError}
+    }
+    return @($journalItems | ForEach-Object { Join-Path $rootFull $_.target })
+}
+
+function Get-ReservedNodeRuntimeArtifacts {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$RuntimeRoot)
+    $runtimeFull = Resolve-FullPath -Path $RuntimeRoot -MustExist -PathType Container
+    return @(Get-ChildItem -LiteralPath $runtimeFull -Force | Where-Object {
+        $_.Name.StartsWith('.node', [StringComparison]::OrdinalIgnoreCase) -or
+        $_.Name.StartsWith('.LICENSE.backup-', [StringComparison]::OrdinalIgnoreCase)
+    })
+}
+
+function Assert-NoReservedNodeRuntimeArtifacts {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$RuntimeRoot)
+    $reserved = @(Get-ReservedNodeRuntimeArtifacts -RuntimeRoot $RuntimeRoot)
+    if ($reserved.Count -gt 0) {
+        throw "Runtime contains reserved Node transaction debris: $(@($reserved | ForEach-Object Name | Sort-Object) -join ', ')"
+    }
+}
+
+function Repair-NodeRuntimePreparedOrphans {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RuntimeRoot,
+        [Parameter(Mandatory)][string]$NodePath,
+        [Parameter(Mandatory)][string]$LicensePath,
+        [switch]$NoDownload,
+        [hashtable]$PairValidationParameters = @{}
+    )
+    $runtimeFull = Resolve-FullPath -Path $RuntimeRoot -MustExist -PathType Container
+    $reserved = @(Get-ReservedNodeRuntimeArtifacts -RuntimeRoot $runtimeFull)
+    if ($reserved.Count -eq 0) { return [pscustomobject]@{State='none'} }
+
+    $tokens = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $preparedNode = $null
+    $preparedLicense = $null
+    $writingNode = $null
+    $writingLicense = $null
+    foreach ($artifact in $reserved) {
+        Assert-NoReparsePoint -Root $runtimeFull -Path $artifact.FullName
+        if (-not (Test-Path -LiteralPath $artifact.FullName -PathType Leaf)) { throw "Reserved Node transaction artifact is not a regular file: $($artifact.FullName)" }
+        if ($artifact.Name -cmatch '^\.node-([0-9a-f]{32})\.prepared$') {
+            if ($null -ne $preparedNode) { throw 'Node runtime contains duplicate prepared executable candidates.' }
+            [void]$tokens.Add($Matches[1]); $preparedNode = $artifact.FullName
+        } elseif ($artifact.Name -cmatch '^\.node-license-([0-9a-f]{32})\.prepared$') {
+            if ($null -ne $preparedLicense) { throw 'Node runtime contains duplicate prepared license candidates.' }
+            [void]$tokens.Add($Matches[1]); $preparedLicense = $artifact.FullName
+        } elseif ($artifact.Name -cmatch '^\.node-([0-9a-f]{32})\.writing$') {
+            if ($null -ne $writingNode) { throw 'Node runtime contains duplicate incomplete executable writes.' }
+            [void]$tokens.Add($Matches[1]); $writingNode = $artifact.FullName
+        } elseif ($artifact.Name -cmatch '^\.node-license-([0-9a-f]{32})\.writing$') {
+            if ($null -ne $writingLicense) { throw 'Node runtime contains duplicate incomplete license writes.' }
+            [void]$tokens.Add($Matches[1]); $writingLicense = $artifact.FullName
+        } else {
+            throw "Runtime contains malformed or unbound reserved Node transaction debris: $($artifact.Name)"
+        }
+    }
+    if ($tokens.Count -ne 1) { throw 'Node runtime contains ambiguous prepared candidates from different transaction tokens.' }
+    if (($null -ne $writingNode -and $null -ne $preparedNode) -or ($null -ne $writingLicense -and $null -ne $preparedLicense)) {
+        throw 'Node runtime contains both writing and prepared artifacts for the same transaction item.'
+    }
+    # Writing names are never referenced by a publication journal. They are
+    # durable-copy work products and are safe to reclaim after the full
+    # reserved namespace has been proven to belong to one transaction token.
+    foreach ($writing in @($writingLicense,$writingNode)) {
+        if ($null -ne $writing) { Remove-Item -LiteralPath $writing -Force }
+    }
+
+    $canonicalValid = Test-PinnedNodeRuntimePair -NodePath $NodePath -LicensePath $LicensePath @PairValidationParameters
+    $invalidPrepared = @(
+        if ($null -ne $preparedNode -and -not (Test-FileDescriptorMatch -Path $preparedNode -Bytes 92299080 -Sha256 $script:PinnedNodeExecutableSha256)) { $preparedNode }
+        if ($null -ne $preparedLicense -and -not (Test-FileDescriptorMatch -Path $preparedLicense -Bytes 159872 -Sha256 $script:PinnedNodeLicenseSha256)) { $preparedLicense }
+    )
+    if ($invalidPrepared.Count -gt 0) {
+        if (-not $canonicalValid -and $NoDownload) {
+            throw 'A malformed pre-journal Node runtime candidate cannot repair the damaged offline runtime; its prepared artifacts were preserved.'
+        }
+        foreach ($prepared in @($preparedLicense,$preparedNode)) {
+            if ($null -ne $prepared) { Remove-Item -LiteralPath $prepared -Force }
+        }
+        return [pscustomobject]@{State='removed'}
+    }
+    $candidateComplete = $null -ne $preparedNode -and $null -ne $preparedLicense
+    if (-not $canonicalValid -and $candidateComplete) {
+        Publish-PreparedFileSetTransaction -Root $runtimeFull -JournalName '.node-runtime-transaction.json' -TransactionRole node-runtime -ExpectedTargetNames @('LICENSE','node.exe') -Items @(
+            [pscustomobject]@{PreparedPath=$preparedLicense;TargetPath=$LicensePath},
+            [pscustomobject]@{PreparedPath=$preparedNode;TargetPath=$NodePath}
+        ) | Out-Null
+        return [pscustomobject]@{State='published'}
+    }
+    if (-not $canonicalValid -and $NoDownload) {
+        throw 'An incomplete pre-journal Node runtime candidate cannot repair the damaged offline runtime; all artifacts were preserved.'
+    }
+
+    # The canonical pair is already valid, or online repair can recreate it.
+    # These exact-token, hash-validated candidates are app-owned pre-journal debris.
+    foreach ($prepared in @($preparedLicense,$preparedNode)) {
+        if ($null -ne $prepared) { Remove-Item -LiteralPath $prepared -Force }
+    }
+    return [pscustomobject]@{State='removed'}
+}
+
+function Ensure-PinnedNodeRuntime {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [switch]$NoDownload,
+        [hashtable]$InternalTestHooks
+    )
+
+    Assert-InternalNodeRuntimeTestHooks -Hooks $InternalTestHooks
+    $pairValidationParameters = @{}
+    if ($null -ne $InternalTestHooks) {
+        if ($InternalTestHooks.ContainsKey('PeMachineTypeProbe')) { $pairValidationParameters.InternalPeMachineTypeProbe = $InternalTestHooks.PeMachineTypeProbe }
+        if ($InternalTestHooks.ContainsKey('FileVersionProbe')) { $pairValidationParameters.InternalFileVersionProbe = $InternalTestHooks.FileVersionProbe }
+        if ($InternalTestHooks.ContainsKey('NativeVersionProbe')) { $pairValidationParameters.InternalNativeVersionProbe = $InternalTestHooks.NativeVersionProbe }
+    }
+
+    $root = Resolve-FullPath -Path $ProjectRoot -MustExist -PathType Container
+    $runtimeRoot = Join-Path $root 'runtime'
+    if (-not (Test-Path -LiteralPath $runtimeRoot -PathType Container)) {
+        if (Test-Path -LiteralPath $runtimeRoot) { throw "Runtime path is not a directory: $runtimeRoot" }
+        New-Item -ItemType Directory -Path $runtimeRoot | Out-Null
+    }
+    $runtimeRoot = Resolve-FullPath -Path $runtimeRoot -MustExist -PathType Container
+    Assert-NoReparsePoint -Root $root -Path $runtimeRoot
+
+    $nodePath = Join-Path $runtimeRoot 'node.exe'
+    $runtimeLicense = Join-Path $runtimeRoot 'LICENSE'
+    $journalName = '.node-runtime-transaction.json'
+    $journalPath = Join-Path $runtimeRoot $journalName
+    if ((Test-Path -LiteralPath $journalPath) -and -not (Test-Path -LiteralPath $journalPath -PathType Leaf)) { throw "Node runtime transaction journal is not a file: $journalPath" }
+    Repair-PreparedFileSetTransaction -Root $runtimeRoot -JournalName $journalName -ExpectedRole node-runtime -ExpectedTargetNames @('LICENSE','node.exe') | Out-Null
+
+    $sourceLicense = Resolve-FullPath -Path (Join-Path $root 'licenses\NODE-LICENSE.txt') -MustExist -PathType Leaf
+    $sourceLicenseItem = Get-Item -LiteralPath $sourceLicense
+    if ([int64]$sourceLicenseItem.Length -ne 159872 -or
+        (Get-FileHash -LiteralPath $sourceLicense -Algorithm SHA256).Hash.ToLowerInvariant() -cne $script:PinnedNodeLicenseSha256) {
+        throw 'The checked-in Node.js license does not match the pinned official v24.17.0 distribution.'
+    }
+    Repair-NodeRuntimePreparedOrphans -RuntimeRoot $runtimeRoot -NodePath $nodePath -LicensePath $runtimeLicense -NoDownload:$NoDownload -PairValidationParameters $pairValidationParameters | Out-Null
+    Assert-NoReservedNodeRuntimeArtifacts -RuntimeRoot $runtimeRoot
+    if (Test-PinnedNodeRuntimePair -NodePath $nodePath -LicensePath $runtimeLicense @pairValidationParameters) { return Resolve-FullPath -Path $nodePath -MustExist -PathType Leaf }
+    if ($NoDownload) { throw 'The bundled Node.js v24.17.0 runtime pair is missing or invalid; portable repack mode will not download or repair tools.' }
+
+    $buildRoot = Join-Path $root 'build'
+    if (-not (Test-Path -LiteralPath $buildRoot -PathType Container)) {
+        if (Test-Path -LiteralPath $buildRoot) { throw "Build path is not a directory: $buildRoot" }
+        New-Item -ItemType Directory -Path $buildRoot | Out-Null
+    }
+    $buildRoot = Resolve-FullPath -Path $buildRoot -MustExist -PathType Container
+    Assert-NoReparsePoint -Root $root -Path $buildRoot
+
+    $token = [Guid]::NewGuid().ToString('N')
+    $downloadRoot = Join-Path $buildRoot "node-download-$token"
+    $expandRoot = Join-Path $buildRoot "node-expand-$token"
+    New-Item -ItemType Directory -Path $downloadRoot | Out-Null
+    New-Item -ItemType Directory -Path $expandRoot | Out-Null
+    $preparedLicense = Join-Path $runtimeRoot ".node-license-$token.prepared"
+    $preparedNode = Join-Path $runtimeRoot ".node-$token.prepared"
+    $writingLicense = Join-Path $runtimeRoot ".node-license-$token.writing"
+    $writingNode = Join-Path $runtimeRoot ".node-$token.writing"
+    try {
+        $archiveName = 'node-v24.17.0-win-x64.zip'
+        $archivePath = Join-Path $downloadRoot $archiveName
+        Write-Host 'Downloading pinned official Node.js v24.17.0 Windows x64 runtime...'
+        $archiveUri = [Uri]"https://nodejs.org/dist/v24.17.0/$archiveName"
+        if ($null -eq $InternalTestHooks) {
+            Invoke-BoundedNodeJsDownload -Uri $archiveUri -Destination $archivePath -TimeoutSeconds 300 -MaximumBytes 67108864 | Out-Null
+        } else {
+            & $InternalTestHooks.DownloadArchive $archiveUri $archivePath 300 ([int64]67108864) | Out-Null
+        }
+        Assert-NoReparsePoint -Root $downloadRoot -Path $archivePath
+        $expectedArchiveSha256 = if ($null -eq $InternalTestHooks) { $script:PinnedNodeArchiveSha256 } else { [string]$InternalTestHooks.ExpectedArchiveSha256 }
+        Assert-FileSha256 -Path $archivePath -Expected $expectedArchiveSha256 | Out-Null
+        if ($null -eq $InternalTestHooks) {
+            Expand-Archive -LiteralPath $archivePath -DestinationPath $expandRoot -Force
+        } else {
+            & $InternalTestHooks.ExpandArchive $archivePath $expandRoot | Out-Null
+        }
+        $distributionRoot = Resolve-FullPath -Path (Join-Path $expandRoot 'node-v24.17.0-win-x64') -MustExist -PathType Container
+        Assert-NoReparsePoint -Root $expandRoot -Path $distributionRoot
+        $extractedNode = Resolve-FullPath -Path (Join-Path $distributionRoot 'node.exe') -MustExist -PathType Leaf
+        $extractedLicense = Resolve-FullPath -Path (Join-Path $distributionRoot 'LICENSE') -MustExist -PathType Leaf
+        if (-not (Test-PinnedNodeRuntimePair -NodePath $extractedNode -LicensePath $extractedLicense @pairValidationParameters)) {
+            throw 'Extracted Node.js files do not match the pinned v24.17.0 x64 runtime and license.'
+        }
+        if ((Get-FileHash -LiteralPath $extractedLicense -Algorithm SHA256).Hash.ToLowerInvariant() -cne
+            (Get-FileHash -LiteralPath $sourceLicense -Algorithm SHA256).Hash.ToLowerInvariant()) {
+            throw 'Extracted Node.js license does not match the checked-in pinned license.'
+        }
+
+        Copy-FileDurable -Source $extractedLicense -Destination $writingLicense | Out-Null
+        if (-not (Test-FileDescriptorMatch -Path $writingLicense -Bytes 159872 -Sha256 $script:PinnedNodeLicenseSha256)) { throw 'Prepared Node.js license copy failed validation.' }
+        [IO.File]::Move($writingLicense,$preparedLicense)
+        Copy-FileDurable -Source $extractedNode -Destination $writingNode | Out-Null
+        if (-not (Test-FileDescriptorMatch -Path $writingNode -Bytes 92299080 -Sha256 $script:PinnedNodeExecutableSha256)) { throw 'Prepared Node.js executable copy failed validation.' }
+        [IO.File]::Move($writingNode,$preparedNode)
+        $publicationParameters = @{}
+        if ($null -ne $InternalTestHooks -and $InternalTestHooks.ContainsKey('PublicationCheckpoint')) {
+            $publicationParameters.InternalCheckpoint = $InternalTestHooks.PublicationCheckpoint
+        }
+        Publish-PreparedFileSetTransaction -Root $runtimeRoot -JournalName $journalName -TransactionRole node-runtime -ExpectedTargetNames @('LICENSE','node.exe') -Items @(
+            [pscustomobject]@{PreparedPath=$preparedLicense;TargetPath=$runtimeLicense},
+            [pscustomobject]@{PreparedPath=$preparedNode;TargetPath=$nodePath}
+        ) @publicationParameters | Out-Null
+        if (-not (Test-PinnedNodeRuntimePair -NodePath $nodePath -LicensePath $runtimeLicense @pairValidationParameters)) {
+            throw 'Published Node.js runtime pair failed final validation.'
+        }
+        return Resolve-FullPath -Path $nodePath -MustExist -PathType Leaf
+    } finally {
+        foreach ($writing in @($writingLicense,$writingNode)) {
+            if (Test-Path -LiteralPath $writing -PathType Leaf) { Remove-Item -LiteralPath $writing -Force }
+        }
+        if (-not (Test-Path -LiteralPath $journalPath -PathType Leaf)) {
+            foreach ($prepared in @($preparedLicense,$preparedNode)) {
+                if (Test-Path -LiteralPath $prepared -PathType Leaf) {
+                    $expectedHash = if ($prepared -ceq $preparedNode) { $script:PinnedNodeExecutableSha256 } else { $script:PinnedNodeLicenseSha256 }
+                    if ((Get-FileHash -LiteralPath $prepared -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $expectedHash) {
+                        Remove-Item -LiteralPath $prepared -Force
+                    }
+                }
+            }
+        }
+        foreach ($temporaryRoot in @($downloadRoot,$expandRoot)) {
+            if (Test-Path -LiteralPath $temporaryRoot -PathType Container) {
+                Remove-SafeDirectory -ConfinementRoot $buildRoot -Path $temporaryRoot
+            }
+        }
     }
 }
 
@@ -618,15 +2060,28 @@ function Repair-TargetSpecificAtomicFile {
     if (-not (Test-Path -LiteralPath $parent -PathType Container)) { return }
     Assert-NoReparsePoint -Root $root -Path $parent
     $leaf = [Regex]::Escape([IO.Path]::GetFileName($target))
-    $artifacts = @(Get-ChildItem -LiteralPath $parent -File -Force | Where-Object { $_.Name -match "^\.$leaf\.replace\.(?:tmp|backup)-[0-9a-f]{32}$" })
+    $artifacts = @(Get-ChildItem -LiteralPath $parent -File -Force | Where-Object { $_.Name -match "^\.$leaf\.replace\.(?:writing|tmp|backup)-[0-9a-f]{32}$" })
     if ($artifacts.Count -eq 0) { return }
     foreach ($artifact in $artifacts) {
         if (($artifact.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $artifact.Length -gt $MaximumArtifactBytes) { throw "Unsafe atomic-replacement artifact: $($artifact.FullName)" }
     }
     $ids = @($artifacts | ForEach-Object { if ($_.Name -match '-([0-9a-f]{32})$') { $Matches[1] } } | Select-Object -Unique)
     if ($ids.Count -ne 1 -or $artifacts.Count -gt 2) { throw "Ambiguous atomic-replacement artifacts for '$target'." }
+    $writing = $artifacts | Where-Object Name -match '\.replace\.writing-' | Select-Object -First 1
     $temporary = $artifacts | Where-Object Name -match '\.replace\.tmp-' | Select-Object -First 1
     $backup = $artifacts | Where-Object Name -match '\.replace\.backup-' | Select-Object -First 1
+    if ($null -ne $writing) {
+        if ($artifacts.Count -ne 1) { throw "An incomplete atomic write coexists with publication artifacts for '$target'." }
+        if (Test-Path -LiteralPath $target -PathType Leaf) {
+            & $ValidateCanonical $target | Out-Null
+        } elseif (Test-Path -LiteralPath $target) {
+            throw "Atomic replacement target is not a file: $target"
+        }
+        # A writing leaf has never crossed the prepared-name boundary, so no
+        # canonical mutation can depend on it.
+        Remove-Item -LiteralPath $writing.FullName -Force -ErrorAction Stop
+        return
+    }
     if (Test-Path -LiteralPath $target -PathType Leaf) {
         & $ValidateCanonical $target | Out-Null
     } elseif (Test-Path -LiteralPath $target) {
@@ -830,7 +2285,7 @@ function Repair-InterruptedMaintenanceArtifacts {
             $targetSpecificReportDebris = @(Get-ChildItem -LiteralPath $revisionDirectory.FullName -Force | Where-Object { $_.Name -like '.stage-report.json.replace.*' })
             foreach ($item in $targetSpecificReportDebris) {
                 if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
-                    $item.Name -cnotmatch '^\.stage-report\.json\.replace\.(?:tmp|backup)-[0-9a-f]{32}$') {
+                    $item.Name -cnotmatch '^\.stage-report\.json\.replace\.(?:writing|tmp|backup)-[0-9a-f]{32}$') {
                     throw "Ambiguous staged-report replacement artifact in '$($revisionDirectory.FullName)': $($item.Name)"
                 }
                 if ($item.Length -gt 1048576) { throw "Interrupted staged-report replacement artifact is unexpectedly large: $($item.FullName)" }
@@ -1847,9 +3302,11 @@ function Assert-PackageChecksums {
         'README.md',
         'SPEC.md',
         'scripts\build.mjs',
+        'scripts\Generate-BundledNotices.mjs',
         'scripts\inspect-database.mjs',
         'scripts\Common.ps1',
         'scripts\IndexMaintenance.ps1',
+        'scripts\SevenZipRuntime.ps1',
         'scripts\StageInstallRecovery.ps1',
         'scripts\Install-Codex.ps1',
         'scripts\Rebuild-Index.ps1',
@@ -1860,7 +3317,14 @@ function Assert-PackageChecksums {
         'scripts\Rollback-Documentation.ps1',
         'scripts\Test-Maintenance.ps1',
         'scripts\Test-StageInstallRecovery.ps1',
+        'tools\7z.exe',
+        'tools\7z.dll',
+        'tools\7zip.provenance.json',
         'licenses\7ZIP-LICENSE.txt',
+        'licenses\BUNDLED-NODE-NOTICES.txt',
+        'licenses\bundled-node-dependencies.json',
+        'licenses\bundled-node-notice-overrides.json',
+        'licenses\overrides\boolbase-1.0.0.txt',
         'licenses\CHEERIO-LICENSE.txt',
         'licenses\ESBUILD-LICENSE.txt',
         'licenses\ICONV-LITE-LICENSE.txt',
@@ -1877,18 +3341,6 @@ function Assert-PackageChecksums {
     }
     $packageMarker = (Get-Content -LiteralPath (Join-Path $root '.mql5-chm-package-root') -Raw -Encoding UTF8).Trim()
     if ($packageMarker -cne 'mql5-chm-portable-package-v1') { throw 'Portable package ownership marker is invalid.' }
-    $toolPairs = @(
-        @('tools/7z.exe','tools/7z.dll'),
-        @('tools/7za.exe','tools/7za.dll')
-    )
-    $completeToolPairs = 0
-    foreach ($pair in $toolPairs) {
-        $hasExecutable = $seen.Contains($pair[0])
-        $hasLibrary = $seen.Contains($pair[1])
-        if ($hasExecutable -xor $hasLibrary) { throw "Checksum file contains an incomplete 7-Zip tool pair: $($pair -join ' + ')" }
-        if ($hasExecutable -and $hasLibrary) { $completeToolPairs++ }
-    }
-    if ($completeToolPairs -ne 1) { throw 'Portable package must contain exactly one supported 7-Zip executable/DLL pair.' }
     foreach ($file in Get-ValidatedRevisionChecksumFiles -ProjectRoot $root -Revision ([string]$pointer.active_revision) -IdentityMode $revisionIdentityMode -AllowLegacy:($AllowLegacyActive -or $pointerSchema -eq 1)) {
         $relative = $file.FullName.Substring($root.TrimEnd('\','/').Length).TrimStart('\','/').Replace('\','/')
         if (-not $seen.Contains($relative) -and -not $checksumExceptions.Contains($relative)) { throw "Checksum file is missing active revision entry '$relative'." }
@@ -2014,15 +3466,23 @@ function Update-ManagedChecksumsIfPresent {
     $lines = New-Object System.Collections.Generic.List[string]
     foreach ($relative in @($hashes.Keys) | Sort-Object) { $lines.Add("$($hashes[$relative]) *$relative") }
     $transactionId = [Guid]::NewGuid().ToString('N')
+    $writing = Join-Path $root ('.checksums.sha256.replace.writing-' + $transactionId)
     $temporary = Join-Path $root ('.checksums.sha256.replace.tmp-' + $transactionId)
     $backup = Join-Path $root ('.checksums.sha256.replace.backup-' + $transactionId)
     $prepared = $false
     try {
-        [IO.File]::WriteAllLines($temporary, $lines, (New-Object Text.UTF8Encoding($false)))
+        $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes(($lines -join [Environment]::NewLine) + [Environment]::NewLine)
+        $stream = New-Object IO.FileStream($writing, 'CreateNew', 'Write', 'None')
+        try { $stream.Write($bytes,0,$bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+        [IO.File]::Move($writing,$temporary)
         $prepared = $true
         Publish-PreparedAtomicFile -TemporaryPath $temporary -TargetPath $checksumPath -BackupPath $backup
     } catch {
-        if (-not $prepared -and (Test-Path -LiteralPath $temporary -PathType Leaf)) { Remove-Item -LiteralPath $temporary -Force -ErrorAction Stop }
+        if (-not $prepared) {
+            foreach ($incomplete in @($writing,$temporary)) {
+                if (Test-Path -LiteralPath $incomplete -PathType Leaf) { Remove-Item -LiteralPath $incomplete -Force -ErrorAction Stop }
+            }
+        }
         throw
     }
     Assert-PackageChecksums -ProjectRoot $root -AllowLegacyActive:$AllowLegacyActive | Out-Null

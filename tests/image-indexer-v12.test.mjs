@@ -22,6 +22,7 @@ import {
   INDEX_CONTRACT,
   assertAssetIdentityAvailable,
   buildIndex,
+  computeImagePolicySha256,
   inspectRasterAsset,
   inspectPolicyPinnedPngException,
   makeAssetId,
@@ -29,6 +30,13 @@ import {
   parseHtmlTopic,
   resolveInternalAssetPath,
 } from "../src/indexer.mjs";
+
+test("image-policy identity is stable across Git line-ending conversion", () => {
+  const lf = '{\n  "schema_version": 1,\n  "policy_id": "test"\n}\n';
+  const crlf = lf.replaceAll("\n", "\r\n");
+  assert.notEqual(createHash("sha256").update(lf).digest("hex"), createHash("sha256").update(crlf).digest("hex"));
+  assert.equal(computeImagePolicySha256(lf), computeImagePolicySha256(crlf));
+});
 
 const crcTable = (() => {
   const table = new Uint32Array(256);
@@ -560,6 +568,74 @@ test("schema-3 builds preserve JavaScript UTF-16 offsets for supplementary Unico
     } finally {
       database.close();
     }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("real index builds can explicitly reclaim a dead local legacy lock", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "mql5-index-legacy-lock-"));
+  try {
+    await createMiniCorpus(root);
+    const outputDirectory = path.join(root, "candidate");
+    await mkdir(outputDirectory);
+    const lockPath = path.join(outputDirectory, ".index-build.lock");
+    const legacy = { pid: 2_147_483_647, started_at: "2026-01-01T00:00:00.000Z" };
+    await writeFile(lockPath, `${JSON.stringify(legacy)}\n`, "utf8");
+
+    await assert.rejects(
+      buildIndex(root, miniCorpusBuildOptions({ outputDirectory: "candidate" })),
+      /explicit proof|local to this host/i,
+    );
+    assert.equal(await readFile(lockPath, "utf8"), `${JSON.stringify(legacy)}\n`);
+
+    const proofOptions = process.platform === "win32"
+      ? { reclaimDeadLegacyLock: true, legacyLocalStorageProbe: () => true }
+      : { legacySameHostProof: () => true };
+    const result = await buildIndex(root, miniCorpusBuildOptions({
+      outputDirectory: "candidate",
+      ...proofOptions,
+    }));
+    assert.match(result.indexRevision, /^[0-9a-f]{64}$/u);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("finalizer cleanup failure retains strict owner evidence for retry", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "mql5-index-finalizer-retry-"));
+  try {
+    await createMiniCorpus(root);
+    const outputDirectory = path.join(root, "candidate");
+    let injected = false;
+    await assert.rejects(
+      buildIndex(root, miniCorpusBuildOptions({
+        outputDirectory: "candidate",
+        async cleanupRemove(target, options) {
+          if (!injected && path.basename(target).startsWith(".manifest.json.candidate-")) {
+            injected = true;
+            await writeFile(target, "stranded candidate manifest\n", "utf8");
+            const error = new Error("synthetic sharing violation");
+            error.code = "EACCES";
+            throw error;
+          }
+          return rm(target, options);
+        },
+      })),
+      /strict owner lock was retained|cleanup failed/i,
+    );
+    assert.equal(injected, true);
+    const lock = JSON.parse(await readFile(path.join(outputDirectory, ".index-build.lock"), "utf8"));
+    assert.equal(lock.schema_version, 1);
+    assert.equal(await readFile(path.join(outputDirectory, `.manifest.json.candidate-${lock.owner_token}`), "utf8"), "stranded candidate manifest\n");
+
+    const recovered = await buildIndex(root, miniCorpusBuildOptions({
+      outputDirectory: "candidate",
+      lockProbeProcess: () => "dead",
+    }));
+    assert.match(recovered.indexRevision, /^[0-9a-f]{64}$/u);
+    assert.equal((await readdir(outputDirectory)).some((name) => name.includes(lock.owner_token)), false);
+    assert.equal((await readdir(outputDirectory)).includes(".index-build.lock"), false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

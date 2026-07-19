@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import * as searchServiceModule from "../src/search-service.mjs";
 
-const { SUPPORTED_INDEX_CONTRACT, createSearchService } = searchServiceModule;
+const { SUPPORTED_INDEX_CONTRACT, createSearchService, encodeCursor } = searchServiceModule;
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 let service;
@@ -162,6 +162,43 @@ test("read supports focus and opaque continuation", () => {
   assert.ok(first.next_cursor);
   const second = service.read({ topic_id: hit.topic_id, cursor: first.next_cursor, max_chars: 500 });
   assert.ok(second.start_offset > first.start_offset);
+
+  const otherHit = service.search({ query: "OrderSend", source: "mql5", limit: 1 }).results[0];
+  assert.throws(
+    () => service.read({ topic_id: otherHit.topic_id, cursor: first.next_cursor, max_chars: 500 }),
+    (error) => error?.code === "INVALID_CURSOR" && /different topic/i.test(error.message),
+  );
+
+  const sections = service.database.prepare(
+    "SELECT section_id FROM sections WHERE topic_id=? ORDER BY section_id LIMIT 2",
+  ).all(hit.topic_id);
+  assert.equal(sections.length, 2);
+  const sectionCursor = encodeCursor({
+    indexRevision: service.indexSha256,
+    topicId: hit.topic_id,
+    sectionId: sections[0].section_id,
+    offset: 0,
+  });
+  assert.throws(
+    () => service.read({ topic_id: hit.topic_id, section_id: sections[1].section_id, cursor: sectionCursor, max_chars: 500 }),
+    (error) => error?.code === "INVALID_CURSOR" && /different section/i.test(error.message),
+  );
+
+  const staleCursor = encodeCursor({
+    indexRevision: "f".repeat(64),
+    topicId: hit.topic_id,
+    offset: first.returned_chars,
+  });
+  assert.throws(
+    () => service.read({ topic_id: hit.topic_id, cursor: staleCursor, max_chars: 500 }),
+    (error) => error?.code === "INVALID_CURSOR" && /different index revision/i.test(error.message),
+  );
+  const missingTopicId = `${hit.topic_id.slice(0, -1)}${hit.topic_id.endsWith("0") ? "1" : "0"}`;
+  assert.equal(service.database.prepare("SELECT 1 FROM topics WHERE topic_id=?").get(missingTopicId), undefined);
+  assert.throws(
+    () => service.read({ topic_id: missingTopicId, cursor: staleCursor, max_chars: 500 }),
+    (error) => error?.code === "INVALID_CURSOR" && /different index revision/i.test(error.message),
+  );
 });
 
 test("service handlers enforce bounds and stable IDs", () => {

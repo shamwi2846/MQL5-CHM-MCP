@@ -1,4 +1,4 @@
-# MQL5 CHM MCP 1.2.1
+# MQL5 CHM MCP 1.2.2
 
 A portable, local MCP server for the official English MQL5 reference, AlgoBook, and Neural Networks book. The active corpus contains 4,827 indexed topics, 16,261 sections, and a secure catalog of the original technical diagrams, screenshots, charts, and MQL5 object icons. Runtime access is offline, stdio-only, and strictly read-only; no MetaTrader account, HTTP port, trading access, or authentication is required.
 
@@ -11,6 +11,8 @@ The server exposes four closed-world tools:
 
 Normal searches remain text-only. Captions and filenames do not enter FTS5, and images are returned only after an explicit image-tool call.
 
+Text continuation cursors are opaque revision-bound v2 tokens. A cursor is accepted only for the active index, topic, and selected section that issued it; legacy v1, stale-revision, tampered, wrong-topic, and wrong-section cursors are rejected. This release does not change any MCP tool argument or response schema.
+
 ## Install in Codex
 
 Run from PowerShell:
@@ -21,6 +23,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Install-Codex.ps1
 
 Fully close and reopen Codex after installation, activation, or rollback.
 
+Installation and uninstallation serialize package-managed registration changes through one machine-global registration mutex. Installation is idempotent only when the existing `mql5-chm` registration is enabled, path-owned by this package, and has no environment, working-directory, or tool-filter overrides. Disabled, modified, differently owned, malformed, or duplicate entries are preserved and rejected. If registration fails, rollback removes only an entry still observed as owned by the exact Node/server paths just added, then confirms the post-state. This prevents races between cooperating package scripts. Codex currently exposes removal by name rather than by an ownership compare-and-swap token, so an unrelated external config writer must not replace `mql5-chm` during the small `codex mcp remove` command window; the package cannot atomically preserve a replacement it was never able to observe.
+
 ## Check, stage, and activate official updates
 
 Update checking is manual. It downloads only the three fixed HTTPS CHM URLs on `www.mql5.com` into temporary storage, enforces redirect and size limits, compares hashes, and never activates anything:
@@ -29,7 +33,7 @@ Update checking is manual. It downloads only the three fixed HTTPS CHM URLs on `
 .\Check-DocumentationUpdates.ps1
 ```
 
-Stage a different official corpus or a same-corpus index-contract upgrade. This downloads when required, independently counts each CHM's HTML directory entries before extraction, extracts exactly that count, indexes text and safe assets, verifies SQLite/asset integrity, rejects unsafe in-topic references or topic loss, checks representative API ranking, writes a change report, and leaves the index inactive:
+Stage a different official corpus or a same-corpus index-contract upgrade. Before extraction, the archive inventory covers every `.htm`, `.html`, `.hhc`, `.hhk`, and image-policy input and rejects unsafe, rooted, traversing, duplicate, case-colliding, or invalid paths. `hh.exe` and the synchronous 7-Zip fallback run in separate isolated directories; every expected file must have the exact size, and two sorted path/size/SHA-256 closure digests must match before an immutable snapshot is published. The command then indexes text and safe assets, verifies SQLite/asset integrity, rejects unsafe in-topic references or topic loss, checks representative API ranking, writes a change report, and leaves the index inactive:
 
 ```powershell
 .\Update-Documentation.ps1 -Stage
@@ -55,13 +59,19 @@ Return to the previous verified revision:
 
 `data\active.json` is the small atomic active-index pointer. Verified artifacts live under `revisions\<index_revision>\`. Corpus identity remains the hash of the three CHMs, while index identity is the hash of the completed database. Previous installed revisions remain local for rollback; a portable ZIP contains only the active schema-3 index.
 
-Apply and rollback use a strict recovery journal under the same maintenance lock. If either command is interrupted, rerun the corresponding command; it completes the recorded direction without toggling back. Check, stage, rebuild, package, and install refuse to cross an incomplete transition.
+Apply and rollback use a strict recovery journal under the same maintenance lock. If either command is interrupted, rerun the corresponding command; it completes the recorded direction without toggling back. Apply and interrupted-stage semantic acceptance rerun the same deterministic-identity gate before report acknowledgement or mutation, so an older staged same-input drift candidate cannot bypass the current staging checks. Check, stage, rebuild, package, and install refuse to cross an incomplete transition.
+
+All maintenance writers coordinate through one physical-path-derived machine-global `Global\...` mutex. A terminated holder is recovered through the Windows abandoned-mutex contract; inability to open the global object fails before mutation, and path aliases cannot create another writer. The compatibility marker `maintenance\.update.lock` remains zero bytes and is never used as the ownership record.
+
+The direct Node indexer also uses a strict hostname- and owner-token-bound lock. A legacy `{pid,started_at}` lock fails closed by default; an operator who has independently confirmed that its owner was on this machine may use `--reclaim-dead-legacy-lock`. That recovery additionally requires a reparse-free output path on a Windows fixed or RAM-backed local volume, a definitely dead PID, and no ambiguous transaction debris; mapped, UNC, device, live, inaccessible, or uncertain owners are retained.
 
 Source metadata records hashes, byte sizes, retrieval/acceptance time, and available HTTP `ETag`/`Last-Modified` values. These timestamps are never presented as a CHM publication or build version.
 
 ## Rebuild and transfer
 
 `Rebuild-Index.ps1` rebuilds from the active revision's CHMs and can migrate the legacy corpus-keyed schema-2 layout additively. Existing legacy revisions are copied, never modified or removed. Use the staged update workflow, not manual CHM replacement, for later documentation changes.
+
+For the same corpus with current schemas, the current index contract, and the same image-policy SHA-256 (canonicalized across Git LF/CRLF checkout conversion), a rebuild must be byte-deterministic. An equal index hash reports “already current”; a different hash is rejected before any journal, revision, checksum, report, or status mutation. Asset-reduction acknowledgement cannot bypass this gate.
 
 ```powershell
 .\Rebuild-Index.ps1
@@ -74,13 +84,15 @@ To review a validated inactive schema-3 revision without touching the production
 .\Package-Portable.ps1 -CandidateRevision <64-character-index-revision>
 ```
 
-Candidate packages default to `build\portable-candidate-release`. `-OutputDirectory <directory>` selects a different output root, and `-ReleaseName <safe-name>` selects the stage/ZIP name. Output staging is rejected if it equals, contains, or overlaps the project, an immutable revision, application/scripts/config/runtime/tools sources, or a reparse point. An existing stage is replaced only when it contains the package ownership marker written by this packager. The final ZIP is validated in a temporary sibling and atomically published, preserving an existing known-good ZIP if compression fails.
+Candidate packages default to `build\portable-candidate-release`. `-OutputDirectory <directory>` selects a different output root, and `-ReleaseName <safe-name>` selects the stage/ZIP name. Output staging is rejected if it equals, contains, or overlaps the project, an immutable revision, application/scripts/config/runtime/tools sources, or a reparse point. An existing stage is replaced only when it contains the package ownership marker written by this packager. ZIP and sidecar bytes are durably completed and validated under token-bound `.writing` names before they become prepared candidates. The final ZIP and timestamp-free `<ReleaseName>.zip.manifest.json` sidecar are then validated and published as one journaled transaction. The sidecar contains exactly `schema_version`, `file`, `bytes`, and lowercase `sha256`. A legacy ZIP without a sidecar may be upgraded; an unexplained malformed or mismatched existing pair is refused.
 
-Copy or unzip the complete portable package on another Windows x64 computer and run `Install-Codex.ps1`. The bundled Node.js runtime means no system Node installation is needed.
+Copy or unzip the complete portable package on another Windows x64 computer and run `Install-Codex.ps1`. The bundled runtime is exactly Node.js `24.17.0`, so no system Node installation is needed.
 
 `Package-Portable.ps1` rebuilds bundles in a complete development checkout. In a transferred portable copy it instead verifies `checksums.sha256` before executing bundled Node or 7-Zip and before reusing the prebuilt bundles, so repackaging does not require source files, npm packages, or system Node. A tree containing `checksums.sha256` is always treated as portable even if extra development-looking files were added. Install, rebuild, update, and repackaging therefore reject missing, extra, or tampered package files before bundled code or native tools execute. A portable repack defaults to a sibling `<package-folder>-repack-output` directory outside the verified source; a custom `-OutputDirectory` must also be non-overlapping.
 
-The portable package includes `config\mql5-image-policy.json` and `config\mql5-query-expansions.json`, so a transferred copy can perform a verified offline same-corpus rebuild without a source tree or `node_modules`. Extraction/index scratch directories live under the Windows temporary directory and are not part of the checksummed package; interrupted atomic-write debris is reconciled under the maintenance lock before retry.
+In a development checkout, missing or damaged runtime files are repaired only from the official HTTPS `nodejs.org` archive through a 300-second, 64 MiB bounded stream. Archive, executable, exact version, x64 architecture, and license hashes are verified; each copied payload crosses from `.writing` to `.prepared` only after its exact descriptor validates, the prior runtime pair is preserved on failure, and validated files are transactionally published with `node.exe` last. Portable repacking is offline and never downloads or repairs its runtime. Bundled 7-Zip is the pinned official Windows x64 `26.02` executable/DLL/license set, validated against checked-in provenance including CHM capability and repaired only from the official MSI in a development checkout; installed-program fallbacks are not used. Packaging also checks deterministic complete dependency notices against the lockfile and the nonzero esbuild bundle contributors.
+
+The portable package includes `config\mql5-image-policy.json` and `config\mql5-query-expansions.json`, so a transferred copy can perform a verified offline same-corpus rebuild without a source tree or `node_modules`. Extraction/index scratch directories live under the Windows temporary directory and are not part of the checksummed package. Interrupted `.writing` payloads are known to precede publication and are reclaimed only in their exact token-bound context; prepared candidates, backups, journals, and canonical files remain subject to strict validation and fail-closed ambiguity handling under the maintenance lock.
 
 ## Uninstall from Codex
 
@@ -88,7 +100,7 @@ The portable package includes `config\mql5-image-policy.json` and `config\mql5-q
 .\Uninstall-Codex.ps1
 ```
 
-Uninstalling removes only the `mql5-chm` Codex registration. Documentation, revisions, and update history remain on disk. MetaTrader and MetaEditor MCP registrations are never changed.
+Uninstalling is a no-op when `mql5-chm` is absent. It removes only a registration path-owned by this package, even when optional settings changed or package runtime files are damaged; malformed or differently owned entries are preserved and rejected. Documentation, revisions, and update history remain on disk. MetaTrader and MetaEditor MCP registrations are never changed.
 
 ## Security boundary
 

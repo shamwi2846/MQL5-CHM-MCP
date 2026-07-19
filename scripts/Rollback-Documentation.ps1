@@ -9,10 +9,12 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'IndexMaintenance.ps1')
 
 $root = Resolve-FullPath -Path $ProjectRoot -MustExist -PathType Container
-$maintenanceRoot = Join-Path $root 'maintenance'; if (-not (Test-Path -LiteralPath $maintenanceRoot -PathType Container)) { New-Item -ItemType Directory -Path $maintenanceRoot | Out-Null }
+Assert-NoReparsePoint -Root $root -Path $root
+$maintenanceRoot = Join-Path $root 'maintenance'
+$lockPath = Join-Path $maintenanceRoot '.update.lock'
 $lock = $null
 try {
-    $lock = Enter-ExclusiveFileLock -Path (Join-Path $maintenanceRoot '.update.lock') -TimeoutSeconds $LockTimeoutSeconds
+    $lock = Enter-ExclusiveFileLock -Path $lockPath -IdentityRoot $root -TimeoutSeconds $LockTimeoutSeconds
     Repair-InterruptedMaintenanceArtifacts -ProjectRoot $root
     Convert-DevelopmentLegacyActivePointerForStageRecovery -ProjectRoot $root | Out-Null
     $stageRecovery = Repair-InterruptedRevisionStageInstall -ProjectRoot $root

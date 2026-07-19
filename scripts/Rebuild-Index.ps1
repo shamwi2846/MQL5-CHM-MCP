@@ -34,13 +34,13 @@ function Assert-RebuildActivationAccepted {
 
 $root = Resolve-FullPath -Path $ProjectRoot -MustExist -PathType Container
 Assert-NoReparsePoint -Root $root -Path $root
-$maintenanceRoot = Join-Path $root 'maintenance'; if (-not (Test-Path -LiteralPath $maintenanceRoot -PathType Container)) { New-Item -ItemType Directory -Path $maintenanceRoot | Out-Null }
+$maintenanceRoot = Join-Path $root 'maintenance'
 Assert-NoReparsePoint -Root $root -Path $maintenanceRoot
 $tempBase = Resolve-FullPath -Path ([IO.Path]::GetTempPath()) -MustExist -PathType Container
 Assert-NoReparsePoint -Root $tempBase -Path $tempBase
 $lock = $null; $work = Join-Path $tempBase ('mql5-chm-rebuild-work-' + [Guid]::NewGuid().ToString('N'))
 try {
-    $lock = Enter-ExclusiveFileLock -Path (Join-Path $maintenanceRoot '.update.lock') -TimeoutSeconds $LockTimeoutSeconds
+    $lock = Enter-ExclusiveFileLock -Path (Join-Path $maintenanceRoot '.update.lock') -IdentityRoot $root -TimeoutSeconds $LockTimeoutSeconds
     Repair-InterruptedMaintenanceArtifacts -ProjectRoot $root
     if ($PSCmdlet.ParameterSetName -eq 'Stage') { Convert-DevelopmentLegacyActivePointerForStageRecovery -ProjectRoot $root | Out-Null }
     $stageRecovery = Repair-InterruptedRevisionStageInstall -ProjectRoot $root
@@ -97,10 +97,13 @@ try {
     }
     $candidate = New-RevisionCandidate -ProjectRoot $root -SourceRecords $records -WorkingRoot $work -ExtractionTimeoutSeconds $ExtractionTimeoutSeconds -HhTimeoutSeconds $HhTimeoutSeconds
     if ($null -ne $base) {
+        if (Assert-DeterministicRebuildResult -BaseRevision $base -CandidateRevision $candidate) {
+            Write-Host "The verified index is already current: $($candidate.IndexRevision)"
+            return
+        }
         $node = Resolve-NodeExecutable -ProjectRoot $root
         $baseInspection = Invoke-DatabaseInspection -NodePath $node -DatabasePath $base.DatabasePath
         Assert-NoRevisionTopicLoss -BaseRevision $base -CandidateRevision $candidate -BaseInspection $baseInspection -CandidateInspection $candidate.Inspection -Context 'rebuild stage' | Out-Null
-        if ([string]$candidate.IndexRevision -ceq [string]$base.IndexRevision) { Write-Host "The verified index is already current: $($candidate.IndexRevision)"; return }
     }
     $sourceCounts = [ordered]@{}
     foreach ($definition in Get-Mql5CorpusDefinition) {

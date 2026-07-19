@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import iconv from "iconv-lite";
@@ -9,6 +11,7 @@ import iconv from "iconv-lite";
 import {
   decodeHtml,
   detectHtmlEncoding,
+  createSchema,
   makeSectionId,
   makeTopicId,
   normalizeInternalPath,
@@ -64,9 +67,86 @@ test("FTS input is tokenized instead of accepting raw syntax", () => {
 
 test("opaque cursors round-trip and reject tampering", () => {
   const topicId = "mql5:0123456789abcdef01234567";
-  const cursor = encodeCursor({ topicId, offset: 500 });
-  assert.deepEqual(decodeCursor(cursor), { topicId, sectionId: null, offset: 500 });
+  const indexRevision = "a".repeat(64);
+  const cursor = encodeCursor({ indexRevision, topicId, offset: 500 });
+  assert.deepEqual(decodeCursor(cursor), { indexRevision, topicId, sectionId: null, offset: 500 });
   assert.throws(() => decodeCursor(`${cursor.slice(0, -1)}0`), /cursor/i);
+  assert.throws(() => encodeCursor({ topicId, offset: 500 }), /cursor/i);
+
+  const legacyBody = Buffer.from(JSON.stringify({ v: 1, t: topicId, s: null, o: 500 }), "utf8").toString("base64url");
+  const legacyTag = createHash("sha256")
+    .update("mql5-chm-read-cursor-v1\0")
+    .update(legacyBody)
+    .digest("hex")
+    .slice(0, 24);
+  assert.throws(() => decodeCursor(`${legacyBody}.${legacyTag}`), /cursor/i);
+});
+
+test("text continuation preserves supplementary Unicode at UTF-16 boundaries", () => {
+  const database = new DatabaseSync(":memory:");
+  const projectRoot = mkdtempSync(join(tmpdir(), "mql5-unicode-cursor-"));
+  const topicId = makeTopicId("mql5", "unicode-cursor.htm");
+  const content = `${"x".repeat(499)}😀${"y".repeat(700)}`;
+  try {
+    createSchema(database);
+    database.prepare(`
+      INSERT INTO sources(source, chm_filename, chm_sha256, chm_bytes, topic_count, section_count)
+      VALUES('mql5', 'mql5.chm', ?, 1, 1, 0)
+    `).run("b".repeat(64));
+    database.prepare(`
+      INSERT INTO topics(topic_id, source, internal_path, title, normalized_title, breadcrumb, signature, content_sha256, content, content_length)
+      VALUES(?, 'mql5', 'unicode-cursor.htm', 'Unicode Cursor', 'unicode cursor', 'Unicode Cursor', '', ?, ?, ?)
+    `).run(topicId, createHash("sha256").update(content, "utf8").digest("hex"), content, content.length);
+    const source = (filename) => ({ filename, sha256: "b".repeat(64) });
+    const unicodeService = new Mql5ChmSearchService(database, {
+      projectRoot,
+      databaseHash: "c".repeat(64),
+      activePointer: { active_revision: "c".repeat(64), previous_revision: null, activated_at: "2026-01-01T00:00:00.000Z" },
+      manifest: {
+        schema_version: 2,
+        corpus_sha256: "a".repeat(64),
+        sources: {
+          mql5: source("mql5.chm"),
+          mql5book: source("mql5book.chm"),
+          neuronetworksbook: source("neuronetworksbook.chm"),
+        },
+      },
+    });
+    const parts = [];
+    let cursor = null;
+    do {
+      const page = unicodeService.read({
+        topic_id: topicId,
+        ...(cursor ? { cursor } : {}),
+        max_chars: 500,
+        include_related: false,
+        include_images: false,
+      });
+      assert.doesNotMatch(page.text, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u);
+      parts.push(page.text);
+      cursor = page.next_cursor;
+    } while (cursor);
+    assert.equal(parts.join(""), content);
+
+    const focusContent = `${"x".repeat(499)}😀${"y".repeat(99)}needle${"z".repeat(700)}`;
+    database.prepare(`
+      UPDATE topics SET content_sha256=?, content=?, content_length=? WHERE topic_id=?
+    `).run(createHash("sha256").update(focusContent, "utf8").digest("hex"), focusContent, focusContent.length, topicId);
+    const focused = unicodeService.read({
+      topic_id: topicId,
+      focus: "needle",
+      max_chars: 500,
+      include_related: false,
+      include_images: false,
+    });
+    assert.equal(focused.start_offset, 499);
+    assert.ok(focused.text.startsWith("😀"));
+    assert.match(focused.text, /needle/u);
+    assert.doesNotMatch(focused.text, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u);
+  } finally {
+    database.close();
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
 });
 
 test("malformed optional update status never disables MCP status", () => {

@@ -198,17 +198,23 @@ function Write-StagedRevisionReportValue {
     Assert-StagedRevisionReportValue -StageReport $StageReport -ExpectedRevision $revision | Out-Null
     $reportPath = Join-Path $revisionRootFull 'stage-report.json'
     $transactionId = [Guid]::NewGuid().ToString('N')
+    $writing = Assert-PathWithin -Root $revisionRootFull -Path (Join-Path $revisionRootFull ('.stage-report.json.replace.writing-' + $transactionId))
     $temporary = Assert-PathWithin -Root $revisionRootFull -Path (Join-Path $revisionRootFull ('.stage-report.json.replace.tmp-' + $transactionId))
     $backup = Assert-PathWithin -Root $revisionRootFull -Path (Join-Path $revisionRootFull ('.stage-report.json.replace.backup-' + $transactionId))
     $prepared = $false
     try {
         $bytes = Get-StagedRevisionReportFileBytes -StageReport $StageReport
-        $stream = New-Object IO.FileStream($temporary, 'CreateNew', 'Write', 'None')
+        $stream = New-Object IO.FileStream($writing, 'CreateNew', 'Write', 'None')
         try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+        [IO.File]::Move($writing, $temporary)
         $prepared = $true
         Publish-PreparedAtomicFile -TemporaryPath $temporary -TargetPath $reportPath -BackupPath $backup
     } catch {
-        if (-not $prepared -and (Test-Path -LiteralPath $temporary -PathType Leaf)) { Remove-Item -LiteralPath $temporary -Force -ErrorAction Stop }
+        if (-not $prepared) {
+            foreach ($incomplete in @($writing,$temporary)) {
+                if (Test-Path -LiteralPath $incomplete -PathType Leaf) { Remove-Item -LiteralPath $incomplete -Force -ErrorAction Stop }
+            }
+        }
         throw
     }
     return Assert-StagedRevisionReport -Path $reportPath -ExpectedRevision $revision
@@ -313,19 +319,12 @@ function Assert-RevisionStageRecoveryChecksumBoundary {
         '.mql5-chm-package-root','runtime/node.exe','runtime/LICENSE','app/server.mjs','app/indexer.mjs',
         'config/mql5-image-policy.json','config/mql5-query-expansions.json','data/active.json','maintenance/.update.lock',
         'Install-Codex.ps1','Rebuild-Index.ps1','Uninstall-Codex.ps1','Package-Portable.ps1','Check-DocumentationUpdates.ps1','Update-Documentation.ps1','Rollback-Documentation.ps1','README.md','SPEC.md',
-        'scripts/build.mjs','scripts/inspect-database.mjs','scripts/Common.ps1','scripts/IndexMaintenance.ps1','scripts/StageInstallRecovery.ps1',
+        'scripts/build.mjs','scripts/Generate-BundledNotices.mjs','scripts/inspect-database.mjs','scripts/Common.ps1','scripts/IndexMaintenance.ps1','scripts/SevenZipRuntime.ps1','scripts/StageInstallRecovery.ps1',
         'scripts/Install-Codex.ps1','scripts/Rebuild-Index.ps1','scripts/Uninstall-Codex.ps1','scripts/Package-Portable.ps1','scripts/Check-DocumentationUpdates.ps1','scripts/Update-Documentation.ps1','scripts/Rollback-Documentation.ps1','scripts/Test-Maintenance.ps1','scripts/Test-StageInstallRecovery.ps1',
-        'licenses/7ZIP-LICENSE.txt','licenses/CHEERIO-LICENSE.txt','licenses/ESBUILD-LICENSE.txt','licenses/ICONV-LITE-LICENSE.txt','licenses/JPEG-JS-LICENSE.txt','licenses/MCP-SDK-LICENSE.txt','licenses/NODE-LICENSE.txt','licenses/THIRD-PARTY-NOTICES.md','licenses/ZOD-LICENSE.txt'
+        'tools/7z.exe','tools/7z.dll','tools/7zip.provenance.json',
+        'licenses/7ZIP-LICENSE.txt','licenses/BUNDLED-NODE-NOTICES.txt','licenses/bundled-node-dependencies.json','licenses/bundled-node-notice-overrides.json','licenses/overrides/boolbase-1.0.0.txt','licenses/CHEERIO-LICENSE.txt','licenses/ESBUILD-LICENSE.txt','licenses/ICONV-LITE-LICENSE.txt','licenses/JPEG-JS-LICENSE.txt','licenses/MCP-SDK-LICENSE.txt','licenses/NODE-LICENSE.txt','licenses/THIRD-PARTY-NOTICES.md','licenses/ZOD-LICENSE.txt'
     )
     foreach ($relative in $required) { if (-not $seen.ContainsKey($relative)) { throw "Portable checksum boundary is missing required stage-recovery entry '$relative'." } }
-    $toolPairs = @(@('tools/7z.exe','tools/7z.dll'),@('tools/7za.exe','tools/7za.dll'))
-    $completeToolPairs = 0
-    foreach ($pair in $toolPairs) {
-        $hasExecutable = $seen.ContainsKey($pair[0]); $hasLibrary = $seen.ContainsKey($pair[1])
-        if ($hasExecutable -xor $hasLibrary) { throw "Portable checksum boundary contains an incomplete 7-Zip pair: $($pair -join ' + ')" }
-        if ($hasExecutable -and $hasLibrary) { $completeToolPairs++ }
-    }
-    if ($completeToolPairs -ne 1) { throw 'Portable checksum boundary must bind exactly one supported 7-Zip executable/DLL pair.' }
     $packageMarker = (Get-Content -LiteralPath (Join-Path $root '.mql5-chm-package-root') -Raw -Encoding UTF8).Trim()
     if ($packageMarker -cne 'mql5-chm-portable-package-v1') { throw 'Portable package ownership marker is invalid during stage recovery.' }
 

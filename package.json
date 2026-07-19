@@ -1,20 +1,22 @@
 {
   "name": "mql5-chm-mcp",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "private": true,
   "type": "module",
   "description": "Portable read-only MCP server for the official local MQL5 CHM corpus.",
   "engines": {
-    "node": ">=24.17.0 <25"
+    "node": "24.17.0"
   },
   "scripts": {
     "build": "node scripts/build.mjs",
     "build:candidate": "node scripts/build.mjs --outdir build/candidate-v12/app --metafile build/candidate-v12/esbuild-meta.json",
+    "notices:check": "node scripts/Generate-BundledNotices.mjs --check --metafile build/candidate-v12/esbuild-meta.json --metafile-label build/esbuild-meta.json",
+    "test:app-mcp": "node scripts/Test-AppBundle.mjs",
     "rebuild-index": "powershell -NoProfile -ExecutionPolicy Bypass -File ./Rebuild-Index.ps1",
     "check-updates": "powershell -NoProfile -ExecutionPolicy Bypass -File ./Check-DocumentationUpdates.ps1",
     "stage-update": "powershell -NoProfile -ExecutionPolicy Bypass -File ./Update-Documentation.ps1 -Stage",
     "pretest": "npm run build:candidate",
-    "test": "node --test --test-concurrency=1 tests/*.test.mjs && pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/Test-Maintenance.ps1 && pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/Test-StageInstallRecovery.ps1",
+    "test": "npm run notices:check && node --test --test-concurrency=1 tests/*.test.mjs && npm run test:app-mcp && pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/Test-CodexRegistration.ps1 && pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/Test-FileSetTransaction.ps1 && pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/Test-GlobalMutex.ps1 && pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/Test-IndexMaintenanceRepairs.ps1 && pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/Test-PackagingRepairs.ps1 && pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/Test-SevenZipRuntime.ps1 && pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/Test-Maintenance.ps1 && pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/Test-StageInstallRecovery.ps1",
     "package:portable": "powershell -NoProfile -ExecutionPolicy Bypass -File ./Package-Portable.ps1"
   },
   "dependencies": {
