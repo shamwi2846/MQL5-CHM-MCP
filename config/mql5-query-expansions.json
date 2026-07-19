@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "expansions": [
+    {
+      "phrases": ["trade opening", "opening a trade", "open a trade", "open trade", "place a trade", "send an order", "buy trade", "sell trade"],
+      "terms": ["OrderSend", "MqlTradeRequest", "CTrade::Buy", "CTrade::Sell"]
+    },
+    {
+      "phrases": ["position tickets", "position by ticket", "select position ticket", "find position ticket"],
+      "terms": ["PositionSelectByTicket", "PositionGetTicket", "POSITION_TICKET"]
+    },
+    {
+      "phrases": ["indicator buffers", "indicator buffer", "indicator buffer values", "read indicator values"],
+      "terms": ["CopyBuffer", "SetIndexBuffer", "indicator handle"]
+    },
+    {
+      "phrases": ["hedging account", "hedging mode", "multiple positions per symbol"],
+      "terms": ["ACCOUNT_MARGIN_MODE_RETAIL_HEDGING", "account margin mode", "hedging"]
+    },
+    {
+      "phrases": ["activation function", "neural activation", "neural network activation"],
+      "terms": ["activation function", "neural network", "sigmoid", "hyperbolic tangent", "ReLU"]
+    }
+  ]
+}

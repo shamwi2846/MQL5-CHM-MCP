@@ -1,0 +1,27 @@
+{
+  "schema_version": "1.0",
+  "sources": [
+    {
+      "id": "mql5",
+      "filename": "mql5.chm",
+      "sha256": "B6B3338A985E1EFEDC2C87FA478F648D7DE53E1DAA6D2A8A9E5359B8878E23FA",
+      "expected_topics": 4134,
+      "role": "MQL5 language and API reference"
+    },
+    {
+      "id": "mql5book",
+      "filename": "mql5book.chm",
+      "sha256": "4C0D0E6CE858B410F63969FC5D6B64076DA73AE7F4C010C212B6993D018A1F17",
+      "expected_topics": 581,
+      "role": "MQL5 programming book"
+    },
+    {
+      "id": "neuronetworksbook",
+      "filename": "neuronetworksbook.chm",
+      "sha256": "FE9470E6AC9452E34ECC54CD80DDDF59475C8AE23CAC7B5EF071B17F1C32D8F5",
+      "expected_topics": 112,
+      "role": "Neural-network book"
+    }
+  ],
+  "expected_total_topics": 4827
+}

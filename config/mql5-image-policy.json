@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "policy_id": "mql5-chm-technical-images-v1",
+  "catalog_extensions": [
+    ".gif",
+    ".jpeg",
+    ".jpg",
+    ".png"
+  ],
+  "public_mime_types": [
+    "image/jpeg",
+    "image/png"
+  ],
+  "limits": {
+    "max_bytes": 2097152,
+    "max_dimension": 4096,
+    "max_pixels": 4194304,
+    "max_caption_chars": 500
+  },
+  "presentation_ancestor_selectors": [
+    "#footer-links"
+  ],
+  "meaningless_captions": [
+    "graphic",
+    "icon",
+    "image",
+    "picture"
+  ],
+  "integrity_exceptions": [
+    {
+      "source": "neuronetworksbook",
+      "path": "opencl_test.png",
+      "sha256": "04d0d664766a185021ab8aa26eb657fa58860a1113f5d4cb844ee674e5fee8f0",
+      "bytes": 23807,
+      "valid_png_prefix_bytes": 10372,
+      "reason": "official-png-trailing-data"
+    }
+  ],
+  "denylist": [
+    {
+      "source": "mql5",
+      "path": "copyright.gif",
+      "reason": "decorative-copyright"
+    },
+    {
+      "source": "mql5",
+      "path": "next.png",
+      "reason": "navigation-next"
+    },
+    {
+      "source": "mql5",
+      "path": "previous.png",
+      "reason": "navigation-previous"
+    },
+    {
+      "source": "mql5book",
+      "path": "code_base_icon.png",
+      "reason": "footer-codebase-link"
+    },
+    {
+      "source": "mql5book",
+      "path": "metaeditor_icon.png",
+      "reason": "footer-metaeditor-link"
+    },
+    {
+      "source": "mql5book",
+      "path": "next.png",
+      "reason": "navigation-next"
+    },
+    {
+      "source": "mql5book",
+      "path": "previous.png",
+      "reason": "navigation-previous"
+    },
+    {
+      "source": "neuronetworksbook",
+      "path": "code_base_icon.png",
+      "reason": "footer-codebase-link"
+    },
+    {
+      "source": "neuronetworksbook",
+      "path": "metaeditor_icon.png",
+      "reason": "footer-metaeditor-link"
+    },
+    {
+      "source": "neuronetworksbook",
+      "path": "next.png",
+      "reason": "navigation-next"
+    },
+    {
+      "source": "neuronetworksbook",
+      "path": "previous.png",
+      "reason": "navigation-previous"
+    }
+  ]
+}

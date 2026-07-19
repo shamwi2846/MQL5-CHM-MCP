@@ -1,0 +1,30 @@
+{
+  "name": "mql5-chm-mcp",
+  "version": "1.2.1",
+  "private": true,
+  "type": "module",
+  "description": "Portable read-only MCP server for the official local MQL5 CHM corpus.",
+  "engines": {
+    "node": ">=24.17.0 <25"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "build:candidate": "node scripts/build.mjs --outdir build/candidate-v12/app --metafile build/candidate-v12/esbuild-meta.json",
+    "rebuild-index": "powershell -NoProfile -ExecutionPolicy Bypass -File ./Rebuild-Index.ps1",
+    "check-updates": "powershell -NoProfile -ExecutionPolicy Bypass -File ./Check-DocumentationUpdates.ps1",
+    "stage-update": "powershell -NoProfile -ExecutionPolicy Bypass -File ./Update-Documentation.ps1 -Stage",
+    "pretest": "npm run build:candidate",
+    "test": "node --test --test-concurrency=1 tests/*.test.mjs && pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/Test-Maintenance.ps1 && pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/Test-StageInstallRecovery.ps1",
+    "package:portable": "powershell -NoProfile -ExecutionPolicy Bypass -File ./Package-Portable.ps1"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "cheerio": "1.2.0",
+    "iconv-lite": "0.7.3",
+    "jpeg-js": "0.4.4",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.1"
+  }
+}

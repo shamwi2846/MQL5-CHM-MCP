@@ -1,0 +1,19 @@
+node_modules/
+
+# Generated build and portable-release artifacts.
+/build/
+/release/
+
+# Local documentation corpora and immutable generated indexes.
+/mql5.chm
+/mql5book.chm
+/neuronetworksbook.chm
+/data/
+/revisions/
+
+# Mutable maintenance state and the downloaded Node runtime.
+/maintenance/
+/runtime/*
+!/runtime/.gitkeep
+
+*.log
