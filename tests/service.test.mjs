@@ -205,6 +205,9 @@ test("service handlers enforce bounds and stable IDs", () => {
   assert.throws(() => service.search({ query: "", limit: 3 }), /query/i);
   assert.throws(() => service.search({ query: "x".repeat(201), limit: 3 }), /query/i);
   assert.throws(() => service.search({ query: "OnTick", limit: 9 }), /limit/i);
+  assert.throws(() => service.search({ query: "OnTick", limit: 10 }), /limit/i);
+  const hit = service.search({ query: "OnTick", limit: 1 }).results[0];
+  assert.throws(() => service.read({ topic_id: hit.topic_id, max_chars: 12_000 }), /max_chars/i);
   assert.throws(() => service.read({ topic_id: "..\\secret" }), /topic_id/i);
 });
 

@@ -1,4 +1,4 @@
-# Portable Read-Only MQL5 CHM MCP v1.2.2
+# Portable Read-Only MQL5 CHM MCP v1.2.3
 
 ## Value Proposition
 
@@ -26,7 +26,7 @@ Search documentation:
 
 1. Codex submits an API name or documentation question.
 2. The server ranks exact, full-text, expanded, then typo-tolerant matches.
-3. Codex selects a stable topic or section ID and cites the returned source metadata.
+3. Codex selects a stable topic or section ID and cites the exact returned title, stable topic ID, and the shared corpus or index revision.
 4. When local evidence is absent, fuzzy-only, known stale, or explicitly required to be current, the result recommends an official-domain web check.
 
 Read documentation:
@@ -76,6 +76,7 @@ Update documentation:
 ## Public MCP Interfaces
 
 All tools use `readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: true`, and `openWorldHint: false`.
+All bounded inputs are validated strictly. Out-of-range values are rejected and never silently clamped.
 
 ### `mql5_chm_search`
 
@@ -163,11 +164,11 @@ HTTP timestamps are labeled as HTTP metadata or retrieval time, never as a CHM b
 
 ## Index and Revision Model
 
-- Server/package version: 1.2.2. Manifest and SQLite schema version: 3. Pointer schema: 2.
+- Server/package version: 1.2.3. Manifest and SQLite schema version: 3. Pointer schema: 2.
 - `corpus_sha256` is the SHA-256 of the UTF-8 concatenation `source_id + NUL + lowercase_chm_sha256 + NUL` for `mql5`, `mql5book`, then `neuronetworksbook`. It intentionally depends only on the downloaded source set so the checker can name a candidate before extraction.
 - `index_revision` is the lowercase SHA-256 of the completed schema-3 SQLite database. The database contains the complete asset catalog and asset-tree digest, so this identity binds text and image metadata without creating a self-hash cycle.
 - SQLite identity-bearing data excludes build/retrieval times, ETags, and HTTP Last-Modified. Those values remain in the manifest. Identical inputs, index contract, and image policy must produce byte-identical databases and index revisions.
-- SQLite metadata includes `index_contract`, the image-policy digest, asset-catalog digest, asset-tree digest, and exact counts. `index_contract` changes whenever extraction or indexing semantics change without a SQL-schema change. v1.2.2 continues to emit `mql5-chm-index-v3-assets-v2`; this release does not bump the index contract. The transitional runtime accepts both the prior `mql5-chm-index-v3-assets-v1` and current contract so rollback remains available, while new candidate activation requires the current contract.
+- SQLite metadata includes `index_contract`, the image-policy digest, asset-catalog digest, asset-tree digest, and exact counts. `index_contract` changes whenever extraction or indexing semantics change without a SQL-schema change. v1.2.3 continues to emit `mql5-chm-index-v3-assets-v2`; this release does not bump the index contract. The transitional runtime accepts both the prior `mql5-chm-index-v3-assets-v1` and current contract so rollback remains available, while new candidate activation requires the current contract.
 - Each immutable revision lives under `revisions/<index_revision>/` and contains its three CHMs, database, manifest, corpus lock, stage report when staged, and the exact `assets/` tree.
 - `data/active.json` is the only activation pointer. Schema 2 retains `active_revision`, `previous_revision`, and `activated_at`; revision fields identify indexes and are replaced atomically.
 - Stage reports, transition journals, and update-status files distinguish index revisions from corpus revisions. `Update-Documentation.ps1 -Apply -Revision` accepts the staged index revision.
@@ -219,7 +220,8 @@ Caption precedence is `<figcaption>`, meaningful `title`, meaningful `alt`, near
 - A version-controlled JSON synonym map handles bounded domain phrases such as trade opening, position tickets, indicator buffers, hedging account mode, and activation functions.
 - Corpus aliases and resolved related-topic titles may contribute additional bounded terms, but no LLM or network is used at runtime.
 - Original query terms always score above expansions. Expansion terms and matched terms are deduplicated and bounded.
-- Structured citations contain source filename, topic title, breadcrumb, topic/section ID, source revision, and index revision.
+- Structured citations contain source filename, topic title, breadcrumb, topic/section ID, source revision, corpus revision, and index revision.
+- Model-facing search/read guidance tells Codex to cite the exact returned topic title or selected section heading, the stable topic ID and relevant section ID, and one shared corpus or index revision per answer when multiple findings use that revision. It does not require revision metadata to be repeated in every paragraph.
 - Human-readable read content ends with one concise source footer; search entries contain one concise source line each.
 
 ## Online Check Policy

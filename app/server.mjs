@@ -35188,18 +35188,18 @@ function toolFailure(error51) {
 }
 function createMcpServer(service) {
   const server = new McpServer(
-    { name: "mql5-chm", version: "1.2.2" },
+    { name: "mql5-chm", version: "1.2.3" },
     { capabilities: { tools: {} } }
   );
   server.registerTool(
     "mql5_chm_search",
     {
       title: "Search local MQL5 CHM documentation",
-      description: "Search the verified offline MQL5 reference, MQL5 book, and neural-networks book. Exact API names outrank bounded MQL5-aware expansions and typo fallback.",
+      description: "Search the verified offline MQL5 reference, MQL5 book, and neural-networks book. Exact API names outrank bounded MQL5-aware expansions and typo fallback. The limit input must be an integer from 1 to 8 and must not exceed 8. In answers, name each exact returned title, include citation.topic_id, and state citation.corpus_revision or citation.index_revision once per answer when findings share that revision.",
       inputSchema: {
         query: external_exports.string().trim().min(1).max(200).describe("API name or documentation question"),
         source: sourceSchema.optional().default("all").describe("CHM corpus filter"),
-        limit: external_exports.number().int().min(1).max(8).optional().default(3).describe("Maximum ranked results"),
+        limit: external_exports.number().int().min(1).max(8).optional().default(3).describe("Number of ranked results; integer from 1 to 8 and must not exceed 8"),
         expand: external_exports.boolean().optional().default(true).describe("Use bounded MQL5-aware query expansion"),
         require_current: external_exports.boolean().optional().default(false).describe("Recommend an official-domain check")
       },
@@ -35247,13 +35247,13 @@ function createMcpServer(service) {
     "mql5_chm_read",
     {
       title: "Read local MQL5 CHM documentation",
-      description: "Read a bounded passage from a stable topic ID. Optionally select a section or focus and include bounded related-topic metadata.",
+      description: "Read a bounded passage from a stable topic ID. Optionally select a section or focus and include bounded related-topic metadata. The max_chars input must be an integer from 500 to 8000 and must not exceed 8000. In answers, name the exact returned section_heading when present (otherwise title), include citation.topic_id and citation.section_id when relevant, and state citation.corpus_revision or citation.index_revision once per answer when findings share that revision.",
       inputSchema: {
         topic_id: topicIdSchema.describe("Stable topic ID returned by mql5_chm_search"),
         section_id: sectionIdSchema.optional().describe("Optional stable section ID from search"),
         focus: external_exports.string().trim().min(1).max(200).optional().describe("Passage-selection query"),
         cursor: external_exports.string().min(10).max(2048).optional().describe("Opaque next_cursor from an earlier read"),
-        max_chars: external_exports.number().int().min(500).max(8e3).optional().default(4e3),
+        max_chars: external_exports.number().int().min(500).max(8e3).optional().default(4e3).describe("Maximum passage length; integer from 500 to 8000 and must not exceed 8000"),
         include_related: external_exports.boolean().optional().default(true),
         related_limit: external_exports.number().int().min(0).max(5).optional().default(3),
         include_images: external_exports.boolean().optional().default(true).describe("Include bounded technical-image references when available"),

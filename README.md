@@ -1,4 +1,4 @@
-# MQL5 CHM MCP 1.2.2
+# MQL5 CHM MCP 1.2.3
 
 A portable, local MCP server for the official English MQL5 reference, AlgoBook, and Neural Networks book. The active corpus contains 4,827 indexed topics, 16,261 sections, and a secure catalog of the original technical diagrams, screenshots, charts, and MQL5 object icons. Runtime access is offline, stdio-only, and strictly read-only; no MetaTrader account, HTTP port, trading access, or authentication is required.
 
@@ -12,6 +12,12 @@ The server exposes four closed-world tools:
 Normal searches remain text-only. Captions and filenames do not enter FTS5, and images are returned only after an explicit image-tool call.
 
 Text continuation cursors are opaque revision-bound v2 tokens. A cursor is accepted only for the active index, topic, and selected section that issued it; legacy v1, stale-revision, tampered, wrong-topic, and wrong-section cursors are rejected. This release does not change any MCP tool argument or response schema.
+
+## Bounded calls and stable citations
+
+`mql5_chm_search.limit` must be an integer from 1 through 8. `mql5_chm_read.max_chars` must be an integer from 500 through 8,000 and must not exceed 8,000. Out-of-range values are rejected and are never silently clamped.
+
+When documentation supports a final answer, use the structured citation metadata: name the exact returned topic `title`, or the exact read `section_heading` when present; include the stable `citation.topic_id` and relevant `citation.section_id`; and state `citation.corpus_revision` or `citation.index_revision` once per answer when multiple findings share that revision. The structured citation also retains the source filename. Revision metadata does not need to be repeated in every paragraph.
 
 ## Install in Codex
 

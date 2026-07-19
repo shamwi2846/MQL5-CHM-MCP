@@ -177,7 +177,7 @@ function New-TestZipAndSidecar {
 try {
     $metadataProbe = Invoke-NativeCapture -FilePath $nodeFixtureSource -Arguments @(
         '-e',
-        "const fs=require('node:fs'),p=require('node:path'),r=process.argv[1],a=JSON.parse(fs.readFileSync(p.join(r,'package.json'),'utf8')),b=JSON.parse(fs.readFileSync(p.join(r,'package-lock.json'),'utf8')),c=b.packages[''];if(a.version!=='1.2.2'||b.version!=='1.2.2'||c.version!=='1.2.2'||a.engines.node!=='24.17.0'||c.engines.node!=='24.17.0')process.exit(2)",
+        "const fs=require('node:fs'),p=require('node:path'),r=process.argv[1],a=JSON.parse(fs.readFileSync(p.join(r,'package.json'),'utf8')),b=JSON.parse(fs.readFileSync(p.join(r,'package-lock.json'),'utf8')),c=b.packages[''];if(a.version!=='1.2.3'||b.version!=='1.2.3'||c.version!=='1.2.3'||a.engines.node!=='24.17.0'||c.engines.node!=='24.17.0')process.exit(2)",
         $projectRoot
     )
     Assert-Test ($metadataProbe.ExitCode -eq 0) 'Package version or exact Node engine metadata is inconsistent.'

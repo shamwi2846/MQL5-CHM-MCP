@@ -65,8 +65,28 @@ test("portable stdio MCP lists and calls the four v1.2 read-only tools", async (
     const searchTool = listed.tools.find((tool) => tool.name === "mql5_chm_search");
     assert.equal(searchTool.inputSchema.properties.expand.default, true);
     assert.equal(searchTool.inputSchema.properties.require_current.default, false);
+    assert.equal(searchTool.inputSchema.properties.limit.minimum, 1);
     assert.equal(searchTool.inputSchema.properties.limit.maximum, 8);
+    assert.equal(searchTool.inputSchema.properties.limit.default, 3);
+    assert.match(searchTool.inputSchema.properties.limit.description, /integer from 1 to 8/i);
+    assert.match(searchTool.inputSchema.properties.limit.description, /must not exceed 8/i);
+    assert.match(searchTool.description, /exact returned title/i);
+    assert.match(searchTool.description, /citation\.topic_id/);
+    assert.match(searchTool.description, /citation\.corpus_revision/);
+    assert.match(searchTool.description, /citation\.index_revision/);
+    assert.match(searchTool.description, /once per answer/i);
     const readTool = listed.tools.find((tool) => tool.name === "mql5_chm_read");
+    assert.equal(readTool.inputSchema.properties.max_chars.minimum, 500);
+    assert.equal(readTool.inputSchema.properties.max_chars.maximum, 8_000);
+    assert.equal(readTool.inputSchema.properties.max_chars.default, 4_000);
+    assert.match(readTool.inputSchema.properties.max_chars.description, /integer from 500 to 8000/i);
+    assert.match(readTool.inputSchema.properties.max_chars.description, /must not exceed 8000/i);
+    assert.match(readTool.description, /exact returned section_heading/i);
+    assert.match(readTool.description, /otherwise title/i);
+    assert.match(readTool.description, /citation\.topic_id/);
+    assert.match(readTool.description, /citation\.corpus_revision/);
+    assert.match(readTool.description, /citation\.index_revision/);
+    assert.match(readTool.description, /once per answer/i);
     assert.equal(readTool.inputSchema.properties.include_related.default, true);
     assert.equal(readTool.inputSchema.properties.related_limit.default, 3);
     assert.equal(readTool.inputSchema.properties.related_limit.maximum, 5);
@@ -94,7 +114,14 @@ test("portable stdio MCP lists and calls the four v1.2 read-only tools", async (
     assert.equal(search.structuredContent.results[0].title, "PositionSelectByTicket");
     assert.equal(search.structuredContent.results[0].match_kind, "exact");
     assert.match(search.structuredContent.results[0].source_revision, /^[0-9a-f]{64}$/);
-    assert.equal(search.structuredContent.results[0].citation.topic_id, search.structuredContent.results[0].topic_id);
+    const searchResult = search.structuredContent.results[0];
+    assert.equal(searchResult.citation.source_file, "mql5.chm");
+    assert.equal(searchResult.citation.title, searchResult.title);
+    assert.equal(searchResult.citation.topic_id, searchResult.topic_id);
+    assert.equal(searchResult.citation.section_id, searchResult.section_id);
+    assert.equal(searchResult.citation.source_revision, searchResult.source_revision);
+    assert.equal(searchResult.citation.corpus_revision, search.structuredContent.corpus_revision);
+    assert.equal(searchResult.citation.index_revision, search.structuredContent.index_sha256);
     assert.equal(search.structuredContent.online_check.recommended, true);
     assert.match(search.structuredContent.online_check.official_search_query, /^site:mql5\.com\/en\//);
     assert.equal(JSON.stringify(search.structuredContent).includes("asset_id"), false);
@@ -116,7 +143,15 @@ test("portable stdio MCP lists and calls the four v1.2 read-only tools", async (
     assert.equal(Object.hasOwn(read.structuredContent, "text"), false);
     assert.ok(read.structuredContent.related.length <= 2);
     assert.equal((read.content[0].text.match(/^Source: /gmu) ?? []).length, 1);
+    assert.match(read.structuredContent.section_heading, /Return Value/i);
+    assert.equal(read.structuredContent.title, searchResult.title);
+    assert.equal(read.structuredContent.citation.source_file, searchResult.citation.source_file);
+    assert.equal(read.structuredContent.citation.title, read.structuredContent.title);
     assert.equal(read.structuredContent.citation.topic_id, read.structuredContent.topic_id);
+    assert.equal(read.structuredContent.citation.section_id, read.structuredContent.section_id);
+    assert.equal(read.structuredContent.citation.source_revision, read.structuredContent.source_revision);
+    assert.equal(read.structuredContent.citation.corpus_revision, read.structuredContent.corpus_revision);
+    assert.equal(read.structuredContent.citation.index_revision, read.structuredContent.index_sha256);
 
     const imageTopicSearch = await client.callTool({
       name: "mql5_chm_search",
@@ -235,11 +270,25 @@ test("portable stdio MCP lists and calls the four v1.2 read-only tools", async (
       assert.equal(createHash("sha256").update(bytes).digest("hex"), result.structuredContent.sha256);
     }
 
-    const invalid = await client.callTool({
+    const invalidLimit = await client.callTool({
+      name: "mql5_chm_search",
+      arguments: { query: "PositionSelectByTicket", limit: 10 },
+    });
+    assert.equal(invalidLimit.isError, true);
+    assert.equal(invalidLimit.structuredContent, undefined);
+
+    const invalidMaxChars = await client.callTool({
+      name: "mql5_chm_read",
+      arguments: { topic_id: searchResult.topic_id, max_chars: 12_000 },
+    });
+    assert.equal(invalidMaxChars.isError, true);
+    assert.equal(invalidMaxChars.structuredContent, undefined);
+
+    const multipleInvalid = await client.callTool({
       name: "mql5_chm_search",
       arguments: { query: "", limit: 99 },
     });
-    assert.equal(invalid.isError, true);
+    assert.equal(multipleInvalid.isError, true);
   } finally {
     await client.close();
   }

@@ -89,6 +89,7 @@ $fixtureRoot = Join-Path $tempBase ('mql5-chm-index-maintenance-repairs-' + [Gui
 New-Item -ItemType Directory -Path $fixtureRoot | Out-Null
 try {
     $closureInventory = New-InventoryFixture
+    $positiveClosureTimeoutSeconds = 10
     $candidateA = New-Item -ItemType Directory -Path (Join-Path $fixtureRoot 'closure-a')
     Write-InventoryFixtureFiles -Root $candidateA.FullName
     $stateA = Get-ExtractionClosureState -Path $candidateA.FullName -Inventory $closureInventory
@@ -105,7 +106,7 @@ try {
     Set-Content -LiteralPath (Join-Path $htmlOnly.FullName 'topic.htm') -Value 'HTML' -NoNewline -Encoding Ascii
     Assert-RepairThrows -Action { Wait-ExtractionStable -Path $htmlOnly.FullName -Inventory $closureInventory -TimeoutSeconds 1 -StablePolls 2 -PollMilliseconds 10 | Out-Null } -Pattern 'did not reach' -Message 'HTML-only extraction was incorrectly accepted as complete.'
     Write-InventoryFixtureFiles -Root $htmlOnly.FullName
-    $stable = Wait-ExtractionStable -Path $htmlOnly.FullName -Inventory $closureInventory -TimeoutSeconds 1 -StablePolls 2 -PollMilliseconds 10
+    $stable = Wait-ExtractionStable -Path $htmlOnly.FullName -Inventory $closureInventory -TimeoutSeconds $positiveClosureTimeoutSeconds -StablePolls 2 -PollMilliseconds 10
     Assert-RepairFixture -Condition ($stable.Complete -and $stable.HtmlCount -eq 1) -Message 'The exact input closure did not reach a stable state.'
 
     $delayed = New-Item -ItemType Directory -Path (Join-Path $fixtureRoot 'delayed-inputs')
@@ -123,7 +124,7 @@ Start-Sleep -Milliseconds 100
 '@, (New-Object Text.UTF8Encoding($false)))
     $delayedWriter = Start-Process -FilePath (Get-Command pwsh -CommandType Application).Source -ArgumentList @('-NoProfile','-File',$delayWriterPath,$delayed.FullName) -PassThru -WindowStyle Hidden
     try {
-        $delayedStable = Wait-ExtractionStable -Path $delayed.FullName -Inventory $closureInventory -TimeoutSeconds 3 -StablePolls 3 -PollMilliseconds 20
+        $delayedStable = Wait-ExtractionStable -Path $delayed.FullName -Inventory $closureInventory -TimeoutSeconds $positiveClosureTimeoutSeconds -StablePolls 3 -PollMilliseconds 20
         $delayedWriter.WaitForExit()
         Assert-RepairFixture -Condition ($delayedWriter.ExitCode -eq 0 -and $delayedStable.Complete) -Message 'Polling did not wait for delayed HHC, HHK, and image inputs.'
     } finally {
@@ -133,13 +134,13 @@ Start-Sleep -Milliseconds 100
 
     $snapshotRoot = Join-Path $fixtureRoot 'snapshots'
     New-Item -ItemType Directory -Path $snapshotRoot | Out-Null
-    $snapshot = New-VerifiedExtractionSnapshot -CandidatePath $htmlOnly.FullName -SnapshotRoot $snapshotRoot -Inventory $closureInventory -TimeoutSeconds 1 -StablePolls 2 -PollMilliseconds 10
+    $snapshot = New-VerifiedExtractionSnapshot -CandidatePath $htmlOnly.FullName -SnapshotRoot $snapshotRoot -Inventory $closureInventory -TimeoutSeconds $positiveClosureTimeoutSeconds -StablePolls 2 -PollMilliseconds 10
     Set-Content -LiteralPath (Join-Path $htmlOnly.FullName 'topic.htm') -Value 'LATE' -NoNewline -Encoding Ascii
     Assert-RepairFixture -Condition ((Get-Content -LiteralPath (Join-Path $snapshot.Path 'topic.htm') -Raw) -ceq 'HTML') -Message 'A late source write contaminated the verified extraction snapshot.'
     Set-Content -LiteralPath (Join-Path $htmlOnly.FullName 'topic.htm') -Value 'HTML' -NoNewline -Encoding Ascii
     $raceRejected = $false
     try {
-        New-VerifiedExtractionSnapshot -CandidatePath $htmlOnly.FullName -SnapshotRoot $snapshotRoot -Inventory $closureInventory -TimeoutSeconds 1 -StablePolls 2 -PollMilliseconds 10 -AfterCopyHook {
+        New-VerifiedExtractionSnapshot -CandidatePath $htmlOnly.FullName -SnapshotRoot $snapshotRoot -Inventory $closureInventory -TimeoutSeconds $positiveClosureTimeoutSeconds -StablePolls 2 -PollMilliseconds 10 -AfterCopyHook {
             param($source,$target,$entry)
             if ([string]$entry.Path -ceq 'images/pic.png') {
                 Set-Content -LiteralPath (Join-Path $htmlOnly.FullName 'topic.htm') -Value 'RACE' -NoNewline -Encoding Ascii
