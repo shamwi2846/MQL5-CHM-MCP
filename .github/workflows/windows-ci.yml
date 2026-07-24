@@ -1,0 +1,50 @@
+name: Windows CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fast:
+    name: Fast MCP tests
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source without credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Use Node.js 24.17.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.17.0
+          cache: npm
+
+      - name: Install locked dependencies
+        shell: pwsh
+        run: |
+          if ($PSVersionTable.PSVersion.Major -ne 7) {
+              throw "Expected PowerShell 7, found $($PSVersionTable.PSVersion)."
+          }
+          npm ci
+
+      - name: Run fast MCP and cross-shell syntax tests
+        shell: pwsh
+        run: npm run test:fast
+
+      - name: Confirm Windows PowerShell 5.1 is available
+        shell: powershell
+        run: |
+          if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) {
+              throw "Expected Windows PowerShell 5.1, found $($PSVersionTable.PSVersion)."
+          }

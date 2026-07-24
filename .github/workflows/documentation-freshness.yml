@@ -1,0 +1,55 @@
+name: Documentation freshness
+
+on:
+  schedule:
+    - cron: "17 15 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: documentation-freshness
+  cancel-in-progress: false
+
+jobs:
+  compare:
+    name: Compare official CHM hashes
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source without credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download and compare official CHMs
+        shell: pwsh
+        run: |
+          $result = & .\scripts\Compare-OfficialDocumentationHashes.ps1 -ProjectRoot $PWD.Path -TimeoutSeconds 120
+          $summary = @(
+              '## Official MQL5 CHM freshness'
+              ''
+              "- Status: ``$($result.status)``"
+              "- Expected corpus: ``$($result.expected_corpus_revision)``"
+              "- Downloaded corpus: ``$($result.candidate_corpus_revision)``"
+              ''
+              '| Source | Expected SHA-256 | Actual SHA-256 | Changed |'
+              '| --- | --- | --- | --- |'
+          )
+          foreach ($source in @($result.sources)) {
+              $summary += "| $($source.id) | ``$($source.expected_sha256)`` | ``$($source.actual_sha256)`` | $($source.changed) |"
+          }
+          $summary += ''
+          $summary += $result.message
+          $summary -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+          $workflowMessage = ([string]$result.message).Replace('%','%25').Replace("`r",'%0D').Replace("`n",'%0A')
+          if ($result.status -eq 'different-revision-available') {
+              Write-Output "::error title=Official MQL5 CHMs changed::$workflowMessage Review and stage the new corpus manually; this workflow never applies updates."
+              exit 2
+          }
+          if ($result.status -ne 'up-to-date') {
+              Write-Output "::error title=Documentation freshness unavailable::$workflowMessage"
+              exit 1
+          }

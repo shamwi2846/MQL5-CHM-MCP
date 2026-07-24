@@ -1,0 +1,15 @@
+* text=auto eol=lf
+
+*.bin -text
+*.chm -text
+*.dll -text
+*.exe -text
+*.jpg -text
+*.jpeg -text
+*.png -text
+*.sqlite -text
+*.zip -text
+
+licenses/*.txt text eol=crlf
+licenses/**/*.txt text eol=crlf
+licenses/BUNDLED-NODE-NOTICES.txt text eol=lf

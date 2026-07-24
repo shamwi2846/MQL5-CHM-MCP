@@ -81,7 +81,67 @@ function New-TestCaseDirectory {
     return $path
 }
 
+function Assert-InvalidJournalNumberRejected {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][ValidateSet('schema-string','new-bytes-string','new-bytes-fraction')][string]$Mutation
+    )
+    $case = New-TestCaseDirectory -Name $Name
+    $items = @((New-TestJournalItem 'a.txt' '.a.new' '.a.backup' 'old-a' 'new-a'))
+    Write-TestFile (Join-Path $case 'a.txt') 'old-a'
+    Write-TestFile (Join-Path $case '.a.new') 'new-a'
+    Write-TestJournal -Root $case -Items $items
+    $journalPath = Join-Path $case '.transaction.json'
+    $journal = Get-Content -LiteralPath $journalPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($Mutation -ceq 'schema-string') {
+        $journal.schema_version = '1'
+    } elseif ($Mutation -ceq 'new-bytes-string') {
+        $journal.items[0].new_bytes = [string]$journal.items[0].new_bytes
+    } else {
+        $journal.items[0].new_bytes = [double]$journal.items[0].new_bytes
+    }
+    $journalText = $journal | ConvertTo-Json -Depth 8
+    if ($Mutation -ceq 'new-bytes-fraction') {
+        $integerText = [string][int64]$journal.items[0].new_bytes
+        $numberPattern = New-Object Text.RegularExpressions.Regex ('("new_bytes"\s*:\s*)' + [regex]::Escape($integerText) + '(?=\s*[,}])')
+        $journalText = $numberPattern.Replace($journalText,('${1}' + $integerText + '.0'),1)
+        if ($journalText -notmatch ('"new_bytes"\s*:\s*' + [regex]::Escape($integerText) + '\.0')) {
+            throw 'Could not construct the fractional JSON-number recovery fixture.'
+        }
+    }
+    [IO.File]::WriteAllText($journalPath,$journalText,$utf8)
+
+    $failedClosed = $false
+    try { Repair-PreparedFileSetTransaction -Root $case -JournalName '.transaction.json' | Out-Null }
+    catch { $failedClosed = $true }
+    Assert-Test $failedClosed "Prepared transaction accepted the invalid $Mutation JSON representation."
+    Assert-Test ((Get-Content -Raw (Join-Path $case 'a.txt')) -ceq 'old-a') "Invalid $Mutation journal changed the canonical target."
+    Assert-Test (Test-Path -LiteralPath (Join-Path $case '.a.new') -PathType Leaf) "Invalid $Mutation journal removed prepared evidence."
+    Assert-Test (Test-Path -LiteralPath $journalPath -PathType Leaf) "Invalid $Mutation journal removed its recovery evidence."
+}
+
 try {
+    foreach ($invalidNumber in @('schema-string','new-bytes-string','new-bytes-fraction')) {
+        Assert-InvalidJournalNumberRejected -Name "invalid-$invalidNumber" -Mutation $invalidNumber
+    }
+
+    $case = New-TestCaseDirectory -Name 'invalid-items-object'
+    $items = @((New-TestJournalItem 'a.txt' '.a.new' '.a.backup' 'old-a' 'new-a'))
+    Write-TestFile (Join-Path $case 'a.txt') 'old-a'
+    Write-TestFile (Join-Path $case '.a.new') 'new-a'
+    Write-TestJournal -Root $case -Items $items
+    $journalPath = Join-Path $case '.transaction.json'
+    $journal = Get-Content -LiteralPath $journalPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $journal.items = $journal.items[0]
+    [IO.File]::WriteAllText($journalPath,($journal | ConvertTo-Json -Depth 8),$utf8)
+    $failedClosed = $false
+    try { Repair-PreparedFileSetTransaction -Root $case -JournalName '.transaction.json' | Out-Null }
+    catch { $failedClosed = $true }
+    Assert-Test $failedClosed 'Prepared transaction accepted an object where items must be an array.'
+    Assert-Test ((Get-Content -Raw (Join-Path $case 'a.txt')) -ceq 'old-a') 'Object-shaped items changed the canonical target.'
+    Assert-Test (Test-Path -LiteralPath (Join-Path $case '.a.new') -PathType Leaf) 'Object-shaped items removed prepared evidence.'
+    Assert-Test (Test-Path -LiteralPath $journalPath -PathType Leaf) 'Object-shaped items removed its recovery evidence.'
+
     # Normal two-file publication leaves only the validated canonical pair.
     $case = New-TestCaseDirectory -Name 'normal'
     Write-TestFile (Join-Path $case 'a.txt') 'old-a'

@@ -126,7 +126,7 @@ switch ($arguments[1]) {
             $escapedCommon = (Join-Path $PSScriptRoot 'Common.ps1').Replace("'", "''")
             $contentionScript = ". '$escapedCommon'; try { `$lease=Enter-CodexRegistrationMutex -TimeoutSeconds 1; `$lease.Dispose(); exit 0 } catch { exit 23 }"
             $encodedContention = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($contentionScript))
-            $contention = Invoke-NativeCapture -FilePath (Get-Command pwsh -CommandType Application).Source -Arguments @('-NoProfile','-EncodedCommand',$encodedContention)
+            $contention = Invoke-NativeCapture -FilePath (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source -Arguments @('-NoProfile','-EncodedCommand',$encodedContention)
             Assert-Test ($contention.ExitCode -eq 23) 'A concurrent process entered the Codex registration critical section.'
         } finally {
             $registrationLease.Dispose()

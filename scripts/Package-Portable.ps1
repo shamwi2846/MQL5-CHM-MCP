@@ -1,4 +1,4 @@
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName='Active')]
 param(
     [Parameter(Mandatory)]
     [string]$ProjectRoot,
@@ -8,15 +8,18 @@ param(
 
     [string]$OutputDirectory,
 
+    [Parameter(Mandatory,ParameterSetName='Candidate')]
     [ValidatePattern('^[0-9a-f]{64}$')]
-    [string]$CandidateRevision
+    [string]$CandidateRevision,
+
+    [Parameter(ParameterSetName='Candidate')]
+    [switch]$AcceptAssetReduction
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-. (Join-Path $PSScriptRoot 'Common.ps1')
-. (Join-Path $PSScriptRoot 'SevenZipRuntime.ps1')
+. (Join-Path $PSScriptRoot 'IndexMaintenance.ps1')
 
 function Copy-DirectorySafe {
     [CmdletBinding()]
@@ -39,6 +42,31 @@ function Copy-DirectorySafe {
     }
 }
 
+function Invoke-PortablePackageFinalCleanup {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [AllowNull()][string]$CandidateBuildRoot,
+        [AllowNull()][object]$UpdateLock,
+        [hashtable]$InternalTestHooks
+    )
+    try {
+        if (
+            -not [string]::IsNullOrWhiteSpace($CandidateBuildRoot) -and
+            (Test-Path -LiteralPath $CandidateBuildRoot -PathType Container)
+        ) {
+            $buildRoot = Join-Path $ProjectRoot 'build'
+            if ($null -ne $InternalTestHooks -and $InternalTestHooks.ContainsKey('RemoveCandidateBuildRoot')) {
+                & $InternalTestHooks.RemoveCandidateBuildRoot $buildRoot $CandidateBuildRoot
+            } else {
+                Remove-SafeDirectory -ConfinementRoot $buildRoot -Path $CandidateBuildRoot
+            }
+        }
+    } finally {
+        if ($null -ne $UpdateLock) { $UpdateLock.Dispose() }
+    }
+}
+
 $script:PackageRootMarkerName = '.mql5-chm-package-root'
 $script:PackageRootMarkerValue = 'mql5-chm-portable-package-v1'
 
@@ -58,7 +86,10 @@ function Test-PathsOverlap {
 
 function Get-PhysicalPathDescriptor {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Path)
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [hashtable]$InternalTestHooks
+    )
 
     $fullPath = [IO.Path]::GetFullPath($Path)
     $unresolved = New-Object 'Collections.Generic.List[string]'
@@ -75,23 +106,37 @@ function Get-PhysicalPathDescriptor {
         $cursor = [IO.Path]::GetFullPath($parent)
     }
 
-    $existingItem = Get-Item -LiteralPath $cursor -Force -ErrorAction Stop
-    if (($existingItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "Package path resolves through a reparse point: $($existingItem.FullName)"
+    $getExistingItemHook = if ($null -ne $InternalTestHooks -and $InternalTestHooks.ContainsKey('GetExistingItem')) {
+        $getExistingItemHook = $InternalTestHooks['GetExistingItem']
+        if (-not ($getExistingItemHook -is [scriptblock])) {
+            throw 'GetExistingItem test hook must be a script block.'
+        }
+        $getExistingItemHook
+    } else {
+        $null
     }
-    if ($existingItem.PSIsContainer) {
-        $anchor = Resolve-FullPath -Path $existingItem.FullName -MustExist -PathType Container
+    $existingItem = Get-FileSystemItemOrFallback -Path $cursor -InternalGetItem $getExistingItemHook
+    $existingFullName = [IO.Path]::GetFullPath($existingItem.FullName)
+    $existingAttributes = $existingItem.Attributes
+    $isContainer = Test-FileSystemItemContainer -Item $existingItem
+    if (($existingAttributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Package path resolves through a reparse point: $existingFullName"
+    }
+    if ($isContainer) {
+        $anchor = Resolve-FullPath -Path $existingFullName -MustExist -PathType Container
         $existingBoundary = $anchor
     } else {
-        if ($unresolved.Count -gt 0) { throw "Package path descends from an existing file: $($existingItem.FullName)" }
-        $unresolved.Insert(0, [IO.Path]::GetFileName($existingItem.FullName))
-        $anchor = Resolve-FullPath -Path (Split-Path -Parent $existingItem.FullName) -MustExist -PathType Container
-        $existingBoundary = $existingItem.FullName
+        if ($unresolved.Count -gt 0) { throw "Package path descends from an existing file: $existingFullName" }
+        $unresolved.Insert(0, [IO.Path]::GetFileName($existingFullName))
+        $anchor = Resolve-FullPath -Path (Split-Path -Parent $existingFullName) -MustExist -PathType Container
+        $existingBoundary = $existingFullName
     }
 
-    $volumeRoot = [IO.Path]::GetPathRoot($anchor)
+    $volumeRoot = Get-FilesystemRootPath -Path $anchor
     if ([string]::IsNullOrWhiteSpace($volumeRoot)) { throw "Cannot determine the volume root for package path: $fullPath" }
-    Assert-NoReparsePoint -Root $volumeRoot -Path $existingBoundary
+    $reparseParameters = @{}
+    if ($null -ne $getExistingItemHook) { $reparseParameters.InternalTestHooks = @{GetItem=$getExistingItemHook} }
+    Assert-NoReparsePoint -Root $volumeRoot -Path $existingBoundary @reparseParameters
 
     # Each entry maps one physical ancestor directory to the target's relative
     # components from that ancestor. This remains comparable when an alias is a
@@ -101,9 +146,13 @@ function Get-PhysicalPathDescriptor {
     foreach ($part in $unresolved) { $relativeParts.Add($part.ToLowerInvariant()) }
     $current = $anchor
     while ($true) {
+        if ($current.TrimEnd('\','/').Equals($volumeRoot.TrimEnd('\','/'), [StringComparison]::OrdinalIgnoreCase)) {
+            $current = $volumeRoot
+        }
         $current = Resolve-FullPath -Path $current -MustExist -PathType Container
         $identity = Get-PhysicalDirectoryIdentity -Path $current
         $entries.Add([pscustomobject]@{ Identity=$identity; Parts=@($relativeParts.ToArray()) })
+        if ($current.TrimEnd('\','/').Equals($volumeRoot.TrimEnd('\','/'), [StringComparison]::OrdinalIgnoreCase)) { break }
 
         $currentTrimmed = $current.TrimEnd('\','/')
         $parentInfo = [IO.Directory]::GetParent($currentTrimmed)
@@ -264,8 +313,8 @@ function Reset-OwnedPackageStage {
     $stageFull = Assert-PathWithin -Root $releaseFull -Path $StageRoot
     Assert-NoReparsePoint -Root $releaseFull -Path $stageFull
     if (Test-Path -LiteralPath $stageFull) {
-        $item = Get-Item -LiteralPath $stageFull -Force
-        if (-not $item.PSIsContainer) { throw "Package stage target is not a directory: $stageFull" }
+        $item = Get-FileSystemItemOrFallback -Path $stageFull
+        if (-not (Test-FileSystemItemContainer -Item $item)) { throw "Package stage target is not a directory: $stageFull" }
         $markerPath = Join-Path $stageFull $script:PackageRootMarkerName
         if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) {
             throw "Refusing to replace an existing unowned directory: $stageFull"
@@ -282,6 +331,87 @@ function Reset-OwnedPackageStage {
     return $stageFull
 }
 
+function Write-CanonicalPortableActivePointer {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$ActiveRevision,
+        [Parameter(Mandatory)][string]$ActivatedAt
+    )
+
+    if ($ActiveRevision -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'Portable active revision is not a lowercase SHA-256 value.'
+    }
+    Assert-UtcIsoTimestamp -Value $ActivatedAt -Context 'portable active pointer activated_at'
+    if ($ActivatedAt.IndexOfAny([char[]]"`r`n`"") -ge 0) {
+        throw 'Portable active pointer timestamp contains an unsafe character.'
+    }
+
+    $target = Resolve-FullPath -Path $Path
+    $json = '{"schema_version":2,"active_revision":"' + $ActiveRevision +
+        '","previous_revision":null,"activated_at":"' + $ActivatedAt + '"}' + "`n"
+    [IO.File]::WriteAllText($target, $json, (New-Object Text.UTF8Encoding($false)))
+    return $target
+}
+
+function New-ReproduciblePackageZip {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ReleaseRoot,
+        [Parameter(Mandatory)][string]$StageRoot,
+        [Parameter(Mandatory)][string]$ZipPath,
+        [Parameter(Mandatory)][string]$SevenZipPath
+    )
+
+    $releaseFull = Resolve-FullPath -Path $ReleaseRoot -MustExist -PathType Container
+    $stageFull = Assert-PathWithin -Root $releaseFull -Path $StageRoot
+    $zipFull = Assert-PathWithin -Root $releaseFull -Path $ZipPath
+    $sevenZipFull = Resolve-FullPath -Path $SevenZipPath -MustExist -PathType Leaf
+    Assert-NoReparsePoint -Root $releaseFull -Path $stageFull
+    if (Test-Path -LiteralPath $zipFull) { throw "Candidate ZIP path already exists: $zipFull" }
+
+    $releasePrefix = $releaseFull.TrimEnd([char[]]'\/') + [IO.Path]::DirectorySeparatorChar
+    $paths = New-Object 'Collections.Generic.List[string]'
+    $pathNodes = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($file in Get-ChildItem -LiteralPath $stageFull -File -Recurse -Force) {
+        Assert-NoReparsePoint -Root $stageFull -Path $file.FullName
+        if (-not $file.FullName.StartsWith($releasePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Package file escaped its release root: $($file.FullName)"
+        }
+        $relative = $file.FullName.Substring($releasePrefix.Length).Replace('\','/')
+        if ([string]::IsNullOrWhiteSpace($relative) -or $relative.IndexOfAny([char[]]"`r`n") -ge 0) {
+            throw "Package file has an unsafe archive name: $relative"
+        }
+        Add-PortableArchivePathNode -Nodes $pathNodes -Path $relative -Kind File -Context 'Package stage'
+        $file.Attributes = [IO.FileAttributes]::Archive
+        $paths.Add($relative)
+    }
+    if ($paths.Count -eq 0) { throw 'Package stage contains no files.' }
+
+    $orderedPaths = [string[]]$paths.ToArray()
+    [Array]::Sort($orderedPaths, [StringComparer]::OrdinalIgnoreCase)
+    $listPath = Join-Path ([IO.Path]::GetTempPath()) ('mql5-chm-package-' + [Guid]::NewGuid().ToString('N') + '.txt')
+    try {
+        [IO.File]::WriteAllLines($listPath, $orderedPaths, (New-Object Text.UTF8Encoding($false)))
+        Push-Location $releaseFull
+        try {
+            $result = Invoke-NativeCapture -FilePath $sevenZipFull -Arguments @(
+                'a','-tzip','-mm=Deflate','-mx=9','-mfb=258','-mpass=15','-mmt=off',
+                '-mtc=off','-mtm=off','-mta=off','-mcu=on','-sse','-spd','-scsUTF-8',
+                '-bb0','-bd',$zipFull,('@' + $listPath)
+            )
+        } finally {
+            Pop-Location
+        }
+        if ($result.ExitCode -ne 0) {
+            throw "Pinned 7-Zip failed to create the canonical package archive. Exit code: $($result.ExitCode). $($result.Text)"
+        }
+    } finally {
+        if (Test-Path -LiteralPath $listPath -PathType Leaf) { Remove-Item -LiteralPath $listPath -Force }
+    }
+    return (Resolve-FullPath -Path $zipFull -MustExist -PathType Leaf)
+}
+
 function Assert-PackageZipMatchesStage {
     [CmdletBinding()]
     param(
@@ -292,13 +422,14 @@ function Assert-PackageZipMatchesStage {
     $stageFull = Resolve-FullPath -Path $StageRoot -MustExist -PathType Container
     $zipFull = Resolve-FullPath -Path $ZipPath -MustExist -PathType Leaf
     Assert-NoReparsePoint -Root $stageFull -Path $stageFull
+    Add-Type -AssemblyName System.IO.Compression -ErrorAction Stop
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
 
     $archiveRoot = Split-Path -Leaf $stageFull
     if ([string]::IsNullOrWhiteSpace($archiveRoot)) { throw 'Package stage has no archive root name.' }
     $stagePrefix = $stageFull.TrimEnd([char[]]'\/') + [IO.Path]::DirectorySeparatorChar
     $expectedFiles = @{}
-    $allowedDirectories = @{}
-    $allowedDirectories["$archiveRoot/"] = $true
+    $expectedNodes = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
 
     foreach ($directory in Get-ChildItem -LiteralPath $stageFull -Directory -Recurse -Force) {
         Assert-NoReparsePoint -Root $stageFull -Path $directory.FullName
@@ -306,9 +437,7 @@ function Assert-PackageZipMatchesStage {
             throw "Package directory escaped its stage root: $($directory.FullName)"
         }
         $relative = $directory.FullName.Substring($stagePrefix.Length).Replace('\','/')
-        $archiveName = "$archiveRoot/$relative/"
-        if ($allowedDirectories.ContainsKey($archiveName)) { throw "Case-folded package directory collision: $archiveName" }
-        $allowedDirectories[$archiveName] = $true
+        Add-PortableArchivePathNode -Nodes $expectedNodes -Path "$archiveRoot/$relative" -Kind Directory -Context 'Package stage'
     }
 
     foreach ($file in Get-ChildItem -LiteralPath $stageFull -File -Recurse -Force) {
@@ -318,6 +447,7 @@ function Assert-PackageZipMatchesStage {
         }
         $relative = $file.FullName.Substring($stagePrefix.Length).Replace('\','/')
         $archiveName = "$archiveRoot/$relative"
+        Add-PortableArchivePathNode -Nodes $expectedNodes -Path $archiveName -Kind File -Context 'Package stage'
         if ($expectedFiles.ContainsKey($archiveName)) { throw "Case-folded package file collision: $archiveName" }
         $expectedFiles[$archiveName] = [pscustomobject]@{
             ArchiveName = $archiveName
@@ -327,28 +457,40 @@ function Assert-PackageZipMatchesStage {
         }
     }
 
+    $expectedOrder = [string[]]@($expectedFiles.Values | ForEach-Object ArchiveName)
+    [Array]::Sort($expectedOrder, [StringComparer]::OrdinalIgnoreCase)
     $seenFiles = @{}
-    $seenDirectories = @{}
+    $archiveNodes = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
     $archive = [IO.Compression.ZipFile]::OpenRead($zipFull)
     try {
         if ($archive.Entries.Count -eq 0) { throw 'Candidate ZIP contains no entries.' }
-        foreach ($entry in $archive.Entries) {
+        if ($archive.Entries.Count -ne $expectedOrder.Count) {
+            throw "Candidate ZIP entry count does not match its stage: expected $($expectedOrder.Count), found $($archive.Entries.Count)."
+        }
+        for ($entryIndex = 0; $entryIndex -lt $archive.Entries.Count; $entryIndex++) {
+            $entry = $archive.Entries[$entryIndex]
             $entryName = $entry.FullName.Replace('\','/')
             if ([string]::IsNullOrWhiteSpace($entryName) -or $entryName.StartsWith('/') -or $entryName.Contains([char]0)) {
                 throw "Candidate ZIP contains an unsafe entry name: $entryName"
             }
             $isDirectory = $entryName.EndsWith('/') -or [string]::IsNullOrEmpty($entry.Name)
+            Add-PortableArchivePathNode -Nodes $archiveNodes -Path $entryName -Kind $(if ($isDirectory) { 'Directory' } else { 'File' }) -Context 'Candidate ZIP'
             if ($isDirectory) {
-                if (-not $entryName.EndsWith('/')) { $entryName += '/' }
-                if (-not $allowedDirectories.ContainsKey($entryName)) { throw "Candidate ZIP contains an unexpected directory: $entryName" }
-                if ($seenDirectories.ContainsKey($entryName)) { throw "Candidate ZIP contains a duplicate directory: $entryName" }
-                $seenDirectories[$entryName] = $true
-                continue
+                throw "Canonical package ZIP must not contain an explicit directory entry: $entryName"
+            }
+            if ($entryName -cne $expectedOrder[$entryIndex]) {
+                throw "Candidate ZIP entry order is not canonical at position $entryIndex`: expected '$($expectedOrder[$entryIndex])', found '$entryName'."
             }
             if (-not $expectedFiles.ContainsKey($entryName)) { throw "Candidate ZIP contains an unexpected file: $entryName" }
             $expected = $expectedFiles[$entryName]
             if ($expected.ArchiveName -cne $entryName) { throw "Candidate ZIP changed package path casing: $entryName" }
             if ($seenFiles.ContainsKey($entryName)) { throw "Candidate ZIP contains a duplicate file: $entryName" }
+            if ($entry.LastWriteTime.Year -ne 1980 -or $entry.LastWriteTime.Month -ne 1 -or
+                $entry.LastWriteTime.Day -ne 1 -or $entry.LastWriteTime.Hour -ne 0 -or
+                $entry.LastWriteTime.Minute -ne 0 -or $entry.LastWriteTime.Second -ne 0 -or
+                [int]$entry.ExternalAttributes -ne 32) {
+                throw "Candidate ZIP metadata is not canonical for: $entryName"
+            }
             if ([long]$entry.Length -ne $expected.Length) { throw "Candidate ZIP length mismatch for: $entryName" }
             $stream = $entry.Open()
             $sha = [Security.Cryptography.SHA256]::Create()
@@ -385,36 +527,35 @@ function Assert-PackageZipSidecar {
         [Parameter(Mandatory)][string]$ManifestPath,
         [string]$ExpectedFile
     )
-    $zipFull = Resolve-FullPath -Path $ZipPath -MustExist -PathType Leaf
-    $manifestFull = Resolve-FullPath -Path $ManifestPath -MustExist -PathType Leaf
-    $manifest = Read-JsonFile -Path $manifestFull -Context 'portable ZIP sidecar manifest'
-    Assert-ExactJsonProperties -Object $manifest -Names @('schema_version','file','bytes','sha256') -Context 'portable ZIP sidecar manifest'
-    $zipItem = Get-Item -LiteralPath $zipFull
-    if ([string]::IsNullOrWhiteSpace($ExpectedFile)) { $ExpectedFile = [IO.Path]::GetFileName($zipFull) }
-    if (-not (Test-JsonIntegerValue $manifest.schema_version) -or [int64]$manifest.schema_version -ne 1 -or
-        -not ($manifest.file -is [string]) -or [string]$manifest.file -cne $ExpectedFile -or
-        -not (Test-JsonIntegerValue $manifest.bytes) -or [int64]$manifest.bytes -lt 0 -or [int64]$manifest.bytes -ne [int64]$zipItem.Length -or
-        -not ($manifest.sha256 -is [string]) -or [string]$manifest.sha256 -cnotmatch '^[0-9a-f]{64}$') {
-        throw 'Portable ZIP sidecar manifest is structurally invalid or does not describe its ZIP.'
-    }
-    $actualHash = (Get-FileHash -LiteralPath $zipFull -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($actualHash -cne [string]$manifest.sha256) { throw 'Portable ZIP sidecar SHA-256 does not match its ZIP.' }
-    Assert-PortableZipInternalChecksumClosure -ZipPath $zipFull | Out-Null
-    return [pscustomobject]@{ZipPath=$zipFull;ManifestPath=$manifestFull;Bytes=[int64]$zipItem.Length;Sha256=$actualHash}
+    return Assert-PortableZipSidecar -ZipPath $ZipPath -ManifestPath $ManifestPath -ExpectedFile $ExpectedFile
 }
 
-function Write-NewJsonDurable {
+function Write-PackageSidecarDurable {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][object]$Value)
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$File,
+        [Parameter(Mandatory)][int64]$Bytes,
+        [Parameter(Mandatory)][string]$Sha256
+    )
+
+    if ([IO.Path]::GetFileName($File) -cne $File -or $File -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
+        throw 'Portable ZIP sidecar file name is unsafe.'
+    }
+    if ($Bytes -lt 0) { throw 'Portable ZIP sidecar byte count must not be negative.' }
+    if ($Sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'Portable ZIP sidecar SHA-256 is invalid.' }
+
     $target = Resolve-FullPath -Path $Path
     if (Test-Path -LiteralPath $target) { throw "Prepared JSON path already exists: $target" }
     $utf8 = New-Object Text.UTF8Encoding($false)
-    $json = ($Value | ConvertTo-Json -Depth 8) + [Environment]::NewLine
+    $json = '{"schema_version":1,"file":"' + $File + '","bytes":' +
+        $Bytes.ToString([Globalization.CultureInfo]::InvariantCulture) +
+        ',"sha256":"' + $Sha256 + '"}' + "`n"
     $stream = $null
     try {
         $stream = New-Object IO.FileStream($target, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-        $bytes = $utf8.GetBytes($json)
-        $stream.Write($bytes, 0, $bytes.Length)
+        $encoded = $utf8.GetBytes($json)
+        $stream.Write($encoded, 0, $encoded.Length)
         $stream.Flush($true)
     } catch {
         if ($null -ne $stream) {
@@ -587,12 +728,21 @@ function Publish-PackageZipAtomically {
         [Parameter(Mandatory)][string]$ReleaseRoot,
         [Parameter(Mandatory)][string]$StageRoot,
         [Parameter(Mandatory)][string]$ZipPath,
-        [string]$ManifestPath
+        [string]$ManifestPath,
+        [string]$SevenZipPath
     )
     $releaseFull = Resolve-FullPath -Path $ReleaseRoot -MustExist -PathType Container
     $stageFull = Assert-PathWithin -Root $releaseFull -Path $StageRoot
     $zipFull = Assert-PathWithin -Root $releaseFull -Path $ZipPath
     if ([string]::IsNullOrWhiteSpace($ManifestPath)) { $ManifestPath = "$ZipPath.manifest.json" }
+    if ([string]::IsNullOrWhiteSpace($SevenZipPath)) {
+        $defaultToolRoot = if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+            [IO.Path]::GetFullPath((Get-Location).Path)
+        } else {
+            Split-Path -Parent $PSScriptRoot
+        }
+        $SevenZipPath = Join-Path $defaultToolRoot 'tools\7z.exe'
+    }
     $manifestFull = Assert-PathWithin -Root $releaseFull -Path $ManifestPath
     $journalName = "." + [IO.Path]::GetFileName($zipFull) + '.publication-transaction.json'
     $journalPath = Join-Path $releaseFull $journalName
@@ -604,19 +754,14 @@ function Publish-PackageZipAtomically {
     $temporaryZip = Assert-PathWithin -Root $releaseFull -Path (Join-Path $releaseFull ".package-$token.prepared.zip")
     $temporaryManifest = Assert-PathWithin -Root $releaseFull -Path (Join-Path $releaseFull ".package-$token.prepared.manifest.json")
     try {
-        Compress-Archive -LiteralPath $stageFull -DestinationPath $writingZip -CompressionLevel Optimal -ErrorAction Stop
+        New-ReproduciblePackageZip -ReleaseRoot $releaseFull -StageRoot $stageFull -ZipPath $writingZip -SevenZipPath $SevenZipPath | Out-Null
         $zipStream = [IO.File]::Open($writingZip,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
         try { $zipStream.Flush($true) } finally { $zipStream.Dispose() }
         Assert-PackageZipMatchesStage -StageRoot $stageFull -ZipPath $writingZip | Out-Null
         [IO.File]::Move($writingZip,$temporaryZip)
-        $candidateItem = Get-Item -LiteralPath $temporaryZip
+        $candidateItem = Get-FileSystemItemOrFallback -Path $temporaryZip
         $candidateZipHash = (Get-FileHash -LiteralPath $temporaryZip -Algorithm SHA256).Hash.ToLowerInvariant()
-        Write-NewJsonDurable -Path $writingManifest -Value ([ordered]@{
-            schema_version=1
-            file=[IO.Path]::GetFileName($zipFull)
-            bytes=[int64]$candidateItem.Length
-            sha256=$candidateZipHash
-        }) | Out-Null
+        Write-PackageSidecarDurable -Path $writingManifest -File ([IO.Path]::GetFileName($zipFull)) -Bytes ([int64]$candidateItem.Length) -Sha256 $candidateZipHash | Out-Null
         Assert-PreparedPackageManifestShape -ManifestPath $writingManifest -ExpectedFile ([IO.Path]::GetFileName($zipFull)) | Out-Null
         [IO.File]::Move($writingManifest,$temporaryManifest)
         Assert-PackageZipSidecar -ZipPath $temporaryZip -ManifestPath $temporaryManifest -ExpectedFile ([IO.Path]::GetFileName($zipFull)) | Out-Null
@@ -688,23 +833,33 @@ try {
         Assert-PackageChecksums -ProjectRoot $root | Out-Null
         Write-Host 'Using checksum-verified prebuilt application bundles from the portable package.'
     }
-    $pointer = Get-ActiveRevisionPointer -ProjectRoot $root
-    if ($candidateMode) {
-        $selected = Assert-Revision -ProjectRoot $root -Revision $CandidateRevision -IdentityMode Index -RequireCurrent
-        if ([int]$selected.ManifestSchemaVersion -ne 3) { throw 'Inactive candidate packaging requires a manifest-schema-3 revision.' }
-        $candidateReport = Assert-StagedRevisionReport -Path (Join-Path $selected.Root 'stage-report.json') -ExpectedRevision $CandidateRevision
-        if ([string]$candidateReport.corpus_revision -cne [string]$selected.CorpusRevision) { throw 'Inactive candidate stage report does not match its verified corpus revision.' }
-        if ([int]$pointer.schema_version -eq 2 -and [string]$pointer.active_revision -ceq $CandidateRevision) { throw 'CandidateRevision is already active; use default final packaging instead.' }
-    } else {
-        if ([int]$pointer.schema_version -ne 2) { throw 'Portable packaging requires an index-identity active pointer. Stage and apply the v1.2 rebuild first, or use -CandidateRevision for an inactive validated schema-3 index.' }
-        $selected = Assert-Revision -ProjectRoot $root -Revision ([string]$pointer.active_revision) -IdentityMode Index -RequireCurrent
-    }
     foreach ($relativePath in @('runtime','tools','app','scripts')) {
         $candidatePath = Join-Path $root $relativePath
         if (Test-Path -LiteralPath $candidatePath) { Assert-NoReparsePoint -Root $root -Path $candidatePath }
     }
+    # Candidate acceptance invokes the database inspector. Repair and
+    # provenance-check Node before any candidate-controlled bytes can cause a
+    # subprocess launch, then bind that exact verified path into inspection.
     $node = Ensure-PinnedNodeRuntime -ProjectRoot $root -NoDownload:$portablePrebuiltMode
     Assert-NoReservedNodeRuntimeArtifacts -RuntimeRoot (Join-Path $root 'runtime')
+    $pointer = Get-ActiveRevisionPointer -ProjectRoot $root
+    if ($candidateMode) {
+        $activeBase = Assert-ManifestAndCorpus -ProjectRoot $root
+        if ([string]$activeBase.IndexRevision -ceq $CandidateRevision) { throw 'CandidateRevision is already active; use default final packaging instead.' }
+        $acceptedCandidate = Assert-CandidateActivationAccepted `
+            -ProjectRoot $root `
+            -CandidateIndexRevision $CandidateRevision `
+            -BaseRevision $activeBase `
+            -NodePath $node `
+            -AcceptAssetReduction:$AcceptAssetReduction `
+            -RequireCurrentSources `
+            -RequireCurrentPolicy
+        $selected = $acceptedCandidate.Candidate
+        if ([int]$selected.ManifestSchemaVersion -ne 3) { throw 'Inactive candidate packaging requires a manifest-schema-3 revision.' }
+    } else {
+        if ([int]$pointer.schema_version -ne 2) { throw 'Portable packaging requires an index-identity active pointer. Stage and apply the v1.2 rebuild first, or use -CandidateRevision for an inactive validated schema-3 index.' }
+        $selected = Assert-Revision -ProjectRoot $root -Revision ([string]$pointer.active_revision) -IdentityMode Index -RequireCurrent -RequireCurrentSources -RequireCurrentPolicy
+    }
     $sevenZipPair = Ensure-PinnedSevenZipRuntime -ProjectRoot $root -NoDownload:$portablePrebuiltMode
     Assert-NoReservedSevenZipRuntimeArtifacts -ToolsRoot (Join-Path $root 'tools')
     $applicationSource = Join-Path $root 'app'
@@ -764,23 +919,15 @@ foreach ($toolName in @($sevenZipPair.ExeName, $sevenZipPair.DllName, '7zip.prov
     Copy-Item -LiteralPath $toolPath -Destination (Join-Path $stageRoot "tools\$toolName")
 }
 New-Item -ItemType Directory -Path (Join-Path $stageRoot 'data') | Out-Null
-$portablePointer = [ordered]@{
-    schema_version=2
-    active_revision=[string]$selected.IndexRevision
-    previous_revision=$null
-    activated_at=if ($candidateMode) { [DateTime]::UtcNow.ToString('O') } else { [string]$pointer.activated_at }
-}
-Write-JsonAtomic -Path (Join-Path $stageRoot 'data\active.json') -Value $portablePointer -ConfinementRoot $stageRoot
+Write-CanonicalPortableActivePointer `
+    -Path (Join-Path $stageRoot 'data\active.json') `
+    -ActiveRevision ([string]$selected.IndexRevision) `
+    -ActivatedAt $(if ($candidateMode) { [string]$selected.Manifest.indexed_at } else { [string]$pointer.activated_at }) | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $stageRoot 'revisions') | Out-Null
 Copy-DirectorySafe -Root $root -Source $selected.Root -Destination (Join-Path $stageRoot "revisions\$($selected.IndexRevision)")
 $portableMaintenanceRoot = Join-Path $stageRoot 'maintenance'
 New-Item -ItemType Directory -Path $portableMaintenanceRoot -Force | Out-Null
 [IO.File]::WriteAllBytes((Join-Path $portableMaintenanceRoot '.update.lock'), (New-Object byte[] 0))
-$status = $null
-try { $status = Get-UpdateStatus -ProjectRoot $root -AllowMissing } catch { Write-Warning "Not packaging invalid update status: $($_.Exception.Message)" }
-if (-not $candidateMode -and $null -ne $status -and [string]$status.active_revision -eq [string]$selected.IndexRevision) {
-    Copy-Item -LiteralPath (Join-Path $root 'maintenance\update-status.json') -Destination (Join-Path $stageRoot 'maintenance\update-status.json')
-}
 
 $rootFiles = @(
     'Install-Codex.ps1',
@@ -799,32 +946,24 @@ foreach ($fileName in $rootFiles) {
 }
 
 $stageFull = [System.IO.Path]::GetFullPath($stageRoot).TrimEnd('\', '/')
-$checksumLines = @(
-    Get-ChildItem -LiteralPath $stageFull -Recurse -File -Force |
-        Where-Object {
-            if ($_.Name -eq 'checksums.sha256') { return $false }
-            $relative = $_.FullName.Substring($stageFull.Length).TrimStart('\', '/').Replace('\', '/')
-            return @('maintenance/update-status.json','maintenance/revision-transition.json','maintenance/revision-stage.json') -notcontains $relative
-        } |
-        ForEach-Object {
-            $relative = $_.FullName.Substring($stageFull.Length).TrimStart('\', '/').Replace('\', '/')
-            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
-            "$hash *$relative"
-        } |
-        Sort-Object
-)
+$checksumEntries = [Collections.Generic.SortedDictionary[string,string]]::new([StringComparer]::Ordinal)
+foreach ($file in Get-ChildItem -LiteralPath $stageFull -Recurse -File -Force) {
+    if ($file.Name -eq 'checksums.sha256') { continue }
+    $relative = $file.FullName.Substring($stageFull.Length).TrimStart('\', '/').Replace('\', '/')
+    if (@('maintenance/update-status.json','maintenance/revision-transition.json','maintenance/revision-stage.json') -contains $relative) { continue }
+    $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $file.FullName).Hash.ToLowerInvariant()
+    $checksumEntries.Add($relative, $hash)
+}
+$checksumLines = @($checksumEntries.GetEnumerator() | ForEach-Object { "$($_.Value) *$($_.Key)" })
 $checksumPath = Join-Path $stageFull 'checksums.sha256'
 [System.IO.File]::WriteAllLines($checksumPath, $checksumLines, (New-Object System.Text.UTF8Encoding($false)))
 Assert-PackageChecksums -ProjectRoot $stageFull | Out-Null
 
-$publication = Publish-PackageZipAtomically -ReleaseRoot $releaseRoot -StageRoot $stageFull -ZipPath $zipPath -ManifestPath $manifestPath
+$publication = Publish-PackageZipAtomically -ReleaseRoot $releaseRoot -StageRoot $stageFull -ZipPath $zipPath -ManifestPath $manifestPath -SevenZipPath $sevenZipPair.Extractor
 Write-Host "Portable package created: $($publication.ZipPath)"
 Write-Host "Sidecar manifest: $($publication.ManifestPath)"
 Write-Host "Bytes: $($publication.Bytes)"
 Write-Host "SHA-256: $($publication.Sha256)"
 } finally {
-    if ($null -ne $candidateBuildRoot -and (Test-Path -LiteralPath $candidateBuildRoot -PathType Container)) {
-        Remove-SafeDirectory -ConfinementRoot (Join-Path $root 'build') -Path $candidateBuildRoot
-    }
-    if ($null -ne $updateLock) { $updateLock.Dispose() }
+    Invoke-PortablePackageFinalCleanup -ProjectRoot $root -CandidateBuildRoot $candidateBuildRoot -UpdateLock $updateLock
 }

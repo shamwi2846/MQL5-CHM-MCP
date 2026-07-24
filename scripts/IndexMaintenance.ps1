@@ -123,20 +123,6 @@ function Get-ChmIndexInputExtensions {
     return @($extensions | Sort-Object)
 }
 
-function Get-CanonicalImagePolicySha256 {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$ProjectRoot)
-    $root = Resolve-FullPath -Path $ProjectRoot -MustExist -PathType Container
-    $policyPath = Resolve-FullPath -Path (Join-Path $root 'config\mql5-image-policy.json') -MustExist -PathType Leaf
-    Assert-NoReparsePoint -Root $root -Path $policyPath
-    $utf8 = New-Object Text.UTF8Encoding($false,$true)
-    try { $text = [IO.File]::ReadAllText($policyPath,$utf8) } catch { throw "MQL5 image policy is not valid UTF-8: $($_.Exception.Message)" }
-    $canonicalText = $text.Replace("`r`n","`n").Replace("`r","`n")
-    $sha = [Security.Cryptography.SHA256]::Create()
-    try { return ([BitConverter]::ToString($sha.ComputeHash($utf8.GetBytes($canonicalText)))).Replace('-','').ToLowerInvariant() }
-    finally { $sha.Dispose() }
-}
-
 function Get-ChmIndexInputInventory {
     [CmdletBinding()]
     param(
@@ -401,7 +387,8 @@ function Invoke-ChmExtraction {
         [Parameter(Mandatory)][object]$SourceRecord,
         [Parameter(Mandatory)][AllowEmptyString()][string]$SevenZip,
         [ValidateRange(10,1800)][int]$ExtractionTimeoutSeconds = 300,
-        [ValidateRange(10,300)][int]$HhTimeoutSeconds = 60
+        [ValidateRange(10,300)][int]$HhTimeoutSeconds = 60,
+        [switch]$SkipHtmlHelp
     )
     $sourceDirectory = Resolve-FullPath -Path (Join-Path $WorkingRoot 'sources') -MustExist -PathType Container
     $extractedDirectory = Resolve-FullPath -Path (Join-Path $WorkingRoot 'extracted') -MustExist -PathType Container
@@ -417,7 +404,7 @@ function Invoke-ChmExtraction {
     try {
         $windowsRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::Windows)
         $hh = if ([string]::IsNullOrWhiteSpace($windowsRoot)) { '' } else { Join-Path $windowsRoot 'hh.exe' }
-        if (Test-Path -LiteralPath $hh -PathType Leaf) {
+        if (-not $SkipHtmlHelp -and (Test-Path -LiteralPath $hh -PathType Leaf)) {
             $hhCandidate = Assert-PathWithin -Root $extractedDirectory -Path (Join-Path $extractedDirectory ('.extract-' + $SourceRecord.Id + '-hh-' + [Guid]::NewGuid().ToString('N')))
             New-Item -ItemType Directory -Path $hhCandidate -ErrorAction Stop | Out-Null
             try {
@@ -668,6 +655,68 @@ function Assert-StagedReportMatchesVerification {
         throw 'The staged representative-ranking report no longer matches the verified index.'
     }
     return [pscustomobject]@{ TopicChanges=$topicChanges; AssetChanges=$assetChanges; SourceTopicCounts=$sourceCounts; RequiredRankings=$rankings }
+}
+
+function Assert-CandidateActivationAccepted {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$CandidateIndexRevision,
+        [AllowNull()][object]$BaseRevision,
+        [AllowNull()][string]$NodePath,
+        [switch]$AcceptAssetReduction,
+        [switch]$RequireCurrentSources,
+        [switch]$RequireCurrentPolicy
+    )
+    $candidateParameters = @{
+        ProjectRoot=$ProjectRoot
+        Revision=$CandidateIndexRevision
+        IdentityMode='Index'
+        RequireCurrent=$true
+    }
+    if ($RequireCurrentSources) { $candidateParameters.RequireCurrentSources = $true }
+    if ($RequireCurrentPolicy) { $candidateParameters.RequireCurrentPolicy = $true }
+    $candidate = Assert-Revision @candidateParameters
+    $report = Assert-StagedRevisionReport -Path (Join-Path $candidate.Root 'stage-report.json') -ExpectedRevision $CandidateIndexRevision
+    if ([string]$report.corpus_revision -cne [string]$candidate.CorpusRevision) {
+        throw 'The staged report candidate corpus revision is invalid.'
+    }
+    if ($null -eq $BaseRevision) {
+        if ($null -ne $report.base_index_revision -or $null -ne $report.base_corpus_revision) {
+            throw 'Initial staged index unexpectedly declares a validation base.'
+        }
+    } elseif (
+        [string]$report.base_index_revision -cne [string]$BaseRevision.IndexRevision -or
+        [string]$report.base_corpus_revision -cne [string]$BaseRevision.CorpusRevision
+    ) {
+        throw 'The staged index was validated against a different active base. Stage it again before applying or packaging.'
+    }
+
+    $node = if ([string]::IsNullOrWhiteSpace($NodePath)) {
+        Resolve-NodeExecutable -ProjectRoot $ProjectRoot
+    } else {
+        $NodePath
+    }
+    $baseInspection = if ($null -eq $BaseRevision) {
+        $null
+    } else {
+        Invoke-DatabaseInspection -NodePath $node -DatabasePath $BaseRevision.DatabasePath
+    }
+    $candidateInspection = Invoke-DatabaseInspection -NodePath $node -DatabasePath $candidate.DatabasePath -RequireAssets
+    $verifiedReport = Assert-StagedReportMatchesVerification `
+        -Report $report `
+        -BaseRevision $BaseRevision `
+        -CandidateRevision $candidate `
+        -BaseInspection $baseInspection `
+        -CandidateInspection $candidateInspection `
+        -AcceptAssetReduction:$AcceptAssetReduction
+    return [pscustomobject]@{
+        Base=$BaseRevision
+        Candidate=$candidate
+        Report=$report
+        Changes=$verifiedReport.TopicChanges
+        Verification=$verifiedReport
+    }
 }
 
 function Assert-NoRevisionTopicLoss {

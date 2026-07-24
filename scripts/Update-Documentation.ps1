@@ -15,25 +15,6 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'IndexMaintenance.ps1')
 
-function Assert-ApplyTransitionAccepted {
-    param(
-        [Parameter(Mandatory)][string]$Root,
-        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$FromRevision,
-        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$ToRevision,
-        [switch]$AcceptAssetReduction
-    )
-    $base = Assert-Revision -ProjectRoot $Root -Revision $FromRevision -IdentityMode Index
-    $candidate = Assert-Revision -ProjectRoot $Root -Revision $ToRevision -IdentityMode Index -RequireCurrent
-    $report = Assert-StagedRevisionReport -Path (Join-Path $candidate.Root 'stage-report.json') -ExpectedRevision $ToRevision
-    if ([string]$report.base_index_revision -cne [string]$base.IndexRevision -or [string]$report.base_corpus_revision -cne [string]$base.CorpusRevision) { throw 'The staged index was validated against a different active base. Stage it again before applying.' }
-    if ([string]$report.corpus_revision -cne [string]$candidate.CorpusRevision) { throw 'The staged report candidate corpus revision is invalid.' }
-    $node = Resolve-NodeExecutable -ProjectRoot $Root
-    $baseInspection = Invoke-DatabaseInspection -NodePath $node -DatabasePath $base.DatabasePath
-    $candidateInspection = Invoke-DatabaseInspection -NodePath $node -DatabasePath $candidate.DatabasePath -RequireAssets
-    $verifiedReport = Assert-StagedReportMatchesVerification -Report $report -BaseRevision $base -CandidateRevision $candidate -BaseInspection $baseInspection -CandidateInspection $candidateInspection -AcceptAssetReduction:$AcceptAssetReduction
-    return [pscustomobject]@{ Base=$base; Candidate=$candidate; Changes=$verifiedReport.TopicChanges }
-}
-
 $root = Resolve-FullPath -Path $ProjectRoot -MustExist -PathType Container
 Assert-NoReparsePoint -Root $root -Path $root
 $maintenanceRoot = Join-Path $root 'maintenance'
@@ -51,7 +32,10 @@ try {
         if ($PSCmdlet.ParameterSetName -ne 'Apply') { throw 'A revision transition is incomplete. Retry its matching -Apply operation before staging.' }
         if ([string]$pending.operation -ne 'apply') { throw 'A rollback transition is incomplete. Recover it with Rollback-Documentation.ps1.' }
         if ([string]$pending.to_revision -cne $Revision) { throw 'The requested revision does not match the pending apply transition.' }
-        if ([int]$pending.schema_version -eq 2) { Assert-ApplyTransitionAccepted -Root $root -FromRevision ([string]$pending.from_revision) -ToRevision ([string]$pending.to_revision) -AcceptAssetReduction:$AcceptAssetReduction | Out-Null }
+        if ([int]$pending.schema_version -eq 2) {
+            $baseForRecovery = Assert-Revision -ProjectRoot $root -Revision ([string]$pending.from_revision) -IdentityMode Index
+            Assert-CandidateActivationAccepted -ProjectRoot $root -CandidateIndexRevision ([string]$pending.to_revision) -BaseRevision $baseForRecovery -AcceptAssetReduction:$AcceptAssetReduction | Out-Null
+        }
         $completed = Complete-RevisionTransition -ProjectRoot $root
         Clear-RevisionTransition -ProjectRoot $root -ExpectedTransition $completed
         Write-Host "Recovered incomplete $($completed.operation) transition $($completed.from_revision) -> $($completed.to_revision). Restart Codex before using it."
@@ -75,7 +59,7 @@ try {
             Write-Host "Index revision $Revision is already active; status and managed checksums were reconciled."
             return
         }
-        Assert-ApplyTransitionAccepted -Root $root -FromRevision ([string]$pointer.active_revision) -ToRevision $Revision -AcceptAssetReduction:$AcceptAssetReduction | Out-Null
+        Assert-CandidateActivationAccepted -ProjectRoot $root -CandidateIndexRevision $Revision -BaseRevision $active -AcceptAssetReduction:$AcceptAssetReduction | Out-Null
         Start-RevisionTransition -ProjectRoot $root -Operation apply -FromRevision ([string]$pointer.active_revision) -ToRevision $Revision | Out-Null
         $completed = Complete-RevisionTransition -ProjectRoot $root
         Clear-RevisionTransition -ProjectRoot $root -ExpectedTransition $completed

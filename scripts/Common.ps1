@@ -45,6 +45,49 @@ function Get-Mql5CorpusDefinition {
     )
 }
 
+function Assert-CurrentCorpusSourceIdentity {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Definition,
+        [Parameter(Mandatory)][string]$Sha256,
+        [Parameter(Mandatory)][int]$TopicCount
+    )
+    $expectedSha256 = ([string]$Definition.Sha256).ToLowerInvariant()
+    if ($Sha256.ToLowerInvariant() -cne $expectedSha256) {
+        throw "Current source '$([string]$Definition.Id)' SHA-256 does not match the release definition."
+    }
+    if ($TopicCount -ne [int]$Definition.TopicCount) {
+        throw "Current source '$([string]$Definition.Id)' topic count does not match the release definition."
+    }
+}
+
+function Get-CanonicalImagePolicySha256 {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ProjectRoot)
+    $root = Resolve-FullPath -Path $ProjectRoot -MustExist -PathType Container
+    $policyPath = Resolve-FullPath -Path (Join-Path $root 'config\mql5-image-policy.json') -MustExist -PathType Leaf
+    Assert-NoReparsePoint -Root $root -Path $policyPath
+    $utf8 = New-Object Text.UTF8Encoding($false,$true)
+    try { $text = [IO.File]::ReadAllText($policyPath,$utf8) }
+    catch { throw "MQL5 image policy is not valid UTF-8: $($_.Exception.Message)" }
+    $canonicalText = $text.Replace("`r`n","`n").Replace("`r","`n")
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($utf8.GetBytes($canonicalText)))).Replace('-','').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+}
+
+function Assert-CurrentImagePolicyIdentity {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$PolicySha256
+    )
+    $currentPolicySha256 = Get-CanonicalImagePolicySha256 -ProjectRoot $ProjectRoot
+    if ($PolicySha256 -cne $currentPolicySha256) {
+        throw 'Revision image policy does not match the current release policy.'
+    }
+}
+
 function Assert-IndexContract {
     [CmdletBinding()]
     param(
@@ -87,6 +130,42 @@ function Get-Mql5ChmLayoutMode {
     return 'unverified-portable'
 }
 
+function Test-FileSystemItemContainer {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$Item)
+
+    $providerProperty = $Item.PSObject.Properties['PSIsContainer']
+    if ($null -ne $providerProperty) { return [bool]$providerProperty.Value }
+    return (($Item.Attributes -band [IO.FileAttributes]::Directory) -ne 0)
+}
+
+function Get-FileSystemItemOrFallback {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [AllowNull()][scriptblock]$InternalGetItem
+    )
+
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $item = if ($null -eq $InternalGetItem) {
+        Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop
+    } else {
+        & $InternalGetItem $fullPath
+    }
+    if ($null -ne $item) { return $item }
+
+    # Windows PowerShell 5.1's FileSystem provider can acknowledge an extended
+    # volume-GUID path but emit no object. Preserve the same file metadata
+    # contract with the underlying .NET filesystem types.
+    if ([IO.Directory]::Exists($fullPath)) {
+        return New-Object IO.DirectoryInfo -ArgumentList $fullPath
+    }
+    if ([IO.File]::Exists($fullPath)) {
+        return New-Object IO.FileInfo -ArgumentList $fullPath
+    }
+    throw "Path does not exist: $fullPath"
+}
+
 function Resolve-FullPath {
     [CmdletBinding()]
     param(
@@ -96,9 +175,10 @@ function Resolve-FullPath {
     )
     $fullPath = [System.IO.Path]::GetFullPath($Path)
     if (-not $MustExist) { return $fullPath }
-    $item = Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop
-    if ($PathType -eq 'Leaf' -and $item.PSIsContainer) { throw "Expected a file but found a directory: $fullPath" }
-    if ($PathType -eq 'Container' -and -not $item.PSIsContainer) { throw "Expected a directory but found a file: $fullPath" }
+    $item = Get-FileSystemItemOrFallback -Path $fullPath
+    $isContainer = Test-FileSystemItemContainer -Item $item
+    if ($PathType -eq 'Leaf' -and $isContainer) { throw "Expected a file but found a directory: $fullPath" }
+    if ($PathType -eq 'Container' -and -not $isContainer) { throw "Expected a directory but found a file: $fullPath" }
     return [System.IO.Path]::GetFullPath($item.FullName)
 }
 
@@ -122,18 +202,46 @@ function Assert-PathWithin {
     return $pathFull
 }
 
+function Get-FilesystemRootPath {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+
+    $full = [IO.Path]::GetFullPath($Path)
+    foreach ($pattern in @(
+        '^\\\\\?\\Volume\{[0-9A-Fa-f-]+\}\\',
+        '^\\\\\?\\UNC\\[^\\]+\\[^\\]+\\',
+        '^\\\\\?\\[A-Za-z]:\\'
+    )) {
+        $match = [regex]::Match($full, $pattern)
+        if ($match.Success) { return $match.Value }
+    }
+    return [IO.Path]::GetPathRoot($full)
+}
+
 function Assert-NoReparsePoint {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string]$Path)
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$Path,
+        [hashtable]$InternalTestHooks
+    )
+    $itemParameters = @{}
+    if ($null -ne $InternalTestHooks) {
+        $unexpectedHooks = @($InternalTestHooks.Keys | Where-Object { [string]$_ -cne 'GetItem' })
+        if ($unexpectedHooks.Count -gt 0 -or -not ($InternalTestHooks['GetItem'] -is [scriptblock])) {
+            throw 'Assert-NoReparsePoint test hooks are invalid.'
+        }
+        $itemParameters.InternalGetItem = $InternalTestHooks['GetItem']
+    }
     $rootFull = Resolve-FullPath -Path $Root -MustExist -PathType Container
-    $volumeRoot = [System.IO.Path]::GetPathRoot($rootFull)
+    $volumeRoot = Get-FilesystemRootPath -Path $rootFull
     if ([string]::IsNullOrWhiteSpace($volumeRoot)) { throw "Cannot determine the filesystem root for confinement path: $rootFull" }
     $ancestorCursor = $volumeRoot
     $ancestorRelative = $rootFull.Substring($volumeRoot.Length).TrimStart('\','/')
     $ancestorSegments = if ([string]::IsNullOrWhiteSpace($ancestorRelative)) { @() } else { @($ancestorRelative -split '[\\/]') }
     foreach ($segment in $ancestorSegments) {
         $ancestorCursor = Join-Path $ancestorCursor $segment
-        $ancestorItem = Get-Item -LiteralPath $ancestorCursor -Force -ErrorAction Stop
+        $ancestorItem = Get-FileSystemItemOrFallback -Path $ancestorCursor @itemParameters
         if (($ancestorItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
             throw "Refusing to use a confinement root beneath a reparse point: $($ancestorItem.FullName)"
         }
@@ -145,7 +253,7 @@ function Assert-NoReparsePoint {
     foreach ($segment in $segments) {
         $cursor = Join-Path $cursor $segment
         if (Test-Path -LiteralPath $cursor) {
-            $item = Get-Item -LiteralPath $cursor -Force
+            $item = Get-FileSystemItemOrFallback -Path $cursor @itemParameters
             if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
                 throw "Refusing to cross a reparse point: $($item.FullName)"
             }
@@ -435,7 +543,7 @@ function Enter-ExclusiveFileLock {
         Assert-NoReparsePoint -Root $identityRootFull -Path $fullPath
         if (Test-Path -LiteralPath $fullPath) {
             if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) { throw "Maintenance lock marker is not a regular file: $fullPath" }
-            $marker = Get-Item -LiteralPath $fullPath -Force
+            $marker = Get-FileSystemItemOrFallback -Path $fullPath
             if (($marker.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or [int64]$marker.Length -ne 0) {
                 throw "Maintenance lock marker must be a zero-byte regular file: $fullPath"
             }
@@ -532,8 +640,9 @@ function Copy-StreamToFileBounded {
     param(
         [Parameter(Mandatory)][IO.Stream]$Stream,
         [Parameter(Mandatory)][string]$Destination,
-        [Parameter(Mandatory)][ValidateRange(1,67108864)][int64]$MaximumBytes,
-        [Parameter(Mandatory)][Threading.CancellationToken]$CancellationToken
+        [Parameter(Mandatory)][ValidateRange(1,536870912)][int64]$MaximumBytes,
+        [Parameter(Mandatory)][Threading.CancellationToken]$CancellationToken,
+        [AllowNull()][Security.Cryptography.HashAlgorithm]$HashAlgorithm
     )
     $destinationFull = Resolve-FullPath -Path $Destination
     $parent = Resolve-FullPath -Path (Split-Path -Parent $destinationFull) -MustExist -PathType Container
@@ -546,8 +655,17 @@ function Copy-StreamToFileBounded {
         while ($true) {
             $CancellationToken.ThrowIfCancellationRequested()
             $read = $Stream.ReadAsync($buffer, 0, $buffer.Length, $CancellationToken).GetAwaiter().GetResult()
-            if ($read -eq 0) { break }
+            if ($read -eq 0) {
+                if ($null -ne $HashAlgorithm) {
+                    [void]$HashAlgorithm.TransformFinalBlock((New-Object byte[] 0), 0, 0)
+                }
+                break
+            }
             if ($total -gt ($MaximumBytes - $read)) { throw "Download exceeded the $MaximumBytes-byte limit." }
+            if ($null -ne $HashAlgorithm) {
+                [void]$HashAlgorithm.TransformBlock($buffer, 0, $read, $buffer, 0)
+            }
+            $CancellationToken.ThrowIfCancellationRequested()
             $output.Write($buffer, 0, $read)
             $total += $read
         }
@@ -674,8 +792,8 @@ function Test-PinnedNodeRuntimePair {
         [scriptblock]$InternalNativeVersionProbe
     )
     if (-not (Test-Path -LiteralPath $NodePath -PathType Leaf) -or -not (Test-Path -LiteralPath $LicensePath -PathType Leaf)) { return $false }
-    $node = Get-Item -LiteralPath $NodePath -Force
-    $license = Get-Item -LiteralPath $LicensePath -Force
+    $node = Get-FileSystemItemOrFallback -Path $NodePath
+    $license = Get-FileSystemItemOrFallback -Path $LicensePath
     if (($node.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or ($license.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
         throw 'Refusing a Node.js runtime pair containing a reparse point.'
     }
@@ -750,7 +868,13 @@ function Get-CodexMcpRegistration {
     if (-not $listText.StartsWith('[') -or -not $listText.EndsWith(']')) {
         throw 'Codex returned a non-array JSON value for its MCP registrations.'
     }
-    try { $registrations = @($listText | ConvertFrom-Json -ErrorAction Stop) } catch {
+    try {
+        # Windows PowerShell 5.1 writes a JSON array as one pipeline object,
+        # including an empty Object[] for "[]". Assign first, then enumerate it
+        # so empty and populated arrays have the same shape as PowerShell 7.
+        $parsedRegistrations = $listText | ConvertFrom-Json -ErrorAction Stop
+        $registrations = @($parsedRegistrations)
+    } catch {
         throw "Codex returned invalid JSON for its MCP registrations: $($_.Exception.Message)"
     }
     $matches = @()
@@ -1050,7 +1174,7 @@ function Assert-SevenZipProvenance {
             throw "7-Zip provenance entry does not match the pinned distribution: $($expected.Relative)"
         }
         $filePath = Resolve-FullPath -Path (Join-Path $root $expected.Relative.Replace('/','\')) -MustExist -PathType Leaf
-        $item = Get-Item -LiteralPath $filePath
+        $item = Get-FileSystemItemOrFallback -Path $filePath
         if ([int64]$item.Length -ne [int64]$expected.Bytes -or
             (Get-FileHash -LiteralPath $filePath -Algorithm SHA256).Hash.ToLowerInvariant() -cne [string]$expected.Sha256) {
             throw "Pinned 7-Zip file failed provenance validation: $filePath"
@@ -1180,7 +1304,7 @@ function Test-FileDescriptorMatch {
         [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$Sha256
     )
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
-    $item = Get-Item -LiteralPath $Path
+    $item = Get-FileSystemItemOrFallback -Path $Path
     return [int64]$item.Length -eq $Bytes -and
         (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $Sha256
 }
@@ -1293,12 +1417,123 @@ function Test-TransactionJsonInteger {
         $Value -is [int32] -or $Value -is [uint32] -or $Value -is [int64]
 }
 
+function Get-TransactionJsonValue {
+    param(
+        [Parameter(Mandatory)][object]$Object,
+        [Parameter(Mandatory)][string]$Name
+    )
+    if ($Object -is [Collections.IDictionary]) {
+        $containsKey = if ($null -ne $Object.PSObject.Methods['ContainsKey']) {
+            $Object.ContainsKey($Name)
+        } else {
+            $Object.Contains($Name)
+        }
+        if (-not $containsKey) { return $null }
+        return $Object[$Name]
+    }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
+function Test-TransactionJsonArrayProperty {
+    param(
+        [Parameter(Mandatory)][object]$Object,
+        [Parameter(Mandatory)][string]$Name
+    )
+    if ($Object -is [Collections.IDictionary]) {
+        $containsKey = if ($null -ne $Object.PSObject.Methods['ContainsKey']) {
+            $Object.ContainsKey($Name)
+        } else {
+            $Object.Contains($Name)
+        }
+        if (-not $containsKey) { return $false }
+        return $Object[$Name] -is [Collections.IList]
+    }
+    $property = $Object.PSObject.Properties[$Name]
+    return $null -ne $property -and $property.Value -is [Collections.IList]
+}
+
+function Get-TransactionJsonNumericView {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][object]$Parsed,
+        [string]$Context = 'prepared file-set transaction journal'
+    )
+    if ($PSVersionTable.PSVersion.Major -gt 5) { return $Parsed }
+
+    # Windows PowerShell 5.1's ConvertFrom-Json turns a token such as 5.0 into
+    # Int64 5. JavaScriptSerializer preserves it as Decimal, allowing the
+    # recovery format to enforce integer JSON representations on both hosts.
+    Add-Type -AssemblyName System.Web.Extensions -ErrorAction Stop
+    $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+    $serializer.MaxJsonLength = 1048576
+    try {
+        $value = $serializer.DeserializeObject([IO.File]::ReadAllText($Path))
+    } catch {
+        throw "$Context numeric validation failed: $($_.Exception.Message)"
+    }
+    if (-not ($value -is [Collections.IDictionary])) {
+        throw "$Context must be a JSON object."
+    }
+    return $value
+}
+
+function Add-PortableArchivePathNode {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][Collections.Generic.Dictionary[string,object]]$Nodes,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][ValidateSet('File','Directory')][string]$Kind,
+        [Parameter(Mandatory)][string]$Context
+    )
+
+    $normalized = $Path.Replace('\','/')
+    if ($Kind -ceq 'Directory') { $normalized = $normalized.TrimEnd([char[]]'/') }
+    if ([string]::IsNullOrWhiteSpace($normalized) -or $normalized.StartsWith('/') -or $normalized.EndsWith('/')) {
+        throw "$Context contains an invalid archive path node: $Path"
+    }
+    $segments = @($normalized -split '/')
+    if (@($segments | Where-Object { [string]::IsNullOrWhiteSpace($_) -or $_ -ceq '.' -or $_ -ceq '..' }).Count -gt 0) {
+        throw "$Context contains an invalid archive path node: $Path"
+    }
+    foreach ($segment in $segments) {
+        if ($segment.Length -gt 255) {
+            throw "$Context contains a Windows path component longer than 255 characters: $Path"
+        }
+        if ($segment.EndsWith('.') -or $segment.EndsWith(' ') -or
+            $segment -match '^(CON|PRN|AUX|NUL|CLOCK\$|CONIN\$|CONOUT\$|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)') {
+            throw "$Context contains an invalid Windows archive path node: $Path"
+        }
+    }
+
+    $nodePath = ''
+    for ($index = 0; $index -lt $segments.Count; $index++) {
+        $nodePath = if ($index -eq 0) { [string]$segments[$index] } else { "$nodePath/$($segments[$index])" }
+        $nodeKind = if ($index -eq $segments.Count - 1) { $Kind } else { 'Directory' }
+        if ($Nodes.ContainsKey($nodePath)) {
+            $existing = $Nodes[$nodePath]
+            if ([string]$existing.Path -cne $nodePath) {
+                throw "$Context contains a case-colliding path node: '$([string]$existing.Path)' and '$nodePath'."
+            }
+            if ([string]$existing.Kind -cne $nodeKind) {
+                throw "$Context contains a file/directory path node conflict: $nodePath"
+            }
+            if ($index -eq $segments.Count - 1 -and $nodeKind -ceq 'File') {
+                throw "$Context contains a duplicate file path node: $nodePath"
+            }
+            continue
+        }
+        $Nodes.Add($nodePath,[pscustomobject]@{Path=$nodePath;Kind=$nodeKind})
+    }
+}
+
 function Assert-PortableZipInternalChecksumClosure {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$ZipPath)
 
     $zipFull = Resolve-FullPath -Path $ZipPath -MustExist -PathType Leaf
-    $zipItem = Get-Item -LiteralPath $zipFull -Force
+    $zipItem = Get-FileSystemItemOrFallback -Path $zipFull
     if (($zipItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Portable ZIP must not be a reparse point.' }
     Add-Type -AssemblyName System.IO.Compression -ErrorAction Stop
     Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
@@ -1306,6 +1541,8 @@ function Assert-PortableZipInternalChecksumClosure {
     try {
         if ($archive.Entries.Count -eq 0) { throw 'Portable ZIP contains no entries.' }
         $entries = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
+        $pathNodes = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
+        $explicitDirectories = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
         $rootName = $null
         $totalUncompressed = [int64]0
         foreach ($entry in $archive.Entries) {
@@ -1320,8 +1557,32 @@ function Assert-PortableZipInternalChecksumClosure {
             }
             if ($null -eq $rootName) { $rootName = [string]$segments[0] }
             if ([string]$segments[0] -cne $rootName) { throw 'Portable ZIP contains more than one top-level package root.' }
-            $isDirectory = $entryName.EndsWith('/') -or [string]::IsNullOrEmpty($entry.Name)
-            if ($isDirectory) { continue }
+            $externalAttributes = [int64]$entry.ExternalAttributes
+            $dosDirectory = (($externalAttributes -band [int64][IO.FileAttributes]::Directory) -ne 0)
+            $dosDevice = (($externalAttributes -band [int64][IO.FileAttributes]::Device) -ne 0)
+            $dosReparsePoint = (($externalAttributes -band [int64][IO.FileAttributes]::ReparsePoint) -ne 0)
+            $unixType = (($externalAttributes -shr 16) -band 0xF000)
+            if ($dosDevice -or $dosReparsePoint -or $unixType -eq 0xA000 -or
+                ($unixType -ne 0 -and $unixType -ne 0x4000 -and $unixType -ne 0x8000)) {
+                throw "Portable ZIP entry uses unsupported link or device attributes: $entryName"
+            }
+            $nameIsDirectory = $entryName.EndsWith('/') -or [string]::IsNullOrEmpty($entry.Name)
+            $attributeIsDirectory = $dosDirectory -or $unixType -eq 0x4000
+            if ($attributeIsDirectory -and -not $nameIsDirectory) {
+                throw "Portable ZIP entry has a directory attribute without a canonical directory name: $entryName"
+            }
+            if ($nameIsDirectory -and $unixType -eq 0x8000) {
+                throw "Portable ZIP directory entry has conflicting regular-file attributes: $entryName"
+            }
+            $isDirectory = $nameIsDirectory
+            Add-PortableArchivePathNode -Nodes $pathNodes -Path $entryName -Kind $(if ($isDirectory) { 'Directory' } else { 'File' }) -Context 'Portable ZIP'
+            if ($isDirectory) {
+                if ([int64]$entry.Length -ne 0) { throw "Portable ZIP directory entry contains data: $entryName" }
+                if (-not $explicitDirectories.Add($entryName.TrimEnd('/'))) {
+                    throw "Portable ZIP contains a duplicate explicit directory entry: $entryName"
+                }
+                continue
+            }
             if ($segments.Count -lt 2) { throw 'Portable ZIP contains a file outside its top-level package directory.' }
             if ([int64]$entry.Length -lt 0 -or [int64]$entry.Length -gt 536870912) { throw "Portable ZIP entry has an unsafe uncompressed size: $entryName" }
             $totalUncompressed += [int64]$entry.Length
@@ -1384,6 +1645,35 @@ function Assert-PortableZipInternalChecksumClosure {
         if ($unlisted.Count -gt 0) { throw "Portable ZIP contains file(s) outside its internal checksum closure: $($unlisted -join ', ')" }
         return $true
     } finally { $archive.Dispose() }
+}
+
+function Assert-PortableZipSidecar {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ZipPath,
+        [Parameter(Mandatory)][string]$ManifestPath,
+        [string]$ExpectedFile
+    )
+    $zipFull = Resolve-FullPath -Path $ZipPath -MustExist -PathType Leaf
+    $manifestFull = Resolve-FullPath -Path $ManifestPath -MustExist -PathType Leaf
+    $manifest = Read-JsonFile -Path $manifestFull -Context 'portable ZIP sidecar manifest'
+    Assert-ExactJsonProperties -Object $manifest -Names @('schema_version','file','bytes','sha256') -Context 'portable ZIP sidecar manifest'
+    $numericManifest = Get-TransactionJsonNumericView -Path $manifestFull -Parsed $manifest -Context 'portable ZIP sidecar manifest'
+    $numericSchemaVersion = Get-TransactionJsonValue -Object $numericManifest -Name 'schema_version'
+    $numericBytes = Get-TransactionJsonValue -Object $numericManifest -Name 'bytes'
+    $zipItem = Get-FileSystemItemOrFallback -Path $zipFull
+    if ([string]::IsNullOrWhiteSpace($ExpectedFile)) { $ExpectedFile = [IO.Path]::GetFileName($zipFull) }
+    if (-not (Test-TransactionJsonInteger $numericSchemaVersion) -or [int64]$manifest.schema_version -ne 1 -or
+        -not ($manifest.file -is [string]) -or [string]$manifest.file -cne $ExpectedFile -or
+        -not (Test-TransactionJsonInteger $numericBytes) -or [int64]$manifest.bytes -lt 0 -or
+        [int64]$manifest.bytes -ne [int64]$zipItem.Length -or
+        -not ($manifest.sha256 -is [string]) -or [string]$manifest.sha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'Portable ZIP sidecar manifest is structurally invalid or does not describe its ZIP.'
+    }
+    $actualHash = (Get-FileHash -LiteralPath $zipFull -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actualHash -cne [string]$manifest.sha256) { throw 'Portable ZIP sidecar SHA-256 does not match its ZIP.' }
+    Assert-PortableZipInternalChecksumClosure -ZipPath $zipFull | Out-Null
+    return [pscustomobject]@{ZipPath=$zipFull;ManifestPath=$manifestFull;Bytes=[int64]$zipItem.Length;Sha256=$actualHash}
 }
 
 function Assert-PortableTransactionPairSemantics {
@@ -1454,6 +1744,11 @@ function Get-PreparedFileSetTransactionDefinition {
     Assert-NoReparsePoint -Root $rootFull -Path $sourcePath
     if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) { throw 'Prepared file-set transaction journal is not a regular file.' }
     $journal = Read-JsonFile -Path $sourcePath -Context 'prepared file-set transaction journal'
+    $numericJournal = Get-TransactionJsonNumericView -Path $sourcePath -Parsed $journal
+    $numericSchemaVersion = Get-TransactionJsonValue -Object $numericJournal -Name 'schema_version'
+    if (-not (Test-TransactionJsonInteger $numericSchemaVersion)) {
+        throw 'Prepared file-set transaction journal schema is invalid.'
+    }
     $schemaVersion = [int]$journal.schema_version
     if ($schemaVersion -eq 1) {
         Assert-ExactJsonProperties -Object $journal -Names @('schema_version','operation','transaction_id','items') -Context 'prepared file-set transaction journal'
@@ -1470,22 +1765,37 @@ function Get-PreparedFileSetTransactionDefinition {
     if (-not [string]::IsNullOrWhiteSpace($ExpectedRole) -and ($null -eq $ExpectedTargetNames -or $ExpectedTargetNames.Count -eq 0)) {
         throw 'Context-bound transaction recovery requires its exact intended target set.'
     }
+    if (-not (Test-TransactionJsonArrayProperty -Object $numericJournal -Name 'items')) {
+        throw 'Prepared file-set transaction items must be a JSON array.'
+    }
     $items = @($journal.items)
+    $numericItems = @(Get-TransactionJsonValue -Object $numericJournal -Name 'items')
+    if ($numericItems.Count -ne $items.Count) { throw 'Prepared file-set transaction item count is invalid.' }
     if ($items.Count -lt 1 -or $items.Count -gt 16) { throw 'Prepared file-set transaction item count is invalid.' }
     $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     [void]$seen.Add($journalLeaf)
     $states = @()
+    $itemIndex = -1
     foreach ($item in $items) {
+        $itemIndex++
+        $numericItem = $numericItems[$itemIndex]
+        $numericNewBytes = Get-TransactionJsonValue -Object $numericItem -Name 'new_bytes'
+        $numericOldBytes = Get-TransactionJsonValue -Object $numericItem -Name 'old_bytes'
         Assert-ExactJsonProperties -Object $item -Names @('target','prepared','backup','old_present','old_bytes','old_sha256','new_bytes','new_sha256') -Context 'prepared file-set transaction item'
         $targetLeaf = Assert-TransactionLeafName -Name ([string]$item.target) -Context 'transaction target'
         $preparedLeaf = Assert-TransactionLeafName -Name ([string]$item.prepared) -Context 'transaction prepared file'
         $backupLeaf = Assert-TransactionLeafName -Name ([string]$item.backup) -Context 'transaction backup file'
         foreach ($leaf in @($targetLeaf,$preparedLeaf,$backupLeaf)) { if (-not $seen.Add($leaf)) { throw 'Prepared file-set transaction contains duplicate paths.' } }
-        if (-not ($item.old_present -is [bool]) -or [int64]$item.new_bytes -lt 0 -or [string]$item.new_sha256 -cnotmatch '^[0-9a-f]{64}$') {
+        if (-not ($item.old_present -is [bool]) -or
+            -not (Test-TransactionJsonInteger $numericNewBytes) -or [int64]$item.new_bytes -lt 0 -or
+            [string]$item.new_sha256 -cnotmatch '^[0-9a-f]{64}$') {
             throw 'Prepared file-set transaction item descriptor is invalid.'
         }
         if ([bool]$item.old_present) {
-            if ([int64]$item.old_bytes -lt 0 -or [string]$item.old_sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'Prepared file-set transaction prior descriptor is invalid.' }
+            if (-not (Test-TransactionJsonInteger $numericOldBytes) -or [int64]$item.old_bytes -lt 0 -or
+                [string]$item.old_sha256 -cnotmatch '^[0-9a-f]{64}$') {
+                throw 'Prepared file-set transaction prior descriptor is invalid.'
+            }
         } elseif ($null -ne $item.old_bytes -or $null -ne $item.old_sha256) {
             throw 'Prepared file-set transaction absent prior descriptor is invalid.'
         }
@@ -1737,10 +2047,10 @@ function Publish-PreparedFileSetTransaction {
         if (-not $seen.Add($preparedLeaf) -or -not $seen.Add($targetLeaf)) { throw 'Prepared file-set publication contains duplicate paths.' }
         $backupLeaf = ".$targetLeaf.backup-$transactionId"
         if (-not $seen.Add($backupLeaf)) { throw 'Prepared file-set publication backup path collided.' }
-        $newItem=Get-Item -LiteralPath $prepared
+        $newItem=Get-FileSystemItemOrFallback -Path $prepared
         $oldPresent=Test-Path -LiteralPath $target -PathType Leaf
         if ((Test-Path -LiteralPath $target) -and -not $oldPresent) { throw "Transaction target is not a regular file: $target" }
-        $oldItem=if($oldPresent){Get-Item -LiteralPath $target}else{$null}
+        $oldItem=if($oldPresent){Get-FileSystemItemOrFallback -Path $target}else{$null}
         $journalItems += [ordered]@{
             target=$targetLeaf;prepared=$preparedLeaf;backup=$backupLeaf;old_present=[bool]$oldPresent
             old_bytes=if($oldPresent){[int64]$oldItem.Length}else{$null}
@@ -1934,7 +2244,7 @@ function Ensure-PinnedNodeRuntime {
     Repair-PreparedFileSetTransaction -Root $runtimeRoot -JournalName $journalName -ExpectedRole node-runtime -ExpectedTargetNames @('LICENSE','node.exe') | Out-Null
 
     $sourceLicense = Resolve-FullPath -Path (Join-Path $root 'licenses\NODE-LICENSE.txt') -MustExist -PathType Leaf
-    $sourceLicenseItem = Get-Item -LiteralPath $sourceLicense
+    $sourceLicenseItem = Get-FileSystemItemOrFallback -Path $sourceLicense
     if ([int64]$sourceLicenseItem.Length -ne 159872 -or
         (Get-FileHash -LiteralPath $sourceLicense -Algorithm SHA256).Hash.ToLowerInvariant() -cne $script:PinnedNodeLicenseSha256) {
         throw 'The checked-in Node.js license does not match the pinned official v24.17.0 distribution.'
@@ -2113,7 +2423,7 @@ function Get-RevisionStageReportRepairContext {
     if ($revisionName -cnotmatch '^[0-9a-f]{64}$') { throw "Revision stage-report repair directory has an invalid identity: $revisionName" }
     $manifestPath = Join-Path $revisionRoot 'manifest.json'
     Assert-NoReparsePoint -Root $revisionsRoot -Path $manifestPath
-    if ((Get-Item -LiteralPath $manifestPath).Length -gt 2097152) { throw "Revision manifest is unexpectedly large during stage-report repair: $manifestPath" }
+    if ((Get-FileSystemItemOrFallback -Path $manifestPath).Length -gt 2097152) { throw "Revision manifest is unexpectedly large during stage-report repair: $manifestPath" }
     $manifest = Read-JsonFile -Path $manifestPath -Context 'revision manifest for stage-report repair'
     $schema = [int](Get-RequiredJsonProperty $manifest 'schema_version' 'revision manifest for stage-report repair')
     $database = Get-RequiredJsonProperty $manifest 'database' 'revision manifest for stage-report repair'
@@ -2492,7 +2802,9 @@ function Assert-Revision {
         [string]$RevisionRoot,
         [string]$RevisionConfinementRoot,
         [ValidateSet('Auto','Corpus','Index')][string]$IdentityMode = 'Auto',
-        [switch]$RequireCurrent
+        [switch]$RequireCurrent,
+        [switch]$RequireCurrentSources,
+        [switch]$RequireCurrentPolicy
     )
     $root = Resolve-FullPath -Path $ProjectRoot -MustExist -PathType Container
     $revisionConfinement = if ([string]::IsNullOrWhiteSpace($RevisionConfinementRoot)) {
@@ -2526,7 +2838,7 @@ function Assert-Revision {
     $databaseHash = [string](Get-RequiredJsonProperty $database 'sha256' 'manifest.database')
     if ($databaseHash -cnotmatch '^[0-9a-f]{64}$') { throw 'Manifest database SHA-256 is invalid.' }
     Assert-FileSha256 -Path $databasePath -Expected $databaseHash | Out-Null
-    if ((Get-Item -LiteralPath $databasePath).Length -ne [int64](Get-RequiredJsonProperty $database 'bytes' 'manifest.database')) { throw 'Manifest database byte count is invalid.' }
+    if ((Get-FileSystemItemOrFallback -Path $databasePath).Length -ne [int64](Get-RequiredJsonProperty $database 'bytes' 'manifest.database')) { throw 'Manifest database byte count is invalid.' }
     $sources = Get-RequiredJsonProperty $manifest 'sources' 'manifest'
     $hashObject = [pscustomobject]@{}
     $totalTopics = 0
@@ -2544,9 +2856,12 @@ function Assert-Revision {
         $chm = Join-Path $revisionRoot $definition.FileName
         Assert-NoReparsePoint -Root $revisionConfinement -Path $chm
         Assert-FileSha256 -Path $chm -Expected $hash | Out-Null
-        if ((Get-Item -LiteralPath $chm).Length -ne [int64](Get-RequiredJsonProperty $source 'bytes' "manifest.sources.$($definition.Id)")) { throw "Source byte count mismatch for '$($definition.Id)'." }
+        if ((Get-FileSystemItemOrFallback -Path $chm).Length -ne [int64](Get-RequiredJsonProperty $source 'bytes' "manifest.sources.$($definition.Id)")) { throw "Source byte count mismatch for '$($definition.Id)'." }
         $topicCount = [int](Get-RequiredJsonProperty $source 'topic_count' "manifest.sources.$($definition.Id)")
         $sectionCount = [int](Get-RequiredJsonProperty $source 'section_count' "manifest.sources.$($definition.Id)")
+        if ($RequireCurrentSources) {
+            Assert-CurrentCorpusSourceIdentity -Definition $definition -Sha256 $hash -TopicCount $topicCount
+        }
         if ($topicCount -lt $definition.TopicCount) { throw "Source '$($definition.Id)' has $topicCount topics; trusted baseline is $($definition.TopicCount)." }
         if ([int]$lockEntry.expected_topics -ne $topicCount) { throw "Revision corpus lock topic count does not match '$($definition.Id)'." }
         if ($sectionCount -lt $topicCount) { throw "Source '$($definition.Id)' section count is invalid." }
@@ -2583,6 +2898,9 @@ function Assert-Revision {
         $assets = Get-RequiredJsonProperty $manifest 'assets' 'manifest'
         foreach ($countName in @('cataloged_count','exposed_count','excluded_count','occurrence_count','exposed_occurrence_count','total_bytes')) { if ([int64](Get-RequiredJsonProperty $assets $countName 'manifest.assets') -lt 0) { throw "Manifest assets.$countName is invalid." } }
         foreach ($hashName in @('catalog_sha256','tree_sha256','policy_sha256')) { if ([string](Get-RequiredJsonProperty $assets $hashName 'manifest.assets') -cnotmatch '^[0-9a-f]{64}$') { throw "Manifest assets.$hashName is invalid." } }
+        if ($RequireCurrentPolicy) {
+            Assert-CurrentImagePolicyIdentity -ProjectRoot $root -PolicySha256 ([string]$assets.policy_sha256)
+        }
         if ([int]$assets.cataloged_count -ne ([int]$assets.exposed_count + [int]$assets.excluded_count)) { throw 'Manifest asset exposure counts are inconsistent.' }
         if ([int]$assets.exposed_occurrence_count -gt [int]$assets.occurrence_count) { throw 'Manifest topic asset exposure counts are inconsistent.' }
         [int]$sourceAssetCount = 0; [int]$sourceExposedCount = 0; [int]$sourceExcludedCount = 0; [int]$sourceTopicAssetCount = 0; [int]$sourceExposedTopicAssetCount = 0; [int64]$sourceAssetBytes = 0
@@ -2602,10 +2920,16 @@ function Assert-Revision {
 
 function Assert-ManifestAndCorpus {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$ProjectRoot, [switch]$RequireCurrent)
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [switch]$RequireCurrent,
+        [switch]$RequireCurrentSources,
+        [switch]$RequireCurrentPolicy
+    )
     $pointer = Get-ActiveRevisionPointer -ProjectRoot $ProjectRoot
     $identityMode = if ([int]$pointer.schema_version -eq 1) { 'Corpus' } else { 'Index' }
-    return Assert-Revision -ProjectRoot $ProjectRoot -Revision ([string]$pointer.active_revision) -IdentityMode $identityMode -RequireCurrent:$RequireCurrent
+    return Assert-Revision -ProjectRoot $ProjectRoot -Revision ([string]$pointer.active_revision) -IdentityMode $identityMode `
+        -RequireCurrent:$RequireCurrent -RequireCurrentSources:$RequireCurrentSources -RequireCurrentPolicy:$RequireCurrentPolicy
 }
 
 function Copy-DirectoryTreeNoReparse {
@@ -2808,7 +3132,7 @@ function Assert-LegacyStagedRevisionReport {
         [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedCorpusRevision
     )
     $full = Resolve-FullPath -Path $Path -MustExist -PathType Leaf
-    if ((Get-Item -LiteralPath $full).Length -gt 2097152) { throw 'Legacy stage report exceeds the 2 MiB validation limit.' }
+    if ((Get-FileSystemItemOrFallback -Path $full).Length -gt 2097152) { throw 'Legacy stage report exceeds the 2 MiB validation limit.' }
     $report = Read-JsonFile -Path $full -Context 'legacy stage report'
     Assert-ExactJsonProperties -Object $report -Names @('schema_version','revision','base_revision','staged_at','validation_passed','source_topic_counts','changes','required_rankings') -Context 'legacy stage report'
     if ([int]$report.schema_version -ne 1 -or [string]$report.revision -cne $ExpectedCorpusRevision -or $report.validation_passed -isnot [bool] -or -not [bool]$report.validation_passed) { throw 'Legacy stage report is not approved for this corpus revision.' }
@@ -2881,7 +3205,7 @@ function Assert-NoPendingRevisionStageInstall {
     $path = Assert-PathWithin -Root $root -Path (Join-Path $root 'maintenance\revision-stage.json')
     Assert-NoReparsePoint -Root $root -Path $path
     if (Test-Path -LiteralPath $path -PathType Leaf) {
-        if ((Get-Item -LiteralPath $path).Length -gt 2097152) { throw 'Pending revision-stage journal exceeds the 2 MiB safety limit.' }
+        if ((Get-FileSystemItemOrFallback -Path $path).Length -gt 2097152) { throw 'Pending revision-stage journal exceeds the 2 MiB safety limit.' }
         throw 'A revision stage install is incomplete. Recover it with the matching Rebuild-Index.ps1 -Stage or Update-Documentation.ps1 -Stage operation before continuing.'
     }
     if (Test-Path -LiteralPath $path) { throw 'Revision-stage journal path is not a regular file.' }
@@ -3003,49 +3327,168 @@ function Invoke-OfficialChmDownload {
         [Parameter(Mandatory)][string]$Destination,
         [Parameter(Mandatory)][ValidateRange(1,104857600)][int64]$MinimumBytes,
         [Parameter(Mandatory)][ValidateRange(102400,536870912)][int64]$MaximumBytes,
-        [ValidateRange(5,600)][int]$TimeoutSeconds = 120
+        [ValidateRange(5,600)][int]$TimeoutSeconds = 120,
+        [Parameter(DontShow)][hashtable]$InternalTestHooks
     )
+    if ($null -ne $InternalTestHooks) {
+        $unexpectedHooks = @($InternalTestHooks.Keys | Where-Object { [string]$_ -cne 'GetResponse' })
+        if ($unexpectedHooks.Count -gt 0 -or -not ($InternalTestHooks['GetResponse'] -is [scriptblock])) {
+            throw 'Official CHM download test hooks are invalid.'
+        }
+    }
     if ($Uri.Scheme -ne 'https' -or $Uri.IdnHost -cne 'www.mql5.com' -or (-not $Uri.IsDefaultPort -and $Uri.Port -ne 443) -or -not [string]::IsNullOrEmpty($Uri.UserInfo) -or -not $Uri.AbsolutePath.EndsWith('.chm', [StringComparison]::OrdinalIgnoreCase)) { throw "Refusing non-official CHM URI: $Uri" }
     $target = Resolve-FullPath -Path $Destination
     $parent = Split-Path -Parent $target
     Resolve-FullPath -Path $parent -MustExist -PathType Container | Out-Null
     if (Test-Path -LiteralPath $target) { throw "Download destination already exists: $target" }
-    $current = $Uri
-    for ($redirect = 0; $redirect -le 5; $redirect++) {
-        $request = [System.Net.HttpWebRequest]::Create($current)
-        $request.Method = 'GET'; $request.AllowAutoRedirect = $false; $request.UserAgent = 'mql5-chm-mcp/1.1'
-        $request.Timeout = $TimeoutSeconds * 1000; $request.ReadWriteTimeout = $TimeoutSeconds * 1000
-        try { $response = [System.Net.HttpWebResponse]$request.GetResponse() } catch { throw "Official CHM download failed for '$current': $($_.Exception.Message)" }
-        try {
-            $code = [int]$response.StatusCode
-            if ($code -ge 300 -and $code -lt 400) {
-                $location = $response.Headers['Location']
-                if ([string]::IsNullOrWhiteSpace($location)) { throw "Redirect from '$current' has no Location header." }
-                $next = New-Object Uri($current, $location)
-                if ($next.Scheme -ne 'https' -or $next.IdnHost -cne 'www.mql5.com' -or (-not $next.IsDefaultPort -and $next.Port -ne 443) -or -not [string]::IsNullOrEmpty($next.UserInfo) -or -not $next.AbsolutePath.EndsWith('.chm', [StringComparison]::OrdinalIgnoreCase)) { throw "Refusing redirect outside the official www.mql5.com CHM paths: $next" }
-                $current = $next; continue
-            }
-            if ($code -ne 200) { throw "Official CHM download returned HTTP $code for '$current'." }
-            if ($response.ResponseUri.Scheme -ne 'https' -or $response.ResponseUri.IdnHost -cne 'www.mql5.com' -or (-not $response.ResponseUri.IsDefaultPort -and $response.ResponseUri.Port -ne 443)) { throw "Final download endpoint is not HTTPS www.mql5.com: $($response.ResponseUri)" }
-            if ($response.ContentLength -ge 0 -and ($response.ContentLength -lt $MinimumBytes -or $response.ContentLength -gt $MaximumBytes)) { throw "Official CHM Content-Length is outside the allowed range: $($response.ContentLength)" }
-            $input = $response.GetResponseStream(); $output = New-Object System.IO.FileStream($target, 'CreateNew', 'Write', 'None')
-            try {
-                $buffer = New-Object byte[] 65536; [int64]$written = 0
-                while (($read = $input.Read($buffer, 0, $buffer.Length)) -gt 0) { $written += $read; if ($written -gt $MaximumBytes) { throw 'Official CHM download exceeded the maximum size.' }; $output.Write($buffer, 0, $read) }
-                $output.Flush($true)
-            } finally { $output.Dispose(); $input.Dispose() }
-            if ($written -lt $MinimumBytes) { throw "Official CHM download is too small: $written bytes." }
-            $signature = New-Object byte[] 4; $verify = [IO.File]::OpenRead($target)
-            try { if ($verify.Read($signature,0,4) -ne 4 -or [Text.Encoding]::ASCII.GetString($signature) -ne 'ITSF') { throw 'Downloaded file is not a compiled HTML Help file.' } } finally { $verify.Dispose() }
-            return [pscustomobject]@{
-                Path=$target; Sha256=(Get-FileHash -Algorithm SHA256 -LiteralPath $target).Hash.ToLowerInvariant(); Bytes=$written
-                HttpLastModified=if ([string]::IsNullOrWhiteSpace($response.Headers['Last-Modified'])) { $null } else { [string]$response.Headers['Last-Modified'] }
-                HttpEtag=if ([string]::IsNullOrWhiteSpace($response.Headers['ETag'])) { $null } else { [string]$response.Headers['ETag'] }
-                RetrievedAt=[DateTime]::UtcNow.ToString('O'); FinalUri=[string]$response.ResponseUri
-            }
-        } catch { if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force }; throw } finally { $response.Dispose() }
+
+    Add-Type -AssemblyName System.Net.Http -ErrorAction Stop
+    $handler = $null
+    $client = $null
+    if ($null -eq $InternalTestHooks) {
+        $handler = New-Object Net.Http.HttpClientHandler
+        $handler.AllowAutoRedirect = $false
+        $handler.AutomaticDecompression = [Net.DecompressionMethods]::None
+        $handler.UseCookies = $false
+        if ($handler.PSObject.Properties.Name -contains 'SslProtocols') {
+            $handler.SslProtocols = [Security.Authentication.SslProtocols]::Tls12
+        }
+        $client = New-Object Net.Http.HttpClient($handler, $true)
+        $client.Timeout = [Threading.Timeout]::InfiniteTimeSpan
     }
-    throw 'Official CHM download exceeded the redirect limit.'
+
+    $deadline = New-Object Threading.CancellationTokenSource([TimeSpan]::FromSeconds($TimeoutSeconds))
+    $current = $Uri
+    [int]$redirects = 0
+    try {
+        while ($true) {
+            $request = $null
+            $httpResponse = $null
+            $testResponse = $null
+            $input = $null
+            try {
+                if ($null -eq $InternalTestHooks) {
+                    $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Get, $current)
+                    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp/1.1')
+                    try {
+                        $httpResponse = $client.SendAsync(
+                            $request,
+                            [Net.Http.HttpCompletionOption]::ResponseHeadersRead,
+                            $deadline.Token
+                        ).GetAwaiter().GetResult()
+                    } catch {
+                        throw "Official CHM download failed for '$current': $($_.Exception.Message)"
+                    }
+                    $code = [int]$httpResponse.StatusCode
+                    $location = $httpResponse.Headers.Location
+                } else {
+                    try { $testResponse = & $InternalTestHooks.GetResponse $current $deadline.Token }
+                    catch { throw "Official CHM download failed for '$current': $($_.Exception.Message)" }
+                    if ($null -eq $testResponse) {
+                        throw "Official CHM download failed for '$current': the test response was null."
+                    }
+                    $code = [int]$testResponse.StatusCode
+                    $location = $testResponse.Headers['Location']
+                }
+
+                if ($code -ge 300 -and $code -lt 400) {
+                    if ($redirects -ge 5) { throw 'Official CHM download exceeded the redirect limit.' }
+                    if ([string]::IsNullOrWhiteSpace([string]$location)) {
+                        throw "Redirect from '$current' has no Location header."
+                    }
+                    $next = New-Object Uri($current, [string]$location)
+                    if ($next.Scheme -ne 'https' -or $next.IdnHost -cne 'www.mql5.com' -or
+                        (-not $next.IsDefaultPort -and $next.Port -ne 443) -or
+                        -not [string]::IsNullOrEmpty($next.UserInfo) -or
+                        -not $next.AbsolutePath.EndsWith('.chm', [StringComparison]::OrdinalIgnoreCase)) {
+                        throw "Refusing redirect outside the official www.mql5.com CHM paths: $next"
+                    }
+                    $current = $next
+                    $redirects++
+                    continue
+                }
+                if ($code -ne 200) { throw "Official CHM download returned HTTP $code for '$current'." }
+
+                if ($null -eq $InternalTestHooks) {
+                    if ($null -eq $httpResponse.Content) { throw 'Official CHM download returned no response content.' }
+                    if ($httpResponse.Content.Headers.ContentEncoding.Count -ne 0) {
+                        throw 'Official CHM download unexpectedly used content encoding.'
+                    }
+                    $contentLength = $httpResponse.Content.Headers.ContentLength
+                    $lastModified = if ($httpResponse.Content.Headers.Contains('Last-Modified')) {
+                        [string](@($httpResponse.Content.Headers.GetValues('Last-Modified'))[0])
+                    } else { $null }
+                    $etag = if ($null -eq $httpResponse.Headers.ETag) { $null } else { [string]$httpResponse.Headers.ETag }
+                    $responseUri = $current
+                    $input = $httpResponse.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+                } else {
+                    $contentLength = [int64]$testResponse.ContentLength
+                    $lastModified = if ([string]::IsNullOrWhiteSpace($testResponse.Headers['Last-Modified'])) { $null } else { [string]$testResponse.Headers['Last-Modified'] }
+                    $etag = if ([string]::IsNullOrWhiteSpace($testResponse.Headers['ETag'])) { $null } else { [string]$testResponse.Headers['ETag'] }
+                    $responseUri = [uri]$testResponse.ResponseUri
+                    $input = $testResponse.GetResponseStream()
+                }
+
+                if ($responseUri.Scheme -ne 'https' -or $responseUri.IdnHost -cne 'www.mql5.com' -or
+                    (-not $responseUri.IsDefaultPort -and $responseUri.Port -ne 443)) {
+                    throw "Final download endpoint is not HTTPS www.mql5.com: $responseUri"
+                }
+                if ($null -eq $input) { throw 'Official CHM download returned no response stream.' }
+                if ($null -ne $contentLength -and [int64]$contentLength -ge 0 -and
+                    ([int64]$contentLength -lt $MinimumBytes -or [int64]$contentLength -gt $MaximumBytes)) {
+                    throw "Official CHM Content-Length is outside the allowed range: $contentLength"
+                }
+
+                $downloadSha = [Security.Cryptography.SHA256]::Create()
+                try {
+                    $written = Copy-StreamToFileBounded `
+                        -Stream $input `
+                        -Destination $target `
+                        -MaximumBytes $MaximumBytes `
+                        -CancellationToken $deadline.Token `
+                        -HashAlgorithm $downloadSha
+                    $sha256 = ([BitConverter]::ToString($downloadSha.Hash)).Replace('-','').ToLowerInvariant()
+                } finally {
+                    $downloadSha.Dispose()
+                }
+                if ($written -lt $MinimumBytes) { throw "Official CHM download is too small: $written bytes." }
+
+                $deadline.Token.ThrowIfCancellationRequested()
+                $signature = New-Object byte[] 4
+                $verify = [IO.File]::OpenRead($target)
+                try {
+                    if ($verify.Read($signature,0,4) -ne 4 -or
+                        [Text.Encoding]::ASCII.GetString($signature) -ne 'ITSF') {
+                        throw 'Downloaded file is not a compiled HTML Help file.'
+                    }
+                } finally { $verify.Dispose() }
+                $deadline.Token.ThrowIfCancellationRequested()
+                return [pscustomobject]@{
+                    Path=$target
+                    Sha256=$sha256
+                    Bytes=$written
+                    HttpLastModified=$lastModified
+                    HttpEtag=$etag
+                    RetrievedAt=[DateTime]::UtcNow.ToString('O')
+                    FinalUri=[string]$responseUri
+                }
+            } finally {
+                if ($null -ne $input) { $input.Dispose() }
+                if ($null -ne $httpResponse) { $httpResponse.Dispose() }
+                if ($null -ne $testResponse) { $testResponse.Dispose() }
+                if ($null -ne $request) { $request.Dispose() }
+            }
+        }
+    } catch {
+        if (Test-Path -LiteralPath $target -PathType Leaf) { Remove-Item -LiteralPath $target -Force }
+        if ($deadline.IsCancellationRequested) {
+            throw "Official CHM download exceeded its $TimeoutSeconds-second deadline."
+        }
+        throw
+    } finally {
+        if ($null -ne $client) { $client.Dispose() }
+        $deadline.Dispose()
+    }
 }
 
 function Get-ValidatedRevisionChecksumFiles {
@@ -3308,6 +3751,11 @@ function Assert-PackageChecksums {
         'scripts\IndexMaintenance.ps1',
         'scripts\SevenZipRuntime.ps1',
         'scripts\StageInstallRecovery.ps1',
+        'scripts\Smoke-Test-McpServer.mjs',
+        'scripts\Compare-OfficialDocumentationHashes.ps1',
+        'scripts\Test-DocumentationFreshness.ps1',
+        'scripts\Test-PowerShellSyntax.ps1',
+        'scripts\Invoke-PowerShellTestSuite.ps1',
         'scripts\Install-Codex.ps1',
         'scripts\Rebuild-Index.ps1',
         'scripts\Uninstall-Codex.ps1',
