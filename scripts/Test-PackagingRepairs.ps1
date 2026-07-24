@@ -273,10 +273,10 @@ try {
     $secondNodeDirectory = Join-Path $nodeSelectionRoot 'node-second'
     New-Item -ItemType Directory -Path $fallbackProjectRoot -Force | Out-Null
     $nodeFixtureDirectory = Split-Path -Parent $nodeFixtureSource
-    New-Item -ItemType Junction -Path $firstNodeDirectory -Target $nodeFixtureDirectory | Out-Null
-    New-Item -ItemType Junction -Path $secondNodeDirectory -Target $nodeFixtureDirectory | Out-Null
     $priorPath = $env:PATH
     try {
+        New-Item -ItemType Junction -Path $firstNodeDirectory -Target $nodeFixtureDirectory | Out-Null
+        New-Item -ItemType Junction -Path $secondNodeDirectory -Target $nodeFixtureDirectory | Out-Null
         $env:PATH = "$firstNodeDirectory;$secondNodeDirectory;$priorPath"
         $visibleNodeCommands = @(Get-Command node.exe -CommandType Application -ErrorAction Stop)
         Assert-Test ($visibleNodeCommands.Count -ge 2) 'Multi-install Node fixture did not expose two PATH candidates.'
@@ -293,8 +293,16 @@ try {
         ) 'Selected multi-install Node fixture did not preserve pinned runtime validation.'
     } finally {
         $env:PATH = $priorPath
+        $junctionCleanupErrors = @()
         foreach ($junction in @($firstNodeDirectory,$secondNodeDirectory)) {
-            if (Test-Path -LiteralPath $junction) { [IO.Directory]::Delete($junction) }
+            try {
+                if (Test-Path -LiteralPath $junction) { [IO.Directory]::Delete($junction) }
+            } catch {
+                $junctionCleanupErrors += "$junction`: $($_.Exception.Message)"
+            }
+        }
+        if ($junctionCleanupErrors.Count -gt 0) {
+            throw "Could not clean multi-install Node fixture junctions: $($junctionCleanupErrors -join '; ')"
         }
     }
 
