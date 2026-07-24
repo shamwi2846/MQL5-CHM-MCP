@@ -267,6 +267,14 @@ test("release validation runs full suites under PowerShell 7 and Windows PowerSh
   assert.equal(setupNodeInputs.get("node-version"), "24.17.0");
   assert.equal(setupNodeInputs.get("package-manager-cache"), "false");
   assert.equal(setupNodeInputs.has("cache"), false);
+  const nodeBindingStep = workflowSteps(workflow)
+    .find((step) => step.includes("Bind MCP subprocess tests to setup-node"));
+  assert.ok(nodeBindingStep, "release validation does not bind subprocess tests to setup-node");
+  assert.match(
+    nodeBindingStep,
+    /\$nodeCommand\s*=\s*Get-Command node\.exe[\s\S]*\|\s*\n\s*Select-Object -First 1/u,
+  );
+  assert.match(nodeBindingStep, /\$nodePath\s*=\s*\[string\]\$nodeCommand\.Source/u);
   assert.match(workflow, /npm run test:release/u);
   assert.match(workflow, /Package-Portable\.ps1/u);
   assert.match(workflow, /SHA-256|sha256|Get-FileHash/u);
