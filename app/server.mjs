@@ -3638,21 +3638,21 @@ var require_fast_uri = __commonJS({
         normalizeString(uri, options);
       } else if (typeof uri === "object") {
         uri = /** @type {T} */
-        parse3(serialize(uri, options), options);
+        parse4(serialize(uri, options), options);
       }
       return uri;
     }
     function resolve3(baseURI, relativeURI, options) {
       const schemelessOptions = options ? Object.assign({ scheme: "null" }, options) : { scheme: "null" };
-      const resolved = resolveComponent(parse3(baseURI, schemelessOptions), parse3(relativeURI, schemelessOptions), schemelessOptions, true);
+      const resolved = resolveComponent(parse4(baseURI, schemelessOptions), parse4(relativeURI, schemelessOptions), schemelessOptions, true);
       schemelessOptions.skipEscape = true;
       return serialize(resolved, schemelessOptions);
     }
     function resolveComponent(base, relative2, options, skipNormalization) {
       const target = {};
       if (!skipNormalization) {
-        base = parse3(serialize(base, options), options);
-        relative2 = parse3(serialize(relative2, options), options);
+        base = parse4(serialize(base, options), options);
+        relative2 = parse4(serialize(relative2, options), options);
       }
       options = options || {};
       if (!options.tolerant && relative2.scheme) {
@@ -3881,7 +3881,7 @@ var require_fast_uri = __commonJS({
       }
       return { parsed, malformedAuthorityOrPort };
     }
-    function parse3(uri, opts) {
+    function parse4(uri, opts) {
       return parseWithStatus(uri, opts).parsed;
     }
     function normalizeString(uri, opts) {
@@ -3910,7 +3910,7 @@ var require_fast_uri = __commonJS({
       resolveComponent,
       equal,
       serialize,
-      parse: parse3
+      parse: parse4
     };
     module.exports = fastUri;
     module.exports.default = fastUri;
@@ -8490,7 +8490,7 @@ var require_decoder = __commonJS({
           }).bind(this);
           xhr.send(null);
         },
-        parse: function parse3(data) {
+        parse: function parse4(data) {
           var maxResolutionInPixels = this.opts.maxResolutionInMP * 1e3 * 1e3;
           var offset = 0, length = data.length;
           function readUint16() {
@@ -33127,7 +33127,7 @@ import {
   realpathSync,
   statSync
 } from "node:fs";
-import { dirname, extname, isAbsolute, relative, resolve, sep } from "node:path";
+import { dirname, extname, isAbsolute, parse as parse3, relative, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { inflateSync } from "node:zlib";
@@ -33365,10 +33365,6 @@ function canonicalPath(pathname) {
 function assertConfined(root, pathname, label) {
   const absoluteRoot = resolve(root);
   const absolutePath = resolve(pathname);
-  const pathFromRoot = relative(canonicalPath(absoluteRoot), canonicalPath(absolutePath));
-  if (pathFromRoot === ".." || pathFromRoot.startsWith(`..${sep}`) || isAbsolute(pathFromRoot)) {
-    fail("PATH_ESCAPE", `${label} is outside the MCP package root.`);
-  }
   let realRoot;
   let realPath;
   try {
@@ -33390,13 +33386,19 @@ function assertNoReparse(pathname, label, expectedKind) {
   } catch (error51) {
     fail("MISSING_PACKAGE_FILE", `${label} is missing or inaccessible.`, { cause: error51 });
   }
-  let resolvesToSelf = false;
+  let traversesReparse = true;
   try {
-    resolvesToSelf = canonicalPath(resolve(realpathSync.native(pathname))) === canonicalPath(resolve(pathname));
+    const absolutePath = resolve(pathname);
+    const filesystemRoot = parse3(absolutePath).root;
+    let cursor = filesystemRoot;
+    traversesReparse = relative(filesystemRoot, absolutePath).split(sep).filter(Boolean).some((segment) => {
+      cursor = resolve(cursor, segment);
+      return lstatSync(cursor).isSymbolicLink();
+    });
   } catch {
-    resolvesToSelf = false;
+    traversesReparse = true;
   }
-  if (info.isSymbolicLink() || !resolvesToSelf || expectedKind === "file" && !info.isFile() || expectedKind === "directory" && !info.isDirectory()) {
+  if (info.isSymbolicLink() || traversesReparse || expectedKind === "file" && !info.isFile() || expectedKind === "directory" && !info.isDirectory()) {
     fail("INVALID_PACKAGE_FILE", `${label} is not an approved regular ${expectedKind}.`);
   }
   return info;
@@ -33954,15 +33956,13 @@ function listAssetTree(assetRoot, revisionRoot) {
   const directories = /* @__PURE__ */ new Set(["assets"]);
   const visit = (directory) => {
     const directoryInfo = lstatSync(directory);
-    const realDirectory = realpathSync.native(directory);
-    if (directoryInfo.isSymbolicLink() || !directoryInfo.isDirectory() || canonicalPath(resolve(realDirectory)) !== canonicalPath(resolve(directory))) {
+    if (directoryInfo.isSymbolicLink() || !directoryInfo.isDirectory()) {
       throw new Error("Asset tree contains a reparse point or invalid directory.");
     }
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       const pathname = resolve(directory, entry.name);
       const info = lstatSync(pathname);
-      const realPath = realpathSync.native(pathname);
-      if (entry.isSymbolicLink() || info.isSymbolicLink() || canonicalPath(resolve(realPath)) !== canonicalPath(resolve(pathname))) {
+      if (entry.isSymbolicLink() || info.isSymbolicLink()) {
         throw new Error("Asset tree contains a reparse point.");
       }
       const key = relative(revisionRoot, pathname).split(sep).join("/");
