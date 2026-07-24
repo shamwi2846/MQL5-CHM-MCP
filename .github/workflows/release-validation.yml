@@ -47,7 +47,9 @@ jobs:
       - name: Bind MCP subprocess tests to setup-node
         shell: pwsh
         run: |
-          $nodePath = (Get-Command node.exe -CommandType Application -ErrorAction Stop).Source
+          $nodeCommand = Get-Command node.exe -CommandType Application -ErrorAction Stop |
+              Select-Object -First 1
+          $nodePath = [string]$nodeCommand.Source
           $nodeVersion = (& $nodePath --version).Trim()
           if ($LASTEXITCODE -ne 0 -or $nodeVersion -cne 'v24.17.0') {
               throw "Expected setup-node v24.17.0, found '$nodeVersion' at '$nodePath'."
