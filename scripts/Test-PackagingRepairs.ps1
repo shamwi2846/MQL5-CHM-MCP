@@ -376,6 +376,41 @@ try {
         catch { $typedSidecarRejected = $true }
         Assert-Test $typedSidecarRejected "Portable ZIP sidecar accepted string-typed $typedMutation."
     }
+    foreach ($decimalMutation in @('schema_version','bytes')) {
+        $schemaToken = if ($decimalMutation -ceq 'schema_version') { '1.0' } else { '1' }
+        $bytesToken = if ($decimalMutation -ceq 'bytes') { "$($strictDescriptor.Bytes).0" } else { [string]$strictDescriptor.Bytes }
+        $decimalSidecarJson = "{`"schema_version`":$schemaToken,`"file`":`"strict-portable.zip`",`"bytes`":$bytesToken,`"sha256`":`"$($strictDescriptor.Sha256)`"}"
+        [IO.File]::WriteAllText($strictSidecarPath,$decimalSidecarJson,$utf8)
+        $decimalSidecarRejected = $false
+        try { Assert-PortableZipSidecar -ZipPath $strictZipPath -ManifestPath $strictSidecarPath -ExpectedFile 'strict-portable.zip' | Out-Null }
+        catch { $decimalSidecarRejected = $true }
+        Assert-Test $decimalSidecarRejected "Portable ZIP sidecar accepted decimal-encoded $decimalMutation."
+    }
+    $transactionZipPath = Join-Path $testRoot 'transaction-portable.zip'
+    $transactionSidecarPath = "$transactionZipPath.manifest.json"
+    New-TestZipAndSidecar -Root $testRoot -ZipPath $transactionZipPath -ManifestPath $transactionSidecarPath -ExpectedFile 'transaction-portable.zip'
+    $transactionZipDescriptor = Get-Descriptor -Path $transactionZipPath
+    $transactionZipState = [pscustomobject]@{
+        Item=[pscustomobject]@{target='transaction-portable.zip';new_bytes=$transactionZipDescriptor.Bytes;new_sha256=$transactionZipDescriptor.Sha256}
+        CandidateSource=$transactionZipPath
+    }
+    $transactionManifestState = [pscustomobject]@{
+        Item=[pscustomobject]@{target='transaction-portable.zip.manifest.json';new_bytes=0;new_sha256=''}
+        CandidateSource=$transactionSidecarPath
+    }
+    foreach ($decimalMutation in @('schema_version','bytes')) {
+        $schemaToken = if ($decimalMutation -ceq 'schema_version') { '1.0' } else { '1' }
+        $bytesToken = if ($decimalMutation -ceq 'bytes') { "$($transactionZipDescriptor.Bytes).0" } else { [string]$transactionZipDescriptor.Bytes }
+        $decimalSidecarJson = "{`"schema_version`":$schemaToken,`"file`":`"transaction-portable.zip`",`"bytes`":$bytesToken,`"sha256`":`"$($transactionZipDescriptor.Sha256)`"}"
+        [IO.File]::WriteAllText($transactionSidecarPath,$decimalSidecarJson,$utf8)
+        $transactionManifestDescriptor = Get-Descriptor -Path $transactionSidecarPath
+        $transactionManifestState.Item.new_bytes = $transactionManifestDescriptor.Bytes
+        $transactionManifestState.Item.new_sha256 = $transactionManifestDescriptor.Sha256
+        $decimalTransactionSidecarRejected = $false
+        try { Assert-PortableTransactionPairSemantics -States @($transactionZipState,$transactionManifestState) -SetKind candidate }
+        catch { $decimalTransactionSidecarRejected = $true }
+        Assert-Test $decimalTransactionSidecarRejected "Portable transaction recovery accepted decimal-encoded sidecar $decimalMutation."
+    }
     $canonicalArchive = [IO.Compression.ZipFile]::OpenRead($reproducibleRoots[0].Zip)
     try {
         Assert-Test ((@($canonicalArchive.Entries | ForEach-Object FullName) -join '|') -ceq 'portable/alpha.txt|portable/Beta.txt|portable/nested/payload.txt') 'Canonical ZIP entry ordering changed.'
@@ -404,6 +439,33 @@ try {
     Add-PortableArchivePathNode -Nodes $normalNodes -Path 'portable/alpha.txt' -Kind File -Context 'test archive'
     Add-PortableArchivePathNode -Nodes $normalNodes -Path 'portable/Beta.txt' -Kind File -Context 'test archive'
     Assert-Test ($normalNodes.Count -eq 3) 'Archive path-node validation rejected normal mixed-case siblings.'
+    foreach ($reservedDeviceLeaf in @(
+        "COM$([char]0x00B9).txt",
+        "LPT$([char]0x00B2)",
+        "COM$([char]0x00B3).payload"
+    )) {
+        $reservedDeviceRejected = $false
+        try {
+            $reservedNodes = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
+            Add-PortableArchivePathNode -Nodes $reservedNodes -Path "portable/$reservedDeviceLeaf" -Kind File -Context 'test archive'
+        } catch {
+            $reservedDeviceRejected = $_.Exception.Message -match 'Windows'
+        }
+        Assert-Test $reservedDeviceRejected "Archive path-node validation accepted reserved Windows device '$reservedDeviceLeaf'."
+    }
+    foreach ($ordinaryDeviceLikeLeaf in @(
+        "COM$([char]0x00C2).txt",
+        "LPT$([char]0x00C2).payload"
+    )) {
+        $ordinaryDeviceLikeAccepted = $true
+        try {
+            $ordinaryNodes = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
+            Add-PortableArchivePathNode -Nodes $ordinaryNodes -Path "portable/$ordinaryDeviceLikeLeaf" -Kind File -Context 'test archive'
+        } catch {
+            $ordinaryDeviceLikeAccepted = $false
+        }
+        Assert-Test $ordinaryDeviceLikeAccepted "Archive path-node validation rejected ordinary Windows filename '$ordinaryDeviceLikeLeaf'."
+    }
 
     $successfulNodeFixture = New-NodeBootstrapFixture -Name 'successful-truncated-runtime-repair'
     $repairedNode = Ensure-PinnedNodeRuntime -ProjectRoot $successfulNodeFixture -InternalTestHooks (New-NodeBootstrapTestHooks)
@@ -529,6 +591,23 @@ try {
     finally { $deadline.Dispose(); $timeoutStream.Dispose() }
     Assert-Test $timeoutRejected 'Cancelled download stream was accepted.'
     Assert-Test (-not (Test-Path -LiteralPath $timeoutPath)) 'Cancelled download left a partial file.'
+
+    $downloadJunctionTarget = Join-Path $testRoot 'download-junction-target'
+    $downloadJunction = Join-Path $testRoot 'download-junction'
+    New-Item -ItemType Directory -Path $downloadJunctionTarget | Out-Null
+    New-Item -ItemType Junction -Path $downloadJunction -Target $downloadJunctionTarget | Out-Null
+    $junctionStream = [IO.MemoryStream]::new([Text.Encoding]::UTF8.GetBytes('must-not-be-written'), $false)
+    $junctionDownloadRejected = $false
+    try {
+        Copy-StreamToFileBounded -Stream $junctionStream -Destination (Join-Path $downloadJunction 'redirected.bin') -MaximumBytes 64 -CancellationToken ([Threading.CancellationToken]::None) | Out-Null
+    } catch {
+        $junctionDownloadRejected = $_.Exception.Message -match 'reparse point'
+    } finally {
+        $junctionStream.Dispose()
+        [IO.Directory]::Delete($downloadJunction)
+    }
+    Assert-Test $junctionDownloadRejected 'Bounded download accepted a destination beneath a reparse-point parent.'
+    Assert-Test (-not (Test-Path -LiteralPath (Join-Path $downloadJunctionTarget 'redirected.bin'))) 'Rejected reparse-point download changed the external target.'
 
     $badArchiveFixture = New-NodeBootstrapFixture -Name 'bad-archive-hash'
     $badArchiveHooks = New-NodeBootstrapTestHooks

@@ -646,6 +646,7 @@ function Copy-StreamToFileBounded {
     )
     $destinationFull = Resolve-FullPath -Path $Destination
     $parent = Resolve-FullPath -Path (Split-Path -Parent $destinationFull) -MustExist -PathType Container
+    Assert-NoReparsePoint -Root $parent -Path $destinationFull
     if (Test-Path -LiteralPath $destinationFull) { throw "Download destination already exists: $destinationFull" }
     $output = $null
     try {
@@ -1502,7 +1503,7 @@ function Add-PortableArchivePathNode {
             throw "$Context contains a Windows path component longer than 255 characters: $Path"
         }
         if ($segment.EndsWith('.') -or $segment.EndsWith(' ') -or
-            $segment -match '^(CON|PRN|AUX|NUL|CLOCK\$|CONIN\$|CONOUT\$|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)') {
+            $segment -match '^(CON|PRN|AUX|NUL|CLOCK\$|CONIN\$|CONOUT\$|COM[1-9\u00B9\u00B2\u00B3]|LPT[1-9\u00B9\u00B2\u00B3])(?:\.|$)') {
             throw "$Context contains an invalid Windows archive path node: $Path"
         }
     }
@@ -1663,10 +1664,10 @@ function Assert-PortableZipSidecar {
     $numericBytes = Get-TransactionJsonValue -Object $numericManifest -Name 'bytes'
     $zipItem = Get-FileSystemItemOrFallback -Path $zipFull
     if ([string]::IsNullOrWhiteSpace($ExpectedFile)) { $ExpectedFile = [IO.Path]::GetFileName($zipFull) }
-    if (-not (Test-TransactionJsonInteger $numericSchemaVersion) -or [int64]$manifest.schema_version -ne 1 -or
+    if (-not (Test-TransactionJsonInteger $numericSchemaVersion) -or [int64]$numericSchemaVersion -ne 1 -or
         -not ($manifest.file -is [string]) -or [string]$manifest.file -cne $ExpectedFile -or
-        -not (Test-TransactionJsonInteger $numericBytes) -or [int64]$manifest.bytes -lt 0 -or
-        [int64]$manifest.bytes -ne [int64]$zipItem.Length -or
+        -not (Test-TransactionJsonInteger $numericBytes) -or [int64]$numericBytes -lt 0 -or
+        [int64]$numericBytes -ne [int64]$zipItem.Length -or
         -not ($manifest.sha256 -is [string]) -or [string]$manifest.sha256 -cnotmatch '^[0-9a-f]{64}$') {
         throw 'Portable ZIP sidecar manifest is structurally invalid or does not describe its ZIP.'
     }
@@ -1721,9 +1722,12 @@ function Assert-PortableTransactionPairSemantics {
     Assert-PortableZipInternalChecksumClosure -ZipPath $zipPath | Out-Null
     $sidecar = Read-JsonFile -Path $manifestPath -Context "portable transaction $SetKind sidecar"
     Assert-ExactJsonProperties -Object $sidecar -Names @('schema_version','file','bytes','sha256') -Context "portable transaction $SetKind sidecar"
-    if (-not (Test-TransactionJsonInteger $sidecar.schema_version) -or [int64]$sidecar.schema_version -ne 1 -or
+    $numericSidecar = Get-TransactionJsonNumericView -Path $manifestPath -Parsed $sidecar -Context "portable transaction $SetKind sidecar"
+    $numericSchemaVersion = Get-TransactionJsonValue -Object $numericSidecar -Name 'schema_version'
+    $numericBytes = Get-TransactionJsonValue -Object $numericSidecar -Name 'bytes'
+    if (-not (Test-TransactionJsonInteger $numericSchemaVersion) -or [int64]$numericSchemaVersion -ne 1 -or
         -not ($sidecar.file -is [string]) -or [string]$sidecar.file -cne $zipLeaf -or
-        -not (Test-TransactionJsonInteger $sidecar.bytes) -or [int64]$sidecar.bytes -ne $zipBytes -or
+        -not (Test-TransactionJsonInteger $numericBytes) -or [int64]$numericBytes -ne $zipBytes -or
         -not ($sidecar.sha256 -is [string]) -or [string]$sidecar.sha256 -cne $zipSha256) {
         throw "Portable transaction $SetKind sidecar does not strictly describe its ZIP target and descriptor."
     }
