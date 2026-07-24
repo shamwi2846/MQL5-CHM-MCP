@@ -105,6 +105,24 @@ function actionStepInputs(step) {
   return inputs;
 }
 
+function actionStepBlockInputLines(step, inputName) {
+  const lines = step.split(/\r?\n/u);
+  for (let index = 0; index < lines.length; index += 1) {
+    const entry = /^(\s*)([A-Za-z0-9_-]+):\s*\|\s*$/u.exec(lines[index]);
+    if (!entry || entry[2] !== inputName) continue;
+    const indentation = entry[1].length;
+    const values = [];
+    for (let valueIndex = index + 1; valueIndex < lines.length; valueIndex += 1) {
+      if (lines[valueIndex].trim() === "") continue;
+      const valueIndentation = /^\s*/u.exec(lines[valueIndex])[0].length;
+      if (valueIndentation <= indentation) break;
+      values.push(lines[valueIndex].slice(indentation + 2));
+    }
+    return values;
+  }
+  return undefined;
+}
+
 async function runReleaseVersionCheck({
   packageVersion = "1.2.3",
   lockVersion = packageVersion,
@@ -252,6 +270,26 @@ test("release validation runs full suites under PowerShell 7 and Windows PowerSh
   assert.match(workflow, /npm run test:release/u);
   assert.match(workflow, /Package-Portable\.ps1/u);
   assert.match(workflow, /SHA-256|sha256|Get-FileHash/u);
+});
+
+test("release validation retains the exact verified ZIP and sidecar", async () => {
+  const workflow = await text(".github/workflows/release-validation.yml");
+  const buildIndex = workflow.indexOf("Build the portable package twice and compare SHA-256");
+  const uploadIndex = workflow.indexOf("Retain verified release assets");
+  assert.ok(buildIndex >= 0 && uploadIndex > buildIndex, "release assets are not retained after validation");
+
+  const uploadSteps = verifiedActionSteps(workflow, "actions/upload-artifact@", "release validation");
+  assert.equal(uploadSteps.length, 1);
+  assert.equal(actionStepUses(uploadSteps[0]), "actions/upload-artifact@v7");
+  const uploadInputs = actionStepInputs(uploadSteps[0]);
+  assert.equal(uploadInputs.get("name"), "mql5-chm-mcp-release-${{ github.sha }}");
+  assert.equal(uploadInputs.get("if-no-files-found"), "error");
+  assert.equal(uploadInputs.get("retention-days"), "7");
+  assert.equal(uploadInputs.get("compression-level"), "0");
+  assert.deepEqual(actionStepBlockInputLines(uploadSteps[0], "path"), [
+    "build/release-proof-first/mql5-chm-mcp-windows-x64.zip",
+    "build/release-proof-first/mql5-chm-mcp-windows-x64.zip.manifest.json",
+  ]);
 });
 
 test("release validation binds tag and lockfile versions before downloading a corpus fixture", async () => {

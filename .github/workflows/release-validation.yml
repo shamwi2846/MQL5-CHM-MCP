@@ -142,10 +142,30 @@ jobs:
           & .\Package-Portable.ps1 -OutputDirectory $second
           $firstZip = Join-Path $first 'mql5-chm-mcp-windows-x64.zip'
           $secondZip = Join-Path $second 'mql5-chm-mcp-windows-x64.zip'
+          $firstSidecar = "$firstZip.manifest.json"
+          $secondSidecar = "$secondZip.manifest.json"
           $firstHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $firstZip).Hash
           $secondHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $secondZip).Hash
           if ($firstHash -cne $secondHash) {
               throw "Byte-reproducible package check failed: $firstHash != $secondHash"
           }
+          $firstSidecarHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $firstSidecar).Hash
+          $secondSidecarHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $secondSidecar).Hash
+          if ($firstSidecarHash -cne $secondSidecarHash) {
+              throw "Byte-reproducible sidecar check failed: $firstSidecarHash != $secondSidecarHash"
+          }
           "Portable ZIP SHA-256: ``$($firstHash.ToLowerInvariant())``" |
               Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "Portable sidecar SHA-256: ``$($firstSidecarHash.ToLowerInvariant())``" |
+              Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Retain verified release assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: mql5-chm-mcp-release-${{ github.sha }}
+          path: |
+            build/release-proof-first/mql5-chm-mcp-windows-x64.zip
+            build/release-proof-first/mql5-chm-mcp-windows-x64.zip.manifest.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
