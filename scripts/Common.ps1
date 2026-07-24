@@ -733,11 +733,11 @@ function Copy-FileDurable {
     $sourceFull = Resolve-FullPath -Path $Source -MustExist -PathType Leaf
     $destinationFull = Resolve-FullPath -Path $Destination
     if (Test-Path -LiteralPath $destinationFull) { throw "Durable copy destination already exists: $destinationFull" }
-    $input = [IO.File]::Open($sourceFull, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $sourceStream = [IO.File]::Open($sourceFull, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     $output = $null
     try {
         $output = New-Object IO.FileStream($destinationFull, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None, 1048576, [IO.FileOptions]::WriteThrough)
-        $input.CopyTo($output, 1048576)
+        $sourceStream.CopyTo($output, 1048576)
         $output.Flush($true)
     } catch {
         if ($null -ne $output) { $output.Dispose(); $output = $null }
@@ -745,7 +745,7 @@ function Copy-FileDurable {
         throw
     } finally {
         if ($null -ne $output) { $output.Dispose() }
-        $input.Dispose()
+        $sourceStream.Dispose()
     }
     return $destinationFull
 }
@@ -3365,7 +3365,7 @@ function Invoke-OfficialChmDownload {
             $request = $null
             $httpResponse = $null
             $testResponse = $null
-            $input = $null
+            $responseStream = $null
             try {
                 if ($null -eq $InternalTestHooks) {
                     $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Get, $current)
@@ -3420,20 +3420,20 @@ function Invoke-OfficialChmDownload {
                     } else { $null }
                     $etag = if ($null -eq $httpResponse.Headers.ETag) { $null } else { [string]$httpResponse.Headers.ETag }
                     $responseUri = $current
-                    $input = $httpResponse.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+                    $responseStream = $httpResponse.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
                 } else {
                     $contentLength = [int64]$testResponse.ContentLength
                     $lastModified = if ([string]::IsNullOrWhiteSpace($testResponse.Headers['Last-Modified'])) { $null } else { [string]$testResponse.Headers['Last-Modified'] }
                     $etag = if ([string]::IsNullOrWhiteSpace($testResponse.Headers['ETag'])) { $null } else { [string]$testResponse.Headers['ETag'] }
                     $responseUri = [uri]$testResponse.ResponseUri
-                    $input = $testResponse.GetResponseStream()
+                    $responseStream = $testResponse.GetResponseStream()
                 }
 
                 if ($responseUri.Scheme -ne 'https' -or $responseUri.IdnHost -cne 'www.mql5.com' -or
                     (-not $responseUri.IsDefaultPort -and $responseUri.Port -ne 443)) {
                     throw "Final download endpoint is not HTTPS www.mql5.com: $responseUri"
                 }
-                if ($null -eq $input) { throw 'Official CHM download returned no response stream.' }
+                if ($null -eq $responseStream) { throw 'Official CHM download returned no response stream.' }
                 if ($null -ne $contentLength -and [int64]$contentLength -ge 0 -and
                     ([int64]$contentLength -lt $MinimumBytes -or [int64]$contentLength -gt $MaximumBytes)) {
                     throw "Official CHM Content-Length is outside the allowed range: $contentLength"
@@ -3442,7 +3442,7 @@ function Invoke-OfficialChmDownload {
                 $downloadSha = [Security.Cryptography.SHA256]::Create()
                 try {
                     $written = Copy-StreamToFileBounded `
-                        -Stream $input `
+                        -Stream $responseStream `
                         -Destination $target `
                         -MaximumBytes $MaximumBytes `
                         -CancellationToken $deadline.Token `
@@ -3473,7 +3473,7 @@ function Invoke-OfficialChmDownload {
                     FinalUri=[string]$responseUri
                 }
             } finally {
-                if ($null -ne $input) { $input.Dispose() }
+                if ($null -ne $responseStream) { $responseStream.Dispose() }
                 if ($null -ne $httpResponse) { $httpResponse.Dispose() }
                 if ($null -ne $testResponse) { $testResponse.Dispose() }
                 if ($null -ne $request) { $request.Dispose() }
@@ -3742,6 +3742,7 @@ function Assert-PackageChecksums {
         'Check-DocumentationUpdates.ps1',
         'Update-Documentation.ps1',
         'Rollback-Documentation.ps1',
+        'package.json',
         'README.md',
         'SPEC.md',
         'scripts\build.mjs',

@@ -937,6 +937,7 @@ $rootFiles = @(
     'Check-DocumentationUpdates.ps1',
     'Update-Documentation.ps1',
     'Rollback-Documentation.ps1',
+    'package.json',
     'README.md',
     'SPEC.md'
 )

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -11,6 +11,98 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 async function text(relativePath) {
   return readFile(path.join(root, relativePath), "utf8");
+}
+
+function workflowSteps(workflow) {
+  const lines = workflow.split(/\r?\n/u);
+  const steps = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const start = /^(\s*)-\s+\S/u.exec(lines[index]);
+    if (!start) continue;
+    const indentation = start[1].length;
+    let end = index + 1;
+    while (end < lines.length) {
+      if (lines[end].trim() === "") {
+        end += 1;
+        continue;
+      }
+      const nextIndentation = /^\s*/u.exec(lines[end])[0].length;
+      if (nextIndentation <= indentation) break;
+      end += 1;
+    }
+    steps.push(lines.slice(index, end).join("\n"));
+    index = end - 1;
+  }
+  return steps;
+}
+
+function yamlScalar(value) {
+  let result = value.trim();
+  if (
+    result.length >= 2
+    && ((result.startsWith("'") && result.endsWith("'"))
+      || (result.startsWith("\"") && result.endsWith("\"")))
+  ) {
+    result = result.slice(1, -1);
+  }
+  return result;
+}
+
+function actionStepUses(step) {
+  const lines = step.split(/\r?\n/u);
+  const stepIndentation = /^(\s*)-/u.exec(lines[0])?.[1].length;
+  assert.notEqual(stepIndentation, undefined, "invalid workflow step fixture");
+  const propertyIndentation = stepIndentation + 2;
+  for (let index = 0; index < lines.length; index += 1) {
+    const indentation = /^\s*/u.exec(lines[index])[0].length;
+    if (index > 0 && indentation !== propertyIndentation) continue;
+    const entry = index === 0
+      ? /^\s*-\s+(?:uses|'uses'|"uses"):\s*(.*?)\s*$/u.exec(lines[index])
+      : /^\s*(?:uses|'uses'|"uses"):\s*(.*?)\s*$/u.exec(lines[index]);
+    if (entry) return yamlScalar(entry[1]);
+  }
+  return undefined;
+}
+
+function actionSteps(workflow, actionPrefix) {
+  const normalizedPrefix = actionPrefix.toLowerCase();
+  return workflowSteps(workflow)
+    .filter((step) => actionStepUses(step)?.toLowerCase().startsWith(normalizedPrefix));
+}
+
+function verifiedActionSteps(workflow, actionPrefix, context = "workflow") {
+  const steps = actionSteps(workflow, actionPrefix);
+  const lexicalMentions = workflow.toLowerCase().split(actionPrefix.toLowerCase()).length - 1;
+  assert.equal(
+    steps.length,
+    lexicalMentions,
+    `${context} contains an ${actionPrefix} reference in unsupported YAML syntax`,
+  );
+  return steps;
+}
+
+function actionStepInputs(step) {
+  const lines = step.split(/\r?\n/u);
+  const stepIndentation = /^(\s*)-/u.exec(lines[0])?.[1].length;
+  assert.notEqual(stepIndentation, undefined, "invalid workflow step fixture");
+  const propertyIndentation = stepIndentation + 2;
+  const withIndex = lines.findIndex((line) => {
+    const match = /^(\s*)(?:with|'with'|"with"):\s*$/u.exec(line);
+    return match && match[1].length === propertyIndentation;
+  });
+  if (withIndex < 0) return new Map();
+
+  const inputs = new Map();
+  for (let index = withIndex + 1; index < lines.length; index += 1) {
+    if (lines[index].trim() === "") continue;
+    const indentation = /^\s*/u.exec(lines[index])[0].length;
+    if (indentation <= propertyIndentation) break;
+    if (indentation !== propertyIndentation + 2) continue;
+    const entry = /^\s*([A-Za-z0-9_-]+|'[^']+'|"[^"]+"):\s*(.*?)\s*$/u.exec(lines[index]);
+    if (!entry) continue;
+    inputs.set(yamlScalar(entry[1]), yamlScalar(entry[2]));
+  }
+  return inputs;
 }
 
 async function runReleaseVersionCheck({
@@ -49,6 +141,52 @@ async function runReleaseVersionCheck({
   }
 }
 
+test("workflow action inspection covers concise and quoted YAML forms", () => {
+  const workflow = `
+jobs:
+  probe:
+    steps:
+      - uses: 'actions/checkout@v7'
+        with:
+          'persist-credentials': 'false'
+      - name: Quoted action and inputs
+        "uses": "actions/setup-node@v7"
+        "with":
+          "cache": "npm"
+      - name: Environment values are not action inputs
+        uses: actions/setup-node@v7
+        env:
+          cache: npm
+`;
+  const checkoutSteps = verifiedActionSteps(workflow, "actions/checkout@", "parser fixture");
+  assert.equal(checkoutSteps.length, 1);
+  assert.equal(actionStepUses(checkoutSteps[0]), "actions/checkout@v7");
+  assert.equal(actionStepInputs(checkoutSteps[0]).get("persist-credentials"), "false");
+
+  const setupNodeSteps = verifiedActionSteps(workflow, "actions/setup-node@", "parser fixture");
+  assert.equal(setupNodeSteps.length, 2);
+  assert.equal(actionStepInputs(setupNodeSteps[0]).get("cache"), "npm");
+  assert.equal(actionStepInputs(setupNodeSteps[1]).has("cache"), false);
+  assert.equal(
+    verifiedActionSteps(
+      "steps:\n  - uses: Actions/Checkout@v7\n",
+      "actions/checkout@",
+      "mixed-case fixture",
+    ).length,
+    1,
+  );
+
+  for (const unsupported of [
+    "steps:\n  - uses: 'actions/checkout@v4' # trailing comment\n",
+    "steps:\n  - { uses: actions/checkout@v4 }\n",
+  ]) {
+    assert.throws(
+      () => verifiedActionSteps(unsupported, "actions/checkout@", "unsupported fixture"),
+      /unsupported YAML syntax/u,
+    );
+  }
+});
+
 test("package scripts expose explicit fast, maintenance, and release suites", async () => {
   const packageJson = JSON.parse(await text("package.json"));
   for (const name of ["test:fast", "test:maintenance", "test:release"]) {
@@ -66,31 +204,51 @@ test("package scripts expose explicit fast, maintenance, and release suites", as
 
 test("Windows CI runs the fast suite on pull requests with the pinned toolchain", async () => {
   const workflow = await text(".github/workflows/windows-ci.yml");
+  const setupNodeSteps = verifiedActionSteps(workflow, "actions/setup-node@", "Windows CI");
   assert.match(workflow, /\bpull_request\s*:/u);
-  assert.match(workflow, /node-version:\s*["']?24\.17\.0/u);
+  assert.equal(setupNodeSteps.length, 1);
+  const setupNodeInputs = actionStepInputs(setupNodeSteps[0]);
+  assert.equal(actionStepUses(setupNodeSteps[0]), "actions/setup-node@v7");
+  assert.equal(setupNodeInputs.get("node-version"), "24.17.0");
+  assert.equal(setupNodeInputs.get("cache"), "npm");
   assert.match(workflow, /npm run test:fast/u);
   assert.match(workflow, /\bpwsh\b/u);
   assert.match(workflow, /\bpowershell(?:\.exe)?\b/u);
 });
 
 test("GitHub workflows never persist checkout credentials", async () => {
-  for (const relativePath of [
-    ".github/workflows/windows-ci.yml",
-    ".github/workflows/release-validation.yml",
-    ".github/workflows/documentation-freshness.yml",
-  ]) {
+  const workflowFiles = (await readdir(path.join(root, ".github", "workflows"), { withFileTypes: true }))
+    .filter((entry) => entry.isFile() && /\.ya?ml$/iu.test(entry.name))
+    .map((entry) => `.github/workflows/${entry.name}`)
+    .sort();
+  assert.ok(workflowFiles.length > 0, "repository has no GitHub workflows");
+  let checkoutCount = 0;
+  for (const relativePath of workflowFiles) {
     const workflow = await text(relativePath);
-    assert.match(
-      workflow,
-      /uses:\s*actions\/checkout@v4\s+with:\s+persist-credentials:\s*false/u,
-      `${relativePath} must disable persisted checkout credentials`,
-    );
+    const checkoutSteps = verifiedActionSteps(workflow, "actions/checkout@", relativePath);
+    checkoutCount += checkoutSteps.length;
+    for (const checkoutStep of checkoutSteps) {
+      assert.equal(actionStepUses(checkoutStep), "actions/checkout@v7");
+      assert.equal(
+        actionStepInputs(checkoutStep).get("persist-credentials"),
+        "false",
+        `${relativePath} must disable persisted credentials on every checkout`,
+      );
+    }
   }
+  assert.ok(checkoutCount > 0, "repository workflows contain no checkout steps");
 });
 
 test("release validation runs full suites under PowerShell 7 and Windows PowerShell 5.1", async () => {
   const workflow = await text(".github/workflows/release-validation.yml");
+  const setupNodeSteps = verifiedActionSteps(workflow, "actions/setup-node@", "release validation");
   assert.match(workflow, /tags:[\s\S]*v\*/u);
+  assert.equal(setupNodeSteps.length, 1);
+  const setupNodeInputs = actionStepInputs(setupNodeSteps[0]);
+  assert.equal(actionStepUses(setupNodeSteps[0]), "actions/setup-node@v7");
+  assert.equal(setupNodeInputs.get("node-version"), "24.17.0");
+  assert.equal(setupNodeInputs.get("package-manager-cache"), "false");
+  assert.equal(setupNodeInputs.has("cache"), false);
   assert.match(workflow, /npm run test:release/u);
   assert.match(workflow, /Package-Portable\.ps1/u);
   assert.match(workflow, /SHA-256|sha256|Get-FileHash/u);

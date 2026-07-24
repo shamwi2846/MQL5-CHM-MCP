@@ -1162,7 +1162,7 @@ function Clear-RevisionTransition { param([string]$ProjectRoot,[object]$Expected
     $packageFixtureFiles = @(
         '.mql5-chm-package-root','runtime\node.exe','runtime\LICENSE','app\server.mjs','app\indexer.mjs',
         'config\mql5-image-policy.json','config\mql5-query-expansions.json','data\active.json','maintenance\.update.lock',
-        'Install-Codex.ps1','Rebuild-Index.ps1','Uninstall-Codex.ps1','Package-Portable.ps1','Check-DocumentationUpdates.ps1','Update-Documentation.ps1','Rollback-Documentation.ps1','README.md','SPEC.md',
+        'Install-Codex.ps1','Rebuild-Index.ps1','Uninstall-Codex.ps1','Package-Portable.ps1','Check-DocumentationUpdates.ps1','Update-Documentation.ps1','Rollback-Documentation.ps1','package.json','README.md','SPEC.md',
         'scripts\build.mjs','scripts\Generate-BundledNotices.mjs','scripts\inspect-database.mjs','scripts\Common.ps1','scripts\IndexMaintenance.ps1','scripts\SevenZipRuntime.ps1','scripts\StageInstallRecovery.ps1','scripts\Smoke-Test-McpServer.mjs','scripts\Compare-OfficialDocumentationHashes.ps1','scripts\Test-DocumentationFreshness.ps1','scripts\Test-PowerShellSyntax.ps1','scripts\Invoke-PowerShellTestSuite.ps1','scripts\Install-Codex.ps1','scripts\Rebuild-Index.ps1','scripts\Uninstall-Codex.ps1','scripts\Package-Portable.ps1','scripts\Check-DocumentationUpdates.ps1','scripts\Update-Documentation.ps1','scripts\Rollback-Documentation.ps1','scripts\Test-Maintenance.ps1','scripts\Test-StageInstallRecovery.ps1',
         'licenses\7ZIP-LICENSE.txt','licenses\BUNDLED-NODE-NOTICES.txt','licenses\bundled-node-dependencies.json','licenses\bundled-node-notice-overrides.json','licenses\overrides\boolbase-1.0.0.txt','licenses\CHEERIO-LICENSE.txt','licenses\ESBUILD-LICENSE.txt','licenses\ICONV-LITE-LICENSE.txt','licenses\JPEG-JS-LICENSE.txt','licenses\MCP-SDK-LICENSE.txt','licenses\NODE-LICENSE.txt','licenses\THIRD-PARTY-NOTICES.md','licenses\ZOD-LICENSE.txt',
         'tools\7z.exe','tools\7z.dll','tools\7zip.provenance.json',
@@ -1172,6 +1172,7 @@ function Clear-RevisionTransition { param([string]$ProjectRoot,[object]$Expected
         $path=Join-Path $packageFixture $relative; $parent=Split-Path -Parent $path; if(-not(Test-Path -LiteralPath $parent)){New-Item -ItemType Directory -Path $parent -Force|Out-Null}
         if ($relative -eq 'maintenance\.update.lock') { [IO.File]::WriteAllBytes($path, (New-Object byte[] 0)) }
         elseif ($relative -eq '.mql5-chm-package-root') { [IO.File]::WriteAllText($path,"mql5-chm-portable-package-v1`n",(New-Object Text.UTF8Encoding($false))) }
+        elseif ($relative -eq 'package.json') { Copy-Item -LiteralPath (Join-Path $projectRoot 'package.json') -Destination $path }
         else { [IO.File]::WriteAllText($path,"fixture-$relative") }
     }
     Copy-Item -LiteralPath $packageRevisionRoot -Destination (Join-Path $packageFixture "revisions\$packageRevisionNext") -Recurse
@@ -1232,6 +1233,13 @@ function Clear-RevisionTransition { param([string]$ProjectRoot,[object]$Expected
         $missingSmokeRejected=$false;try{Assert-PackageChecksums -ProjectRoot $packageFixture|Out-Null}catch{$missingSmokeRejected=$true}
         Assert-Fixture -Condition $missingSmokeRejected -Message 'Package verification accepted a package missing the pre-registration MCP smoke helper and its checksum entry.'
         [IO.File]::WriteAllBytes($smokeFixturePath,$smokeFixtureBytes);[IO.File]::WriteAllText((Join-Path $packageFixture 'checksums.sha256'),$originalChecksumText,(New-Object Text.UTF8Encoding($false)))
+        $packageManifestFixturePath = Join-Path $packageFixture 'package.json'; $packageManifestFixtureBytes = [IO.File]::ReadAllBytes($packageManifestFixturePath)
+        Remove-Item -LiteralPath $packageManifestFixturePath -Force
+        $withoutPackageManifest = @($originalChecksumText -split "`r?`n" | Where-Object { $_ -and $_ -notmatch '(?i)\*package\.json$' })
+        [IO.File]::WriteAllLines((Join-Path $packageFixture 'checksums.sha256'), $withoutPackageManifest, (New-Object Text.UTF8Encoding($false)))
+        $missingPackageManifestRejected=$false;try{Assert-PackageChecksums -ProjectRoot $packageFixture|Out-Null}catch{$missingPackageManifestRejected=$true}
+        Assert-Fixture -Condition $missingPackageManifestRejected -Message 'Package verification accepted a package missing the installer version manifest and its checksum entry.'
+        [IO.File]::WriteAllBytes($packageManifestFixturePath,$packageManifestFixtureBytes);[IO.File]::WriteAllText((Join-Path $packageFixture 'checksums.sha256'),$originalChecksumText,(New-Object Text.UTF8Encoding($false)))
         $sevenZipRuntimeFixturePath = Join-Path $packageFixture 'scripts\SevenZipRuntime.ps1'; $sevenZipRuntimeFixtureBytes = [IO.File]::ReadAllBytes($sevenZipRuntimeFixturePath)
         Remove-Item -LiteralPath $sevenZipRuntimeFixturePath -Force
         $withoutSevenZipRuntime = @($originalChecksumText -split "`r?`n" | Where-Object { $_ -and $_ -notmatch '(?i)\*scripts[/\\]SevenZipRuntime\.ps1$' })
@@ -1395,6 +1403,7 @@ function Clear-RevisionTransition { param([string]$ProjectRoot,[object]$Expected
         $parent=Split-Path -Parent $path;if(-not(Test-Path -LiteralPath $parent)){New-Item -ItemType Directory -Path $parent -Force|Out-Null}
         if($relative -eq 'maintenance\.update.lock'){[IO.File]::WriteAllBytes($path,(New-Object byte[] 0))}
         elseif($relative -eq '.mql5-chm-package-root'){[IO.File]::WriteAllText($path,"mql5-chm-portable-package-v1`n",(New-Object Text.UTF8Encoding($false)))}
+        elseif($relative -eq 'package.json'){Copy-Item -LiteralPath (Join-Path $projectRoot 'package.json') -Destination $path}
         else{[IO.File]::WriteAllText($path,"fixture-$relative")}
     }
     $portableMigrationLines=Get-ChildItem -LiteralPath $portableMigrationFixture -Recurse -File|Where-Object FullName -ne (Join-Path $portableMigrationFixture 'checksums.sha256')|ForEach-Object{
@@ -1448,6 +1457,7 @@ function Clear-RevisionTransition { param([string]$ProjectRoot,[object]$Expected
         $parent=Split-Path -Parent $path;if(-not(Test-Path -LiteralPath $parent)){New-Item -ItemType Directory -Path $parent -Force|Out-Null}
         if($relative -eq 'maintenance\.update.lock'){[IO.File]::WriteAllBytes($path,(New-Object byte[] 0))}
         elseif($relative -eq '.mql5-chm-package-root'){[IO.File]::WriteAllText($path,"mql5-chm-portable-package-v1`n",(New-Object Text.UTF8Encoding($false)))}
+        elseif($relative -eq 'package.json'){Copy-Item -LiteralPath (Join-Path $projectRoot 'package.json') -Destination $path}
         else{[IO.File]::WriteAllText($path,"fixture-$relative")}
     }
     $legacyTransition=[ordered]@{schema_version=1;operation='rollback';from_revision=$legacyTransitionFrom.Corpus;to_revision=$legacyTransitionTo.Corpus;started_at='2026-07-18T00:56:00Z'}

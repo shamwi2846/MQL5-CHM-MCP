@@ -15,8 +15,8 @@ foreach ($path in $paths) {
     $tokens = $null
     $errors = $null
     [void][Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
-    foreach ($error in @($errors)) {
-        $failures.Add("${path}:$($error.Extent.StartLineNumber): $($error.Message)")
+    foreach ($parseError in @($errors)) {
+        $failures.Add("${path}:$($parseError.Extent.StartLineNumber): $($parseError.Message)")
     }
 }
 if ($failures.Count -ne 0) {

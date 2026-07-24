@@ -48,11 +48,16 @@ try {
     Assert-NoReservedNodeRuntimeArtifacts -RuntimeRoot (Join-Path $root 'runtime')
     $server = Resolve-FullPath -Path (Join-Path $root 'app\server.mjs') -MustExist -PathType Leaf
     $smokeTest = Resolve-FullPath -Path (Join-Path $root 'scripts\Smoke-Test-McpServer.mjs') -MustExist -PathType Leaf
+    $packageManifest = Read-JsonFile -Path (Join-Path $root 'package.json') -Context 'package manifest'
+    $expectedServerVersion = [string](Get-RequiredJsonProperty $packageManifest 'version' 'package manifest')
+    if ([string]::IsNullOrWhiteSpace($expectedServerVersion)) {
+        throw 'Package manifest version must not be empty.'
+    }
     $smokeResult = Invoke-NativeCapture -FilePath $node -Arguments @(
         $smokeTest,
         '--server',$server,
         '--timeout-ms','30000',
-        '--expected-server-version','1.2.3',
+        '--expected-server-version',$expectedServerVersion,
         '--expected-active-revision',([string]$pointer.active_revision),
         '--expected-index-revision',([string]$validated.IndexRevision),
         '--expected-corpus-revision',([string]$validated.CorpusRevision),

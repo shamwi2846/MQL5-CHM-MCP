@@ -318,7 +318,7 @@ function Assert-RevisionStageRecoveryChecksumBoundary {
     $required = @(
         '.mql5-chm-package-root','runtime/node.exe','runtime/LICENSE','app/server.mjs','app/indexer.mjs',
         'config/mql5-image-policy.json','config/mql5-query-expansions.json','data/active.json','maintenance/.update.lock',
-        'Install-Codex.ps1','Rebuild-Index.ps1','Uninstall-Codex.ps1','Package-Portable.ps1','Check-DocumentationUpdates.ps1','Update-Documentation.ps1','Rollback-Documentation.ps1','README.md','SPEC.md',
+        'Install-Codex.ps1','Rebuild-Index.ps1','Uninstall-Codex.ps1','Package-Portable.ps1','Check-DocumentationUpdates.ps1','Update-Documentation.ps1','Rollback-Documentation.ps1','package.json','README.md','SPEC.md',
         'scripts/build.mjs','scripts/Generate-BundledNotices.mjs','scripts/inspect-database.mjs','scripts/Common.ps1','scripts/IndexMaintenance.ps1','scripts/SevenZipRuntime.ps1','scripts/StageInstallRecovery.ps1',
         'scripts/Smoke-Test-McpServer.mjs','scripts/Compare-OfficialDocumentationHashes.ps1','scripts/Test-DocumentationFreshness.ps1','scripts/Test-PowerShellSyntax.ps1','scripts/Invoke-PowerShellTestSuite.ps1',
         'scripts/Install-Codex.ps1','scripts/Rebuild-Index.ps1','scripts/Uninstall-Codex.ps1','scripts/Package-Portable.ps1','scripts/Check-DocumentationUpdates.ps1','scripts/Update-Documentation.ps1','scripts/Rollback-Documentation.ps1','scripts/Test-Maintenance.ps1','scripts/Test-StageInstallRecovery.ps1',

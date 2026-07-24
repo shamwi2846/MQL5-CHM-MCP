@@ -247,16 +247,24 @@ test("installer smoke drains buffered stderr from an immediately exiting server"
 
 test("Install-Codex runs the smoke gate before registration", async () => {
   const source = await readFile(path.join(root, "scripts", "Install-Codex.ps1"), "utf8");
-  const versionArgument = source.match(
-    /'--expected-server-version'\s*,\s*'([^']+)'/u,
-  );
   const smoke = source.indexOf("Smoke-Test-McpServer.mjs");
   const registration = source.indexOf("Install-CodexMql5ChmRegistration");
   assert.ok(smoke >= 0, "installer does not invoke the MCP smoke helper");
   assert.ok(registration > smoke, "installer can register before the MCP smoke gate");
-  assert.equal(
-    versionArgument?.[1],
-    packageMetadata.version,
-    "installer expected server version does not match package.json",
+  assert.match(
+    source,
+    /\$packageManifest\s*=\s*Read-JsonFile[\s\S]*?package\.json[\s\S]*?\$expectedServerVersion\s*=\s*\[string\]\(Get-RequiredJsonProperty\s+\$packageManifest\s+'version'\s+'package manifest'\)/u,
+    "installer does not derive the expected server version from package.json",
   );
+  assert.match(source, /'--expected-server-version'\s*,\s*\$expectedServerVersion/u);
+  assert.doesNotMatch(source, /'--expected-server-version'\s*,\s*'\d/u);
+});
+
+test("portable packages carry checksum-bound version metadata for installation", async () => {
+  const packager = await readFile(path.join(root, "scripts", "Package-Portable.ps1"), "utf8");
+  const common = await readFile(path.join(root, "scripts", "Common.ps1"), "utf8");
+  const rootFiles = packager.match(/^\$rootFiles\s*=\s*@\([\s\S]*?^\)$/mu)?.[0];
+  const requiredFiles = common.match(/^\s*\$required\s*=\s*@\([\s\S]*?^\s*\)$/mu)?.[0];
+  assert.match(rootFiles ?? "", /^\s*'package\.json',?\s*$/mu);
+  assert.match(requiredFiles ?? "", /^\s*'package\.json',?\s*$/mu);
 });
