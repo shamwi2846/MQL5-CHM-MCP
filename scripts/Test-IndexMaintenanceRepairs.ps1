@@ -122,7 +122,7 @@ Start-Sleep -Milliseconds 100
 [IO.Directory]::CreateDirectory((Join-Path $Root 'images')) | Out-Null
 [IO.File]::WriteAllText((Join-Path $Root 'images\pic.png'),'AAAA',[Text.Encoding]::ASCII)
 '@, (New-Object Text.UTF8Encoding($false)))
-    $delayedWriter = Start-Process -FilePath (Get-Command pwsh -CommandType Application).Source -ArgumentList @('-NoProfile','-File',$delayWriterPath,$delayed.FullName) -PassThru -WindowStyle Hidden
+    $delayedWriter = Start-Process -FilePath (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source -ArgumentList @('-NoProfile','-File',$delayWriterPath,$delayed.FullName) -PassThru -WindowStyle Hidden
     try {
         $delayedStable = Wait-ExtractionStable -Path $delayed.FullName -Inventory $closureInventory -TimeoutSeconds $positiveClosureTimeoutSeconds -StablePolls 3 -PollMilliseconds 20
         $delayedWriter.WaitForExit()
@@ -219,6 +219,134 @@ if ($Mode -ceq 'sleep') { Start-Sleep -Seconds 30; exit 0 }
     Assert-RepairFixture -Condition (-not (Assert-DeterministicRebuildResult -BaseRevision $base -CandidateRevision (New-RebuildFixture -Policy $policyB))) -Message 'A policy change was incorrectly treated as deterministic drift.'
     Assert-RepairFixture -Condition (-not (Assert-DeterministicRebuildResult -BaseRevision (New-RebuildFixture -Contract 'mql5-chm-index-v3-assets-v1') -CandidateRevision (New-RebuildFixture))) -Message 'A contract upgrade was incorrectly treated as deterministic drift.'
     Assert-RepairFixture -Condition (-not (Assert-DeterministicRebuildResult -BaseRevision (New-RebuildFixture -SchemaVersion $script:LegacyManifestSchemaVersion) -CandidateRevision (New-RebuildFixture))) -Message 'A schema upgrade was incorrectly treated as deterministic drift.'
+
+    $activationBase = [pscustomobject]@{
+        IndexRevision=$hashA
+        CorpusRevision=$corpusA
+        DatabasePath='base.sqlite'
+    }
+    $activationCandidate = [pscustomobject]@{
+        IndexRevision=$hashB
+        CorpusRevision=('f' * 64)
+        DatabasePath='candidate.sqlite'
+        Root='candidate-root'
+    }
+    $script:activationReport = [pscustomobject]@{
+        base_index_revision=$hashA
+        base_corpus_revision=$corpusA
+        corpus_revision=$activationCandidate.CorpusRevision
+    }
+    $script:activationRequiresReduction = $false
+    $script:activationRevisionFlags = $null
+    $script:activationInspections = @()
+    $script:activationResolveCalls = 0
+    $originalAssertRevision = (Get-Item Function:\Assert-Revision).ScriptBlock
+    $originalAssertStagedRevisionReport = (Get-Item Function:\Assert-StagedRevisionReport).ScriptBlock
+    $originalResolveNodeExecutable = (Get-Item Function:\Resolve-NodeExecutable).ScriptBlock
+    $originalInvokeDatabaseInspection = (Get-Item Function:\Invoke-DatabaseInspection).ScriptBlock
+    $originalAssertStagedReportMatchesVerification = (Get-Item Function:\Assert-StagedReportMatchesVerification).ScriptBlock
+    try {
+        function Assert-Revision {
+            param(
+                [string]$ProjectRoot,
+                [string]$Revision,
+                [string]$IdentityMode,
+                [switch]$RequireCurrent,
+                [switch]$RequireCurrentSources,
+                [switch]$RequireCurrentPolicy
+            )
+            $script:activationRevisionFlags = [pscustomobject]@{
+                RequireCurrent=[bool]$RequireCurrent
+                RequireCurrentSources=[bool]$RequireCurrentSources
+                RequireCurrentPolicy=[bool]$RequireCurrentPolicy
+            }
+            return $activationCandidate
+        }
+        function Assert-StagedRevisionReport {
+            param([string]$Path,[string]$ExpectedRevision)
+            return $script:activationReport
+        }
+        function Resolve-NodeExecutable {
+            param([string]$ProjectRoot)
+            $script:activationResolveCalls++
+            return 'fixture-node.exe'
+        }
+        function Invoke-DatabaseInspection {
+            param([string]$NodePath,[string]$DatabasePath,[switch]$RequireAssets)
+            $script:activationInspections += [pscustomobject]@{
+                NodePath=$NodePath
+                DatabasePath=$DatabasePath
+                RequireAssets=[bool]$RequireAssets
+            }
+            return [pscustomobject]@{ DatabasePath=$DatabasePath }
+        }
+        function Assert-StagedReportMatchesVerification {
+            param(
+                [object]$Report,
+                [object]$BaseRevision,
+                [object]$CandidateRevision,
+                [object]$BaseInspection,
+                [object]$CandidateInspection,
+                [switch]$AcceptAssetReduction
+            )
+            if ($script:activationRequiresReduction -and -not $AcceptAssetReduction) {
+                throw 'The candidate reduces cataloged/exposed image or exposed-occurrence coverage. Review the stage report and retry with -AcceptAssetReduction.'
+            }
+            return [pscustomobject]@{ TopicChanges=[pscustomobject]@{ changed_count=1 } }
+        }
+
+        $script:activationReport = [pscustomobject]@{
+            base_index_revision=('0' * 64)
+            base_corpus_revision=$corpusA
+            corpus_revision=$activationCandidate.CorpusRevision
+        }
+        Assert-RepairThrows -Action {
+            Assert-CandidateActivationAccepted -ProjectRoot $fixtureRoot -CandidateIndexRevision $hashB -BaseRevision $activationBase | Out-Null
+        } -Pattern 'different active base' -Message 'Shared candidate acceptance did not reject a report staged against a stale active base.'
+
+        $script:activationReport = [pscustomobject]@{
+            base_index_revision=$hashA
+            base_corpus_revision=$corpusA
+            corpus_revision=$activationCandidate.CorpusRevision
+        }
+        $script:activationRequiresReduction = $true
+        Assert-RepairThrows -Action {
+            Assert-CandidateActivationAccepted -ProjectRoot $fixtureRoot -CandidateIndexRevision $hashB -BaseRevision $activationBase | Out-Null
+        } -Pattern 'AcceptAssetReduction' -Message 'Shared candidate acceptance allowed an asset reduction without explicit review.'
+
+        $script:activationInspections = @()
+        $resolveCallsBeforeVerifiedPath = $script:activationResolveCalls
+        $acceptedActivation = Assert-CandidateActivationAccepted `
+            -ProjectRoot $fixtureRoot `
+            -CandidateIndexRevision $hashB `
+            -BaseRevision $activationBase `
+            -NodePath 'verified-node.exe' `
+            -AcceptAssetReduction `
+            -RequireCurrentSources `
+            -RequireCurrentPolicy
+        Assert-RepairFixture -Condition (
+            [string]$acceptedActivation.Candidate.IndexRevision -ceq $hashB -and
+            [bool]$script:activationRevisionFlags.RequireCurrent -and
+            [bool]$script:activationRevisionFlags.RequireCurrentSources -and
+            [bool]$script:activationRevisionFlags.RequireCurrentPolicy
+        ) -Message 'Shared candidate acceptance did not preserve strict candidate identity checks.'
+        Assert-RepairFixture -Condition (
+            @($script:activationInspections).Count -eq 2 -and
+            $script:activationResolveCalls -eq $resolveCallsBeforeVerifiedPath -and
+            [string]$script:activationInspections[0].NodePath -ceq 'verified-node.exe' -and
+            [string]$script:activationInspections[0].DatabasePath -ceq 'base.sqlite' -and
+            -not [bool]$script:activationInspections[0].RequireAssets -and
+            [string]$script:activationInspections[1].NodePath -ceq 'verified-node.exe' -and
+            [string]$script:activationInspections[1].DatabasePath -ceq 'candidate.sqlite' -and
+            [bool]$script:activationInspections[1].RequireAssets
+        ) -Message 'Shared candidate acceptance did not bind the preverified Node path while freshly inspecting the active and candidate databases.'
+    } finally {
+        Set-Item Function:\Assert-Revision -Value $originalAssertRevision
+        Set-Item Function:\Assert-StagedRevisionReport -Value $originalAssertStagedRevisionReport
+        Set-Item Function:\Resolve-NodeExecutable -Value $originalResolveNodeExecutable
+        Set-Item Function:\Invoke-DatabaseInspection -Value $originalInvokeDatabaseInspection
+        Set-Item Function:\Assert-StagedReportMatchesVerification -Value $originalAssertStagedReportMatchesVerification
+    }
 
     $rebuildText = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Rebuild-Index.ps1') -Raw
     $guardIndex = $rebuildText.IndexOf('Assert-DeterministicRebuildResult',[StringComparison]::Ordinal)

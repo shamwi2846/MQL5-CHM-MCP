@@ -30,6 +30,7 @@ $buildRoot = Join-Path $projectRoot 'build'
 if (-not (Test-Path -LiteralPath $buildRoot -PathType Container)) { New-Item -ItemType Directory -Path $buildRoot | Out-Null }
 $testRoot = Join-Path $buildRoot ('packaging-repair-test-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $testRoot | Out-Null
+$utf8 = New-Object Text.UTF8Encoding($false)
 $passed = 0
 
 function Assert-Test {
@@ -174,6 +175,76 @@ function New-TestZipAndSidecar {
     })
 }
 
+function New-ArchivePathCollisionFixture {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][ValidateSet(
+            'file-directory','directory-case','trailing-dot','reserved-device','payload-directory',
+            'attribute-directory','attribute-device','long-component'
+        )][string]$Kind
+    )
+    $zipPath = Join-Path $Root ("archive-path-collision-$Kind.zip")
+    $payloads = [ordered]@{}
+    switch ($Kind) {
+        'file-directory' {
+            $payloads['portable/Foo'] = 'file-node'
+            $payloads['portable/Foo/bar.txt'] = 'child-node'
+        }
+        'directory-case' {
+            $payloads['portable/Foo/a.txt'] = 'first-child'
+            $payloads['portable/foo/b.txt'] = 'second-child'
+        }
+        'trailing-dot' {
+            $payloads['portable/foo'] = 'plain-node'
+            $payloads['portable/foo.'] = 'windows-equivalent-node'
+        }
+        'reserved-device' {
+            $payloads['portable/CON.txt'] = 'reserved-device-node'
+        }
+        'payload-directory' {
+            $payloads['portable/valid.txt'] = 'checksummed-node'
+            $payloads['portable/hidden/'] = 'unchecked-directory-payload'
+        }
+        'attribute-directory' {
+            $payloads['portable/hidden'] = ''
+        }
+        'attribute-device' {
+            $payloads['portable/device'] = 'device-node'
+        }
+        'long-component' {
+            $payloads[('portable/' + ('a' * 256))] = 'unextractable-component'
+        }
+    }
+    $checksumLines = @()
+    foreach ($name in $payloads.Keys) {
+        if ($name.EndsWith('/')) { continue }
+        $bytes = [Text.Encoding]::UTF8.GetBytes([string]$payloads[$name])
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try { $hash = ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','').ToLowerInvariant() }
+        finally { $sha.Dispose() }
+        $checksumLines += "$hash *$($name.Substring('portable/'.Length))"
+    }
+    $allEntries = [ordered]@{'portable/checksums.sha256'=(($checksumLines -join "`n") + "`n")}
+    foreach ($name in $payloads.Keys) { $allEntries[$name] = $payloads[$name] }
+    $archive = [IO.Compression.ZipFile]::Open($zipPath,[IO.Compression.ZipArchiveMode]::Create)
+    try {
+        foreach ($name in $allEntries.Keys) {
+            $entry = $archive.CreateEntry($name,[IO.Compression.CompressionLevel]::Optimal)
+            $bytes = [Text.Encoding]::UTF8.GetBytes([string]$allEntries[$name])
+            $stream = $entry.Open()
+            try { $stream.Write($bytes,0,$bytes.Length) }
+            finally { $stream.Dispose() }
+            if ($Kind -ceq 'attribute-directory' -and $name -ceq 'portable/hidden') {
+                $entry.ExternalAttributes = [int][IO.FileAttributes]::Directory
+            }
+            if ($Kind -ceq 'attribute-device' -and $name -ceq 'portable/device') {
+                $entry.ExternalAttributes = [int][IO.FileAttributes]::Device
+            }
+        }
+    } finally { $archive.Dispose() }
+    return $zipPath
+}
+
 try {
     $metadataProbe = Invoke-NativeCapture -FilePath $nodeFixtureSource -Arguments @(
         '-e',
@@ -185,6 +256,216 @@ try {
     Assert-Test (Test-PinnedNodeRuntimePair -NodePath $nodeFixtureSource -LicensePath $nodeFixtureLicense) 'Available Node runtime fixture is not the pinned distribution.'
     Assert-SevenZipProvenance -ProjectRoot $projectRoot | Out-Null
     Assert-Test $true 'Pinned 7-Zip provenance validation failed.'
+    $currentPolicyHash = Get-CanonicalImagePolicySha256 -ProjectRoot $projectRoot
+    Assert-CurrentImagePolicyIdentity -ProjectRoot $projectRoot -PolicySha256 $currentPolicyHash
+    Assert-Test $true 'Current image policy identity validation failed.'
+    $stalePolicyRejected = $false
+    try { Assert-CurrentImagePolicyIdentity -ProjectRoot $projectRoot -PolicySha256 ('0' * 64) }
+    catch { $stalePolicyRejected = $_.Exception.Message -match 'image policy' }
+    Assert-Test $stalePolicyRejected 'A stale image policy identity was accepted.'
+    $providerNullTarget = Join-Path (Get-FilesystemRootPath -Path $testRoot) (
+        'mql5-chm-provider-null-' + [Guid]::NewGuid().ToString('N') + '\nested'
+    )
+    $providerNullDescriptor = Get-PhysicalPathDescriptor -Path $providerNullTarget -InternalTestHooks @{
+        GetExistingItem = { param([string]$LiteralPath) return $null }
+    }
+    Assert-Test (
+        $providerNullDescriptor.FullPath -ceq [IO.Path]::GetFullPath($providerNullTarget) -and
+        @($providerNullDescriptor.Entries).Count -gt 0
+    ) 'Physical package path validation could not recover a provider-null existing ancestor.'
+    Assert-NoReparsePoint -Root $testRoot -Path $testRoot -InternalTestHooks @{
+        GetItem = { param([string]$LiteralPath) return $null }
+    }
+    Assert-Test $true 'Reparse-point validation could not recover a provider-null existing path.'
+
+    $cleanupLockRoot = Join-Path $testRoot 'cleanup-lock-disposal'
+    $cleanupBuildRoot = Join-Path $cleanupLockRoot 'build'
+    $cleanupCandidateRoot = Join-Path $cleanupBuildRoot 'candidate'
+    $cleanupMaintenanceRoot = Join-Path $cleanupLockRoot 'maintenance'
+    foreach ($directory in @($cleanupCandidateRoot,$cleanupMaintenanceRoot)) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+    $cleanupLockPath = Join-Path $cleanupMaintenanceRoot '.update.lock'
+    [IO.File]::WriteAllBytes($cleanupLockPath, (New-Object byte[] 0))
+    $cleanupLease = Enter-ExclusiveFileLock -Path $cleanupLockPath -IdentityRoot $cleanupLockRoot -TimeoutSeconds 5
+    $cleanupFailure = $null
+    $cleanupProbeScript = Join-Path $cleanupLockRoot 'acquire-after-cleanup.ps1'
+    [IO.File]::WriteAllText($cleanupProbeScript, @'
+param([string]$CommonPath,[string]$ProjectRoot,[string]$LockPath)
+$ErrorActionPreference='Stop'
+. $CommonPath
+$lease=$null
+try {
+    $lease=Enter-ExclusiveFileLock -Path $LockPath -IdentityRoot $ProjectRoot -TimeoutSeconds 2
+    Write-Output 'second-process-acquired'
+} finally {
+    if($null -ne $lease){$lease.Dispose()}
+}
+'@, $utf8)
+    try {
+        try {
+            Invoke-PortablePackageFinalCleanup `
+                -ProjectRoot $cleanupLockRoot `
+                -CandidateBuildRoot $cleanupCandidateRoot `
+                -UpdateLock $cleanupLease `
+                -InternalTestHooks @{
+                    RemoveCandidateBuildRoot = {
+                        param([string]$ConfinementRoot,[string]$Path)
+                        throw 'injected candidate cleanup failure'
+                    }
+                }
+        } catch {
+            $cleanupFailure = $_.Exception.Message
+        }
+        $cleanupProbe = Invoke-NativeCapture -FilePath (Get-Process -Id $PID).Path -Arguments @(
+            '-NoProfile',
+            '-ExecutionPolicy','Bypass',
+            '-File',$cleanupProbeScript,
+            (Join-Path $PSScriptRoot 'Common.ps1'),
+            $cleanupLockRoot,
+            $cleanupLockPath
+        )
+        Assert-Test ([string]$cleanupFailure -match 'injected candidate cleanup failure') 'Package final cleanup did not surface the injected candidate cleanup failure.'
+        Assert-Test ($cleanupProbe.ExitCode -eq 0 -and $cleanupProbe.Text -match 'second-process-acquired') "Package final cleanup retained the maintenance lock after cleanup failed. $($cleanupProbe.Text)"
+    } finally {
+        try { $cleanupLease.Dispose() } catch {}
+    }
+
+    $reproducibleRoots = @()
+    foreach ($run in @('first','second')) {
+        $release = Join-Path $testRoot "reproducible-$run"
+        $stage = Join-Path $release 'portable'
+        New-Item -ItemType Directory -Path (Join-Path $stage 'nested') -Force | Out-Null
+        if ($run -ceq 'first') {
+            [IO.File]::WriteAllText((Join-Path $stage 'alpha.txt'),'alpha',(New-Object Text.UTF8Encoding($false)))
+            [IO.File]::WriteAllText((Join-Path $stage 'Beta.txt'),'mixed case',(New-Object Text.UTF8Encoding($false)))
+            [IO.File]::WriteAllText((Join-Path $stage 'nested\payload.txt'),'same bytes',(New-Object Text.UTF8Encoding($false)))
+        } else {
+            [IO.File]::WriteAllText((Join-Path $stage 'nested\payload.txt'),'same bytes',(New-Object Text.UTF8Encoding($false)))
+            [IO.File]::WriteAllText((Join-Path $stage 'Beta.txt'),'mixed case',(New-Object Text.UTF8Encoding($false)))
+            [IO.File]::WriteAllText((Join-Path $stage 'alpha.txt'),'alpha',(New-Object Text.UTF8Encoding($false)))
+        }
+        $timestamp = if ($run -ceq 'first') { [datetime]'2024-01-01T00:00:00Z' } else { [datetime]'2025-01-01T00:00:00Z' }
+        foreach ($item in Get-ChildItem -LiteralPath $stage -Recurse -Force) {
+            $item.CreationTimeUtc = $timestamp
+            $item.LastWriteTimeUtc = $timestamp
+        }
+        $zip = Join-Path $release 'portable.zip'
+        New-ReproduciblePackageZip -ReleaseRoot $release -StageRoot $stage -ZipPath $zip -SevenZipPath (Join-Path $projectRoot 'tools\7z.exe') | Out-Null
+        Assert-PackageZipMatchesStage -StageRoot $stage -ZipPath $zip | Out-Null
+        $reproducibleRoots += [pscustomobject]@{Stage=$stage;Zip=$zip;Descriptor=(Get-Descriptor $zip)}
+    }
+    Assert-Test ($reproducibleRoots[0].Descriptor.Sha256 -ceq $reproducibleRoots[1].Descriptor.Sha256) 'Equivalent stages produced different ZIP bytes.'
+    Assert-Test ($reproducibleRoots[0].Descriptor.Sha256 -ceq '3e039abfb2fe926469724bf0f1eefc850863ab93973842cf52fd046be5cef7ec') "Canonical ZIP fixture hash changed: $($reproducibleRoots[0].Descriptor.Sha256)"
+    $strictZipPath = Join-Path $testRoot 'strict-portable.zip'
+    $strictSidecarPath = "$strictZipPath.manifest.json"
+    New-TestZipAndSidecar -Root $testRoot -ZipPath $strictZipPath -ManifestPath $strictSidecarPath -ExpectedFile 'strict-portable.zip'
+    $strictDescriptor = Get-Descriptor -Path $strictZipPath
+    Assert-PortableZipSidecar -ZipPath $strictZipPath -ManifestPath $strictSidecarPath -ExpectedFile 'strict-portable.zip' | Out-Null
+    Assert-Test $true 'Strict portable ZIP sidecar validation rejected a valid descriptor.'
+    foreach ($typedMutation in @('schema_version','bytes')) {
+        $invalidSidecar = [ordered]@{
+            schema_version=if ($typedMutation -ceq 'schema_version') { '1' } else { 1 }
+            file='strict-portable.zip'
+            bytes=if ($typedMutation -ceq 'bytes') { [string]$strictDescriptor.Bytes } else { $strictDescriptor.Bytes }
+            sha256=$strictDescriptor.Sha256
+        }
+        [IO.File]::WriteAllText($strictSidecarPath,($invalidSidecar | ConvertTo-Json -Depth 4),$utf8)
+        $typedSidecarRejected = $false
+        try { Assert-PortableZipSidecar -ZipPath $strictZipPath -ManifestPath $strictSidecarPath -ExpectedFile 'strict-portable.zip' | Out-Null }
+        catch { $typedSidecarRejected = $true }
+        Assert-Test $typedSidecarRejected "Portable ZIP sidecar accepted string-typed $typedMutation."
+    }
+    foreach ($decimalMutation in @('schema_version','bytes')) {
+        $schemaToken = if ($decimalMutation -ceq 'schema_version') { '1.0' } else { '1' }
+        $bytesToken = if ($decimalMutation -ceq 'bytes') { "$($strictDescriptor.Bytes).0" } else { [string]$strictDescriptor.Bytes }
+        $decimalSidecarJson = "{`"schema_version`":$schemaToken,`"file`":`"strict-portable.zip`",`"bytes`":$bytesToken,`"sha256`":`"$($strictDescriptor.Sha256)`"}"
+        [IO.File]::WriteAllText($strictSidecarPath,$decimalSidecarJson,$utf8)
+        $decimalSidecarRejected = $false
+        try { Assert-PortableZipSidecar -ZipPath $strictZipPath -ManifestPath $strictSidecarPath -ExpectedFile 'strict-portable.zip' | Out-Null }
+        catch { $decimalSidecarRejected = $true }
+        Assert-Test $decimalSidecarRejected "Portable ZIP sidecar accepted decimal-encoded $decimalMutation."
+    }
+    $transactionZipPath = Join-Path $testRoot 'transaction-portable.zip'
+    $transactionSidecarPath = "$transactionZipPath.manifest.json"
+    New-TestZipAndSidecar -Root $testRoot -ZipPath $transactionZipPath -ManifestPath $transactionSidecarPath -ExpectedFile 'transaction-portable.zip'
+    $transactionZipDescriptor = Get-Descriptor -Path $transactionZipPath
+    $transactionZipState = [pscustomobject]@{
+        Item=[pscustomobject]@{target='transaction-portable.zip';new_bytes=$transactionZipDescriptor.Bytes;new_sha256=$transactionZipDescriptor.Sha256}
+        CandidateSource=$transactionZipPath
+    }
+    $transactionManifestState = [pscustomobject]@{
+        Item=[pscustomobject]@{target='transaction-portable.zip.manifest.json';new_bytes=0;new_sha256=''}
+        CandidateSource=$transactionSidecarPath
+    }
+    foreach ($decimalMutation in @('schema_version','bytes')) {
+        $schemaToken = if ($decimalMutation -ceq 'schema_version') { '1.0' } else { '1' }
+        $bytesToken = if ($decimalMutation -ceq 'bytes') { "$($transactionZipDescriptor.Bytes).0" } else { [string]$transactionZipDescriptor.Bytes }
+        $decimalSidecarJson = "{`"schema_version`":$schemaToken,`"file`":`"transaction-portable.zip`",`"bytes`":$bytesToken,`"sha256`":`"$($transactionZipDescriptor.Sha256)`"}"
+        [IO.File]::WriteAllText($transactionSidecarPath,$decimalSidecarJson,$utf8)
+        $transactionManifestDescriptor = Get-Descriptor -Path $transactionSidecarPath
+        $transactionManifestState.Item.new_bytes = $transactionManifestDescriptor.Bytes
+        $transactionManifestState.Item.new_sha256 = $transactionManifestDescriptor.Sha256
+        $decimalTransactionSidecarRejected = $false
+        try { Assert-PortableTransactionPairSemantics -States @($transactionZipState,$transactionManifestState) -SetKind candidate }
+        catch { $decimalTransactionSidecarRejected = $true }
+        Assert-Test $decimalTransactionSidecarRejected "Portable transaction recovery accepted decimal-encoded sidecar $decimalMutation."
+    }
+    $canonicalArchive = [IO.Compression.ZipFile]::OpenRead($reproducibleRoots[0].Zip)
+    try {
+        Assert-Test ((@($canonicalArchive.Entries | ForEach-Object FullName) -join '|') -ceq 'portable/alpha.txt|portable/Beta.txt|portable/nested/payload.txt') 'Canonical ZIP entry ordering changed.'
+        foreach ($entry in $canonicalArchive.Entries) {
+            Assert-Test ($entry.LastWriteTime.Year -eq 1980 -and $entry.LastWriteTime.Month -eq 1 -and $entry.LastWriteTime.Day -eq 1 -and [int]$entry.ExternalAttributes -eq 32) "Canonical ZIP metadata changed for '$($entry.FullName)'."
+        }
+    } finally {
+        $canonicalArchive.Dispose()
+    }
+
+    foreach ($collisionKind in @(
+        'file-directory','directory-case','trailing-dot','reserved-device','payload-directory',
+        'attribute-directory','attribute-device','long-component'
+    )) {
+        $collisionZip = New-ArchivePathCollisionFixture -Root $testRoot -Kind $collisionKind
+        $collisionError = $null
+        try { Assert-PortableZipInternalChecksumClosure -ZipPath $collisionZip | Out-Null }
+        catch { $collisionError = $_.Exception.Message }
+        Assert-Test (
+            $null -ne $collisionError -and
+            $collisionError -match 'case-colliding|file/directory|path node|Windows|directory entry|directory attribute|link or device|component'
+        ) "Portable ZIP validation accepted the $collisionKind archive-path collision. Actual error: $collisionError"
+    }
+
+    $normalNodes = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
+    Add-PortableArchivePathNode -Nodes $normalNodes -Path 'portable/alpha.txt' -Kind File -Context 'test archive'
+    Add-PortableArchivePathNode -Nodes $normalNodes -Path 'portable/Beta.txt' -Kind File -Context 'test archive'
+    Assert-Test ($normalNodes.Count -eq 3) 'Archive path-node validation rejected normal mixed-case siblings.'
+    foreach ($reservedDeviceLeaf in @(
+        "COM$([char]0x00B9).txt",
+        "LPT$([char]0x00B2)",
+        "COM$([char]0x00B3).payload"
+    )) {
+        $reservedDeviceRejected = $false
+        try {
+            $reservedNodes = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
+            Add-PortableArchivePathNode -Nodes $reservedNodes -Path "portable/$reservedDeviceLeaf" -Kind File -Context 'test archive'
+        } catch {
+            $reservedDeviceRejected = $_.Exception.Message -match 'Windows'
+        }
+        Assert-Test $reservedDeviceRejected "Archive path-node validation accepted reserved Windows device '$reservedDeviceLeaf'."
+    }
+    foreach ($ordinaryDeviceLikeLeaf in @(
+        "COM$([char]0x00C2).txt",
+        "LPT$([char]0x00C2).payload"
+    )) {
+        $ordinaryDeviceLikeAccepted = $true
+        try {
+            $ordinaryNodes = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
+            Add-PortableArchivePathNode -Nodes $ordinaryNodes -Path "portable/$ordinaryDeviceLikeLeaf" -Kind File -Context 'test archive'
+        } catch {
+            $ordinaryDeviceLikeAccepted = $false
+        }
+        Assert-Test $ordinaryDeviceLikeAccepted "Archive path-node validation rejected ordinary Windows filename '$ordinaryDeviceLikeLeaf'."
+    }
 
     $successfulNodeFixture = New-NodeBootstrapFixture -Name 'successful-truncated-runtime-repair'
     $repairedNode = Ensure-PinnedNodeRuntime -ProjectRoot $successfulNodeFixture -InternalTestHooks (New-NodeBootstrapTestHooks)
@@ -310,6 +591,23 @@ try {
     finally { $deadline.Dispose(); $timeoutStream.Dispose() }
     Assert-Test $timeoutRejected 'Cancelled download stream was accepted.'
     Assert-Test (-not (Test-Path -LiteralPath $timeoutPath)) 'Cancelled download left a partial file.'
+
+    $downloadJunctionTarget = Join-Path $testRoot 'download-junction-target'
+    $downloadJunction = Join-Path $testRoot 'download-junction'
+    New-Item -ItemType Directory -Path $downloadJunctionTarget | Out-Null
+    New-Item -ItemType Junction -Path $downloadJunction -Target $downloadJunctionTarget | Out-Null
+    $junctionStream = [IO.MemoryStream]::new([Text.Encoding]::UTF8.GetBytes('must-not-be-written'), $false)
+    $junctionDownloadRejected = $false
+    try {
+        Copy-StreamToFileBounded -Stream $junctionStream -Destination (Join-Path $downloadJunction 'redirected.bin') -MaximumBytes 64 -CancellationToken ([Threading.CancellationToken]::None) | Out-Null
+    } catch {
+        $junctionDownloadRejected = $_.Exception.Message -match 'reparse point'
+    } finally {
+        $junctionStream.Dispose()
+        [IO.Directory]::Delete($downloadJunction)
+    }
+    Assert-Test $junctionDownloadRejected 'Bounded download accepted a destination beneath a reparse-point parent.'
+    Assert-Test (-not (Test-Path -LiteralPath (Join-Path $downloadJunctionTarget 'redirected.bin'))) 'Rejected reparse-point download changed the external target.'
 
     $badArchiveFixture = New-NodeBootstrapFixture -Name 'bad-archive-hash'
     $badArchiveHooks = New-NodeBootstrapTestHooks
@@ -575,7 +873,7 @@ try {
     $corruptDescriptor = Get-Descriptor $corruptZip
     Write-JsonAtomic -Path $corruptManifest -ConfinementRoot $corruptPairRoot -Value ([ordered]@{schema_version=1;file="$corruptName.zip";bytes=$corruptDescriptor.Bytes;sha256=$corruptDescriptor.Sha256})
     $corruptResult = Invoke-ExpectedPortablePackagingFailure -OutputDirectory $corruptPairRoot -ReleaseName $corruptName
-    Assert-Test ($corruptResult.ExitCode -ne 0 -and $corruptResult.Text -match 'ZIP|archive|central directory') 'A hash-consistent unreadable existing ZIP pair was accepted.'
+    Assert-Test ($corruptResult.ExitCode -ne 0 -and $corruptResult.Text -match 'ZIP|archive|central directory') "A hash-consistent unreadable existing ZIP pair was accepted. $($corruptResult.Text)"
     Assert-Test ((Get-Descriptor $corruptZip).Sha256 -ceq $corruptDescriptor.Sha256) 'Unreadable ZIP rejection changed canonical bytes.'
 
     $malformedZipRoot = Join-Path $testRoot 'portable-malformed-orphan'

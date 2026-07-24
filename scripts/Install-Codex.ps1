@@ -43,10 +43,30 @@ try {
     # The newly installed runtime is deliberately transitional: it must start
     # on a fully validated supported old contract so migration/rollback can be
     # completed before the current index is activated.
-    Assert-ManifestAndCorpus -ProjectRoot $root | Out-Null
+    $validated = Assert-ManifestAndCorpus -ProjectRoot $root
     $node = Ensure-PinnedNodeRuntime -ProjectRoot $root -NoDownload:($layoutMode -eq 'portable')
     Assert-NoReservedNodeRuntimeArtifacts -RuntimeRoot (Join-Path $root 'runtime')
     $server = Resolve-FullPath -Path (Join-Path $root 'app\server.mjs') -MustExist -PathType Leaf
+    $smokeTest = Resolve-FullPath -Path (Join-Path $root 'scripts\Smoke-Test-McpServer.mjs') -MustExist -PathType Leaf
+    $packageManifest = Read-JsonFile -Path (Join-Path $root 'package.json') -Context 'package manifest'
+    $expectedServerVersion = [string](Get-RequiredJsonProperty $packageManifest 'version' 'package manifest')
+    if ([string]::IsNullOrWhiteSpace($expectedServerVersion)) {
+        throw 'Package manifest version must not be empty.'
+    }
+    $smokeResult = Invoke-NativeCapture -FilePath $node -Arguments @(
+        $smokeTest,
+        '--server',$server,
+        '--timeout-ms','30000',
+        '--expected-server-version',$expectedServerVersion,
+        '--expected-active-revision',([string]$pointer.active_revision),
+        '--expected-index-revision',([string]$validated.IndexRevision),
+        '--expected-corpus-revision',([string]$validated.CorpusRevision),
+        '--expected-schema-version',([string]$validated.ManifestSchemaVersion)
+    )
+    if ([int]$smokeResult.ExitCode -ne 0) {
+        throw "Bundled MCP server smoke test failed before registration. $($smokeResult.Text)"
+    }
+    Write-Host 'Verified bundled MCP initialize, tools/list, and mql5_chm_status before registration.'
     $codex = Resolve-CodexExecutable
 
     $registrationResult = Install-CodexMql5ChmRegistration -CodexPath $codex -NodePath $node -ServerPath $server

@@ -11,7 +11,6 @@ import {
   open,
   readFile,
   readdir,
-  realpath,
   rename,
   rm,
   stat,
@@ -1613,10 +1612,9 @@ async function assertRealDirectory(directory, label) {
   if (!info?.isDirectory() || info.isSymbolicLink()) {
     throw new Error(`${label} must be an existing non-link directory: ${directory}`);
   }
-  const canonical = await realpath(directory);
-  if (path.resolve(canonical).toLowerCase() !== path.resolve(directory).toLowerCase()) {
-    throw new Error(`${label} must not traverse a symbolic link or junction: ${directory}`);
-  }
+  const resolved = path.resolve(directory);
+  const filesystemRoot = path.parse(resolved).root;
+  await assertNoLinkTraversal(filesystemRoot, resolved, label, "filesystem root");
 }
 
 async function assertRealFile(filePath, label) {

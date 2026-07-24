@@ -14,24 +14,6 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'IndexMaintenance.ps1')
 
-function Assert-RebuildActivationAccepted {
-    param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string]$ToRevision, [AllowNull()][object]$Base, [switch]$AcceptAssetReduction)
-    $candidate = Assert-Revision -ProjectRoot $Root -Revision $ToRevision -IdentityMode Index -RequireCurrent
-    $report = Assert-StagedRevisionReport -Path (Join-Path $candidate.Root 'stage-report.json') -ExpectedRevision $ToRevision
-    if ([string]$report.corpus_revision -cne [string]$candidate.CorpusRevision) { throw 'Stage report candidate corpus revision is invalid.' }
-    $node = Resolve-NodeExecutable -ProjectRoot $Root
-    $candidateInspection = Invoke-DatabaseInspection -NodePath $node -DatabasePath $candidate.DatabasePath -RequireAssets
-    $baseInspection = $null
-    if ($null -eq $Base) {
-        if ($null -ne $report.base_index_revision -or $null -ne $report.base_corpus_revision) { throw 'Initial staged index unexpectedly declares a validation base.' }
-    } else {
-        if ([string]$report.base_index_revision -cne [string]$Base.IndexRevision -or [string]$report.base_corpus_revision -cne [string]$Base.CorpusRevision) { throw 'The staged index was validated against a different active base. Stage it again before applying.' }
-        $baseInspection = Invoke-DatabaseInspection -NodePath $node -DatabasePath $Base.DatabasePath
-    }
-    Assert-StagedReportMatchesVerification -Report $report -BaseRevision $Base -CandidateRevision $candidate -BaseInspection $baseInspection -CandidateInspection $candidateInspection -AcceptAssetReduction:$AcceptAssetReduction | Out-Null
-    return $candidate
-}
-
 $root = Resolve-FullPath -Path $ProjectRoot -MustExist -PathType Container
 Assert-NoReparsePoint -Root $root -Path $root
 $maintenanceRoot = Join-Path $root 'maintenance'
@@ -51,7 +33,7 @@ try {
         if ($PSCmdlet.ParameterSetName -ne 'Apply' -or [int]$pending.schema_version -ne 2 -or [string]$pending.operation -ne 'apply' -or [string]$pending.to_revision -cne $Revision) { throw 'A revision transition is incomplete. Retry the matching rebuild -Apply operation before continuing.' }
         $pointerForRecovery = Get-ActiveRevisionPointer -ProjectRoot $root
         $baseForRecovery = Assert-Revision -ProjectRoot $root -Revision ([string]$pending.from_revision) -IdentityMode Index
-        Assert-RebuildActivationAccepted -Root $root -ToRevision ([string]$pending.to_revision) -Base $baseForRecovery -AcceptAssetReduction:$AcceptAssetReduction | Out-Null
+        Assert-CandidateActivationAccepted -ProjectRoot $root -CandidateIndexRevision ([string]$pending.to_revision) -BaseRevision $baseForRecovery -AcceptAssetReduction:$AcceptAssetReduction | Out-Null
         $completed = Complete-RevisionTransition -ProjectRoot $root
         Clear-RevisionTransition -ProjectRoot $root -ExpectedTransition $completed
         Write-Host "Recovered incomplete rebuild activation $($completed.from_revision) -> $($completed.to_revision). Restart Codex before using it."
@@ -61,7 +43,7 @@ try {
     $pointer = Get-ActiveRevisionPointer -ProjectRoot $root -AllowMissing
     if ($PSCmdlet.ParameterSetName -eq 'Apply') {
         if ($null -eq $pointer) {
-            $candidate = Assert-RebuildActivationAccepted -Root $root -ToRevision $Revision -Base $null -AcceptAssetReduction:$AcceptAssetReduction
+            $candidate = (Assert-CandidateActivationAccepted -ProjectRoot $root -CandidateIndexRevision $Revision -BaseRevision $null -AcceptAssetReduction:$AcceptAssetReduction).Candidate
             Set-ActiveRevisionPointer -ProjectRoot $root -ActiveRevision $Revision -PreviousRevision $null -SchemaVersion 2 | Out-Null
             Set-UpdateStatus -ProjectRoot $root -Status 'up-to-date' -ActiveRevision $Revision -ActiveCorpusRevision ([string]$candidate.CorpusRevision) -CandidateRevision $Revision -CandidateCorpusRevision ([string]$candidate.CorpusRevision) -Message 'The initial verified index revision was activated locally.' | Out-Null
             Update-ManagedChecksumsIfPresent -ProjectRoot $root
@@ -75,7 +57,7 @@ try {
             Write-Host "Index revision $Revision is already active."
             return
         }
-        Assert-RebuildActivationAccepted -Root $root -ToRevision $Revision -Base $base -AcceptAssetReduction:$AcceptAssetReduction | Out-Null
+        Assert-CandidateActivationAccepted -ProjectRoot $root -CandidateIndexRevision $Revision -BaseRevision $base -AcceptAssetReduction:$AcceptAssetReduction | Out-Null
         Start-RevisionTransition -ProjectRoot $root -Operation apply -FromRevision ([string]$base.IndexRevision) -ToRevision $Revision | Out-Null
         $completed = Complete-RevisionTransition -ProjectRoot $root
         Clear-RevisionTransition -ProjectRoot $root -ExpectedTransition $completed

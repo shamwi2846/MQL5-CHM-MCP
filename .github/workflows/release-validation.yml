@@ -1,0 +1,151 @@
+name: Release validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      corpus_fixture_release:
+        description: Reviewed release tag containing a current portable corpus fixture (optional)
+        required: false
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-validation-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Full Windows release validation
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out source without credentials
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Bind the release tag and lockfile to package.json
+        shell: pwsh
+        run: |
+          & .\scripts\Test-ReleaseVersion.ps1 `
+              -PackageJsonPath .\package.json `
+              -PackageLockPath .\package-lock.json `
+              -RefType $env:GITHUB_REF_TYPE `
+              -RefName $env:GITHUB_REF_NAME
+
+      - name: Use Node.js 24.17.0
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24.17.0
+          package-manager-cache: false
+
+      - name: Bind MCP subprocess tests to setup-node
+        shell: pwsh
+        run: |
+          $nodePath = (Get-Command node.exe -CommandType Application -ErrorAction Stop).Source
+          $nodeVersion = (& $nodePath --version).Trim()
+          if ($LASTEXITCODE -ne 0 -or $nodeVersion -cne 'v24.17.0') {
+              throw "Expected setup-node v24.17.0, found '$nodeVersion' at '$nodePath'."
+          }
+          "MQL5_CHM_TEST_NODE=$nodePath" |
+              Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install locked dependencies
+        shell: pwsh
+        run: |
+          if ($PSVersionTable.PSVersion.Major -ne 7) {
+              throw "Expected PowerShell 7, found $($PSVersionTable.PSVersion)."
+          }
+          npm ci
+
+      - name: Restore a verified corpus fixture
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CORPUS_FIXTURE_RELEASE: ${{ inputs.corpus_fixture_release }}
+        run: |
+          $currentTag = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { $null }
+          $requestedFixture = [string]$env:CORPUS_FIXTURE_RELEASE
+          if (-not [string]::IsNullOrWhiteSpace($requestedFixture)) {
+              if ($requestedFixture -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') {
+                  throw 'The requested corpus fixture release tag is invalid.'
+              }
+              $fixtureRelease = gh release view $requestedFixture --repo $env:GITHUB_REPOSITORY --json tagName,isDraft,publishedAt | ConvertFrom-Json
+              if ($LASTEXITCODE -ne 0 -or $null -eq $fixtureRelease -or [string]$fixtureRelease.tagName -cne $requestedFixture) {
+                  throw "Could not resolve the requested corpus fixture release '$requestedFixture'."
+              }
+              $fixtureTag = [string]$fixtureRelease.tagName
+          } else {
+              $releases = gh release list --repo $env:GITHUB_REPOSITORY --limit 50 --json tagName,isDraft,publishedAt | ConvertFrom-Json
+              if ($LASTEXITCODE -ne 0) { throw 'Could not list releases for automatic corpus fixture selection.' }
+              $fixtureReleases = @($releases |
+                  Where-Object { -not $_.isDraft -and ([string]::IsNullOrWhiteSpace($currentTag) -or $_.tagName -ne $currentTag) } |
+                  Sort-Object publishedAt -Descending |
+                  Select-Object -First 1)
+              if ($fixtureReleases.Count -ne 1) { throw 'No prior verified release is available as a corpus fixture.' }
+              $fixtureTag = [string]$fixtureReleases[0].tagName
+          }
+
+          $downloadRoot = Join-Path $PWD 'build\release-fixture-download'
+          $extractRoot = Join-Path $PWD 'build\release-fixture-extracted'
+          New-Item -ItemType Directory -Path $downloadRoot,$extractRoot -Force | Out-Null
+          gh release download $fixtureTag --repo $env:GITHUB_REPOSITORY --pattern 'mql5-chm-mcp-windows-x64.zip' --dir $downloadRoot
+          if ($LASTEXITCODE -ne 0) { throw "Could not download release fixture $fixtureTag." }
+          gh release download $fixtureTag --repo $env:GITHUB_REPOSITORY --pattern 'mql5-chm-mcp-windows-x64.zip.manifest.json' --dir $downloadRoot
+          if ($LASTEXITCODE -ne 0) { throw "Could not download the release fixture sidecar for $fixtureTag." }
+          $archive = @(Get-ChildItem -LiteralPath $downloadRoot -Filter '*.zip' -File)
+          if ($archive.Count -ne 1) { throw 'Release fixture download did not produce exactly one ZIP.' }
+          $sidecarPath = Join-Path $downloadRoot ($archive[0].Name + '.manifest.json')
+          . .\scripts\Common.ps1
+          Assert-PortableZipSidecar -ZipPath $archive[0].FullName -ManifestPath $sidecarPath -ExpectedFile $archive[0].Name | Out-Null
+          Expand-Archive -LiteralPath $archive[0].FullName -DestinationPath $extractRoot
+          $packageRoots = @(Get-ChildItem -LiteralPath $extractRoot -Directory | Where-Object {
+              Test-Path -LiteralPath (Join-Path $_.FullName 'data\active.json') -PathType Leaf
+          })
+          if ($packageRoots.Count -ne 1) { throw 'Release fixture ZIP did not contain exactly one portable package root.' }
+          foreach ($directory in @('data','revisions')) {
+              $sourceDirectory = Join-Path $packageRoots[0].FullName $directory
+              $targetDirectory = Join-Path $PWD $directory
+              New-Item -ItemType Directory -Path $targetDirectory -Force | Out-Null
+              foreach ($item in Get-ChildItem -LiteralPath $sourceDirectory -Force) {
+                  Copy-Item -LiteralPath $item.FullName -Destination $targetDirectory -Recurse -Force
+              }
+          }
+          $maintenanceRoot = Join-Path $PWD 'maintenance'
+          if (Test-Path -LiteralPath $maintenanceRoot) {
+              throw 'A clean release checkout unexpectedly contained mutable maintenance state.'
+          }
+          New-Item -ItemType Directory -Path $maintenanceRoot | Out-Null
+          [IO.File]::WriteAllBytes((Join-Path $maintenanceRoot '.update.lock'), (New-Object byte[] 0))
+
+      - name: Bind the restored corpus to the current release definition
+        shell: pwsh
+        run: |
+          . .\scripts\Common.ps1
+          Assert-ManifestAndCorpus -ProjectRoot $PWD.Path -RequireCurrent -RequireCurrentSources -RequireCurrentPolicy | Out-Null
+
+      - name: Run full release suite under PowerShell 7 and Windows PowerShell 5.1
+        shell: pwsh
+        run: npm run test:release
+
+      - name: Build the portable package twice and compare SHA-256
+        shell: pwsh
+        run: |
+          $first = Join-Path $PWD 'build\release-proof-first'
+          $second = Join-Path $PWD 'build\release-proof-second'
+          & .\Package-Portable.ps1 -OutputDirectory $first
+          & .\Package-Portable.ps1 -OutputDirectory $second
+          $firstZip = Join-Path $first 'mql5-chm-mcp-windows-x64.zip'
+          $secondZip = Join-Path $second 'mql5-chm-mcp-windows-x64.zip'
+          $firstHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $firstZip).Hash
+          $secondHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $secondZip).Hash
+          if ($firstHash -cne $secondHash) {
+              throw "Byte-reproducible package check failed: $firstHash != $secondHash"
+          }
+          "Portable ZIP SHA-256: ``$($firstHash.ToLowerInvariant())``" |
+              Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append

@@ -216,8 +216,8 @@ try {
     $boundaryRequired = @(
         '.mql5-chm-package-root','runtime/node.exe','runtime/LICENSE','app/server.mjs','app/indexer.mjs',
         'config/mql5-image-policy.json','config/mql5-query-expansions.json','maintenance/.update.lock',
-        'Install-Codex.ps1','Rebuild-Index.ps1','Uninstall-Codex.ps1','Package-Portable.ps1','Check-DocumentationUpdates.ps1','Update-Documentation.ps1','Rollback-Documentation.ps1','README.md','SPEC.md',
-        'scripts/build.mjs','scripts/Generate-BundledNotices.mjs','scripts/inspect-database.mjs','scripts/Common.ps1','scripts/IndexMaintenance.ps1','scripts/SevenZipRuntime.ps1','scripts/StageInstallRecovery.ps1','scripts/Install-Codex.ps1','scripts/Rebuild-Index.ps1','scripts/Uninstall-Codex.ps1','scripts/Package-Portable.ps1','scripts/Check-DocumentationUpdates.ps1','scripts/Update-Documentation.ps1','scripts/Rollback-Documentation.ps1','scripts/Test-Maintenance.ps1','scripts/Test-StageInstallRecovery.ps1',
+        'Install-Codex.ps1','Rebuild-Index.ps1','Uninstall-Codex.ps1','Package-Portable.ps1','Check-DocumentationUpdates.ps1','Update-Documentation.ps1','Rollback-Documentation.ps1','package.json','README.md','SPEC.md',
+        'scripts/build.mjs','scripts/Generate-BundledNotices.mjs','scripts/inspect-database.mjs','scripts/Common.ps1','scripts/IndexMaintenance.ps1','scripts/SevenZipRuntime.ps1','scripts/StageInstallRecovery.ps1','scripts/Smoke-Test-McpServer.mjs','scripts/Compare-OfficialDocumentationHashes.ps1','scripts/Test-DocumentationFreshness.ps1','scripts/Test-PowerShellSyntax.ps1','scripts/Invoke-PowerShellTestSuite.ps1','scripts/Install-Codex.ps1','scripts/Rebuild-Index.ps1','scripts/Uninstall-Codex.ps1','scripts/Package-Portable.ps1','scripts/Check-DocumentationUpdates.ps1','scripts/Update-Documentation.ps1','scripts/Rollback-Documentation.ps1','scripts\Test-Maintenance.ps1','scripts\Test-StageInstallRecovery.ps1',
         'licenses/7ZIP-LICENSE.txt','licenses/BUNDLED-NODE-NOTICES.txt','licenses/bundled-node-dependencies.json','licenses/bundled-node-notice-overrides.json','licenses/overrides/boolbase-1.0.0.txt','licenses/CHEERIO-LICENSE.txt','licenses/ESBUILD-LICENSE.txt','licenses/ICONV-LITE-LICENSE.txt','licenses/JPEG-JS-LICENSE.txt','licenses/MCP-SDK-LICENSE.txt','licenses/NODE-LICENSE.txt','licenses/THIRD-PARTY-NOTICES.md','licenses/ZOD-LICENSE.txt','tools/7z.exe','tools/7z.dll','tools/7zip.provenance.json'
     )
     foreach ($relative in $boundaryRequired) {
@@ -236,6 +236,24 @@ try {
         function Get-ValidatedRevisionChecksumFiles { param([string]$ProjectRoot,[string]$Revision,[string]$IdentityMode='Index',[switch]$AllowLegacy) return @() }
         Assert-RevisionStageRecoveryChecksumBoundary -ProjectRoot $boundaryFixture -Journal $boundaryJournal | Out-Null
     } finally { Set-Item Function:\Get-ValidatedRevisionChecksumFiles -Value $originalValidatedRevisionFiles }
+    $boundaryPackageManifest = Join-Path $boundaryFixture 'package.json'
+    $boundaryPackageManifestBytes = [IO.File]::ReadAllBytes($boundaryPackageManifest)
+    Remove-Item -LiteralPath $boundaryPackageManifest -Force
+    [IO.File]::WriteAllLines(
+        (Join-Path $boundaryFixture 'checksums.sha256'),
+        @($boundaryLines | Where-Object { $_ -notmatch '(?i)\*package\.json$' }),
+        (New-Object Text.UTF8Encoding($false))
+    )
+    $missingBoundaryPackageManifestRejected = $false
+    try {
+        function Get-ValidatedRevisionChecksumFiles { param([string]$ProjectRoot,[string]$Revision,[string]$IdentityMode='Index',[switch]$AllowLegacy) return @() }
+        Assert-RevisionStageRecoveryChecksumBoundary -ProjectRoot $boundaryFixture -Journal $boundaryJournal | Out-Null
+    } catch { $missingBoundaryPackageManifestRejected = $true } finally {
+        Set-Item Function:\Get-ValidatedRevisionChecksumFiles -Value $originalValidatedRevisionFiles
+    }
+    Assert-StageFixture -Condition $missingBoundaryPackageManifestRejected -Message 'Stage recovery accepted a portable boundary missing the installer version manifest.'
+    [IO.File]::WriteAllBytes($boundaryPackageManifest, $boundaryPackageManifestBytes)
+    [IO.File]::WriteAllLines((Join-Path $boundaryFixture 'checksums.sha256'), $boundaryLines, (New-Object Text.UTF8Encoding($false)))
 
     # Existing-destination interruption: the new journaled report bytes were
     # published, but checksums still bind the exact old report. This one
@@ -749,7 +767,7 @@ $ErrorActionPreference='Stop'
 $result=Repair-InterruptedRevisionStageInstall -ProjectRoot $PortableRoot
 if([string]$result.State -cne 'none'){throw 'Unexpected portable recovery state.'}
 '@, (New-Object Text.UTF8Encoding($false)))
-    $portableLoad = Invoke-NativeCapture -FilePath (Get-Command pwsh).Source -Arguments @('-NoProfile','-ExecutionPolicy','Bypass','-File',$portableLoadHelper,$portableLoadRoot)
+    $portableLoad = Invoke-NativeCapture -FilePath (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source -Arguments @('-NoProfile','-ExecutionPolicy','Bypass','-File',$portableLoadHelper,$portableLoadRoot)
     Assert-StageFixture -Condition ($portableLoad.ExitCode -eq 0) -Message "Portable path could not load the stage recovery helper through IndexMaintenance. $($portableLoad.Text)"
 
     $rebuildText = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Rebuild-Index.ps1') -Raw

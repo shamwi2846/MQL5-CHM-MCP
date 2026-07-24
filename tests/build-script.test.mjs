@@ -136,9 +136,20 @@ test("build publishes one complete bundle pair and metadata in generated build s
 
 test("the normal test workflow builds and exercises a candidate before production publication", () => {
   const packageJson = JSON.parse(readFileSync(path.join(projectRoot, "package.json"), "utf8"));
-  assert.equal(packageJson.scripts.pretest, "npm run build:candidate");
+  assert.equal(packageJson.scripts["pretest:fast"], "npm run build:candidate");
+  assert.equal(packageJson.scripts.test, "npm run test:fast");
   assert.match(
     readFileSync(path.join(projectRoot, "tests", "mcp.test.mjs"), "utf8"),
     /build["'],\s*["']candidate-v12["'],\s*["']app["'],\s*["']server\.mjs["']/u,
   );
+});
+
+test("tracked production bundles exactly match the current candidate build", () => {
+  for (const fileName of ["server.mjs", "indexer.mjs"]) {
+    assert.deepEqual(
+      readFileSync(path.join(projectRoot, "app", fileName)),
+      readFileSync(path.join(projectRoot, "build", "candidate-v12", "app", fileName)),
+      `${fileName} is stale; run the checked-in build script before packaging`,
+    );
+  }
 });

@@ -59,7 +59,7 @@ $lease=Enter-ExclusiveFileLock -Path $LockPath -IdentityRoot $IdentityRoot -Time
 [Threading.Thread]::Sleep([Threading.Timeout]::Infinite)
 '@
     [IO.File]::WriteAllText($helperPath, $helper, (New-Object Text.UTF8Encoding($false)))
-    $pwsh = (Get-Command pwsh -CommandType Application).Source
+    $pwsh = (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source
     $argumentList = @(
         '-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $helperPath + '"'),
         '-CommonPath',('"' + (Join-Path $PSScriptRoot 'Common.ps1') + '"'),

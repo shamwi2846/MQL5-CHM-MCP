@@ -1,5 +1,10 @@
 [CmdletBinding()]
-param([switch]$LockBoundaryOnly, [switch]$PackageAliasOnly)
+param(
+    [switch]$LockBoundaryOnly,
+    [switch]$PackageAliasOnly,
+    [switch]$OfficialDownloadDeadlineOnly,
+    [switch]$SkipInstalledCorpusValidation
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -11,7 +16,152 @@ $runningOnWindows = if ($null -ne $isWindowsVariable) {
 } else {
     $env:OS -eq 'Windows_NT'
 }
-if ($LockBoundaryOnly -and $PackageAliasOnly) { throw 'Choose only one focused maintenance regression mode.' }
+$focusedModes = @($LockBoundaryOnly,$PackageAliasOnly,$OfficialDownloadDeadlineOnly | Where-Object { $_ })
+if ($focusedModes.Count -gt 1) { throw 'Choose only one focused maintenance regression mode.' }
+
+function Assert-OfficialDownloadDeadlineRegression {
+    [CmdletBinding()]
+    param()
+
+    if ($null -eq ('Mql5ChmSlowReadStream' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
+
+public sealed class Mql5ChmSlowReadStream : Stream
+{
+    private readonly byte[] payload;
+    private readonly int delayMilliseconds;
+    private int position;
+
+    public Mql5ChmSlowReadStream(byte[] payload, int delayMilliseconds)
+    {
+        if (payload == null) throw new ArgumentNullException("payload");
+        this.payload = payload;
+        this.delayMilliseconds = delayMilliseconds;
+    }
+
+    public override bool CanRead { get { return true; } }
+    public override bool CanSeek { get { return false; } }
+    public override bool CanWrite { get { return false; } }
+    public override long Length { get { return payload.Length; } }
+    public override long Position
+    {
+        get { return position; }
+        set { throw new NotSupportedException(); }
+    }
+
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        Thread.Sleep(delayMilliseconds);
+        return CopyNextByte(buffer, offset, count);
+    }
+
+    public override async Task<int> ReadAsync(
+        byte[] buffer,
+        int offset,
+        int count,
+        CancellationToken cancellationToken)
+    {
+        await Task.Delay(delayMilliseconds, cancellationToken).ConfigureAwait(false);
+        return CopyNextByte(buffer, offset, count);
+    }
+
+    private int CopyNextByte(byte[] buffer, int offset, int count)
+    {
+        if (position >= payload.Length) return 0;
+        if (count < 1) return 0;
+        buffer[offset] = payload[position++];
+        return 1;
+    }
+
+    public override void Flush() { }
+    public override long Seek(long offset, SeekOrigin origin) { throw new NotSupportedException(); }
+    public override void SetLength(long value) { throw new NotSupportedException(); }
+    public override void Write(byte[] buffer, int offset, int count) { throw new NotSupportedException(); }
+}
+'@
+    }
+
+    $tempBase = Resolve-FullPath -Path ([IO.Path]::GetTempPath()) -MustExist -PathType Container
+    $fixture = Join-Path $tempBase ('mql5-chm-official-download-deadline-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $fixture | Out-Null
+    $destination = Join-Path $fixture 'candidate.chm'
+    $observation = [pscustomobject]@{ Calls=0 }
+    $provider = {
+        param([uri]$CurrentUri, [Threading.CancellationToken]$CancellationToken)
+        $observation.Calls++
+        [void]([Threading.Tasks.Task]::Delay(1000,$CancellationToken).GetAwaiter().GetResult())
+        $headers = New-Object Net.WebHeaderCollection
+        if ($observation.Calls -le 2) {
+            $headers['Location'] = "https://www.mql5.com/files/docs/deadline-$($observation.Calls).chm"
+            $stream = [IO.Stream]::Null
+            $statusCode = 302
+            $contentLength = 0
+        } else {
+            $stream = New-Object Mql5ChmSlowReadStream(
+                [Text.Encoding]::ASCII.GetBytes('ITSFdata'),
+                500
+            )
+            $statusCode = 200
+            $contentLength = 8
+        }
+        $response = [pscustomobject]@{
+            StatusCode=$statusCode
+            Headers=$headers
+            ContentLength=$contentLength
+            ResponseUri=$CurrentUri
+            TestStream=$stream
+        }
+        $response | Add-Member -MemberType ScriptMethod -Name GetResponseStream -Value { return $this.TestStream }
+        $response | Add-Member -MemberType ScriptMethod -Name Dispose -Value {
+            if ($null -ne $this.TestStream) { $this.TestStream.Dispose() }
+        }
+        return $response
+    }.GetNewClosure()
+
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    $deadlineError = $null
+    try {
+        Invoke-OfficialChmDownload `
+            -Uri ([uri]'https://www.mql5.com/files/docs/deadline-start.chm') `
+            -Destination $destination `
+            -MinimumBytes 4 `
+            -MaximumBytes 102400 `
+            -TimeoutSeconds 5 `
+            -InternalTestHooks @{GetResponse=$provider} | Out-Null
+    } catch {
+        $deadlineError = $_.Exception.Message
+    } finally {
+        $timer.Stop()
+        if (Test-Path -LiteralPath $fixture -PathType Container) {
+            Remove-SafeDirectory -ConfinementRoot $tempBase -Path $fixture
+        }
+    }
+
+    if ($null -eq $deadlineError -or $deadlineError -notmatch '5-second deadline') {
+        throw "Official CHM download did not enforce one end-to-end deadline. Error: $deadlineError"
+    }
+    if ($timer.Elapsed.TotalSeconds -gt 7.0) {
+        throw "Official CHM download deadline reset across redirects or trickle reads: $($timer.Elapsed.TotalSeconds) seconds."
+    }
+    if ($observation.Calls -ne 3) {
+        throw "Official CHM deadline fixture did not reach the redirected trickle stream: $($observation.Calls) responses."
+    }
+
+    $commonSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Common.ps1') -Raw
+    $downloadStart = $commonSource.IndexOf('function Invoke-OfficialChmDownload',[StringComparison]::Ordinal)
+    $downloadEnd = $commonSource.IndexOf('function Get-ValidatedRevisionChecksumFiles',[StringComparison]::Ordinal)
+    if ($downloadStart -lt 0 -or $downloadEnd -le $downloadStart) {
+        throw 'Could not isolate Invoke-OfficialChmDownload for deadline regression validation.'
+    }
+    $downloadSource = $commonSource.Substring($downloadStart,$downloadEnd-$downloadStart)
+    if ($downloadSource.Contains('Get-FileHash') -or -not $downloadSource.Contains('-HashAlgorithm')) {
+        throw 'Official CHM SHA-256 is not computed inside the cancellable bounded stream copy.'
+    }
+}
 
 function Assert-PhysicalLockAliasSerialization {
     [CmdletBinding()]
@@ -31,7 +181,10 @@ function Assert-PhysicalLockAliasSerialization {
         if ($mountvol.ExitCode -ne 0) { throw "mountvol could not resolve '$driveRoot': $($mountvol.Text)" }
         $volumeRoot = $mountvol.Text.Trim()
         if ($volumeRoot -notmatch '^\\\\\?\\Volume\{[0-9A-Fa-f-]+\}\\$') { throw "mountvol returned an unexpected volume path: '$volumeRoot'" }
-        $relativeMaintenance = [IO.Path]::GetRelativePath($driveRoot, $aliasMaintenance)
+        if (-not $aliasMaintenance.StartsWith($driveRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Fixture path is not on its resolved drive root: $aliasMaintenance"
+        }
+        $relativeMaintenance = $aliasMaintenance.Substring($driveRoot.Length).TrimStart('\','/')
         $volumeLockPath = [IO.Path]::Combine($volumeRoot, $relativeMaintenance, '.update.lock')
 
         $aliasHelper = Join-Path $aliasFixture 'try-lock.ps1'
@@ -58,7 +211,7 @@ try {
         if ([string]$aliasLease.Name -notlike 'Global\Mql5ChmMcp-*') {
             throw "Maintenance lock was not created in the machine-global namespace: $($aliasLease.Name)"
         }
-        $aliasResult = Invoke-NativeCapture -FilePath (Get-Command pwsh).Source -Arguments @(
+        $aliasResult = Invoke-NativeCapture -FilePath (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source -Arguments @(
             '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $aliasHelper,
             (Join-Path $PSScriptRoot 'Common.ps1'), $volumeLockPath
         )
@@ -88,8 +241,11 @@ function Assert-PackagePhysicalAliasRegressions {
         if ($mountvol.ExitCode -ne 0) { throw "mountvol could not resolve '$driveRoot': $($mountvol.Text)" }
         $volumeRoot = $mountvol.Text.Trim()
         if ($volumeRoot -notmatch '^\\\\\?\\Volume\{[0-9A-Fa-f-]+\}\\$') { throw "mountvol returned an unexpected volume path: '$volumeRoot'" }
-        $relative = [IO.Path]::GetRelativePath($driveRoot, $dosFull)
-        if ($relative -eq '.') { return $volumeRoot }
+        if (-not $dosFull.StartsWith($driveRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Fixture path is not on its resolved drive root: $dosFull"
+        }
+        $relative = $dosFull.Substring($driveRoot.Length).TrimStart('\','/')
+        if ([string]::IsNullOrWhiteSpace($relative)) { return $volumeRoot }
         return [IO.Path]::Combine($volumeRoot, $relative)
     }
 
@@ -214,6 +370,12 @@ function Assert-PackagePhysicalAliasRegressions {
         if (Test-Path -LiteralPath $aliasScope -PathType Container) { Remove-SafeDirectory -ConfinementRoot $fixtureRootFull -Path $aliasScope }
     }
 }
+if ($OfficialDownloadDeadlineOnly) {
+    Assert-OfficialDownloadDeadlineRegression
+    Write-Host 'Focused official CHM end-to-end deadline regression passed.'
+    return
+}
+
 if ($LockBoundaryOnly) {
     if (-not $runningOnWindows) { throw 'The focused nested-junction lock regression requires Windows junction support.' }
     $focusedTempRoot = Resolve-FullPath -Path ([IO.Path]::GetTempPath()) -MustExist -PathType Container
@@ -231,7 +393,7 @@ if ($LockBoundaryOnly) {
         $focusedRejected = $true
     } finally {
         if ($null -ne $focusedLease) { $focusedLease.Dispose() }
-        if (Test-Path -LiteralPath $focusedJunction) { Remove-Item -LiteralPath $focusedJunction -Force }
+        if (Test-Path -LiteralPath $focusedJunction) { [IO.Directory]::Delete($focusedJunction) }
         if (Test-Path -LiteralPath $focusedFixture -PathType Container) { Remove-SafeDirectory -ConfinementRoot $focusedTempRoot -Path $focusedFixture }
     }
     if (-not $focusedRejected) { throw 'The shared lock primitive accepted a lock path beneath a reparse-point ancestor.' }
@@ -267,6 +429,8 @@ if ($PackageAliasOnly) {
     return
 }
 
+Assert-OfficialDownloadDeadlineRegression
+
 $hashes = [pscustomobject]@{
     mql5='b6b3338a985e1efedc2c87fa478f648d7de53e1daa6d2a8a9e5359b8878e23fa'
     mql5book='4c0d0e6ce858b410f63969fc5d6b64076da73ae7f4c010c212b6993d018a1f17'
@@ -276,13 +440,15 @@ $expected = '8d058569d975ec5b5ec419770d952757acd0ea51ad8b63fe78eb49fb00751adc'
 if ((Get-CorpusRevision -SourceHashes $hashes) -cne $expected) { throw 'Canonical corpus revision fixture failed.' }
 
 $projectRoot = Resolve-FullPath -Path (Split-Path -Parent $PSScriptRoot) -MustExist -PathType Container
-$sevenZip = Resolve-SevenZipExtractor -Root $projectRoot
-if ([string]::IsNullOrWhiteSpace($sevenZip)) { throw 'Maintenance acceptance requires the bundled CHM-capable 7-Zip executable.' }
-$activeFixture = Assert-ManifestAndCorpus -ProjectRoot $projectRoot
-foreach ($definition in Get-Mql5CorpusDefinition) {
-    $listedCount = Get-ChmHtmlTopicCount -SevenZip $sevenZip -ChmPath (Join-Path $activeFixture.Root $definition.FileName)
-    $manifestCount = [int]$activeFixture.Manifest.sources.PSObject.Properties[$definition.Id].Value.topic_count
-    if ($listedCount -ne $manifestCount) { throw "Independent CHM directory count failed for '$($definition.FileName)': $listedCount != $manifestCount." }
+if (-not $SkipInstalledCorpusValidation) {
+    $sevenZip = Resolve-SevenZipExtractor -Root $projectRoot
+    if ([string]::IsNullOrWhiteSpace($sevenZip)) { throw 'Maintenance acceptance requires the bundled CHM-capable 7-Zip executable.' }
+    $activeFixture = Assert-ManifestAndCorpus -ProjectRoot $projectRoot
+    foreach ($definition in Get-Mql5CorpusDefinition) {
+        $listedCount = Get-ChmHtmlTopicCount -SevenZip $sevenZip -ChmPath (Join-Path $activeFixture.Root $definition.FileName)
+        $manifestCount = [int]$activeFixture.Manifest.sources.PSObject.Properties[$definition.Id].Value.topic_count
+        if ($listedCount -ne $manifestCount) { throw "Independent CHM directory count failed for '$($definition.FileName)': $listedCount != $manifestCount." }
+    }
 }
 
 $validRankings = [pscustomobject]@{}
@@ -380,6 +546,15 @@ try {
     Assert-Fixture -Condition $legacyCurrentContractRejected -Message 'RequireCurrent accepted the rollback-only schema-3 v1 contract.'
     $unknownContractRejected=$false;try{Assert-IndexContract -Contract 'mql5-chm-index-v3-assets-v999'}catch{$unknownContractRejected=$true}
     Assert-Fixture -Condition $unknownContractRejected -Message 'Schema-3 validation accepted an unsupported index contract.'
+    $currentSourceDefinition = @(Get-Mql5CorpusDefinition)[0]
+    Assert-CurrentCorpusSourceIdentity -Definition $currentSourceDefinition `
+        -Sha256 $currentSourceDefinition.Sha256 -TopicCount $currentSourceDefinition.TopicCount
+    $staleCurrentSourceRejected=$false
+    try {
+        Assert-CurrentCorpusSourceIdentity -Definition $currentSourceDefinition `
+            -Sha256 ('0' * 64) -TopicCount $currentSourceDefinition.TopicCount
+    } catch { $staleCurrentSourceRejected=$true }
+    Assert-Fixture -Condition $staleCurrentSourceRejected -Message 'RequireCurrent source identity accepted a stale CHM hash.'
 
     $unverifiedLayout = Join-Path $fixture 'unverified-layout'; New-Item -ItemType Directory -Path $unverifiedLayout | Out-Null
     Assert-Fixture -Condition ((Get-Mql5ChmLayoutMode -ProjectRoot $unverifiedLayout) -ceq 'unverified-portable') -Message 'Checksum-less portable layout was not classified as unverified.'
@@ -435,6 +610,34 @@ try {
     $checkIntegrityIndex = $checkUpdatesScriptText.IndexOf('Assert-MaintenancePackageIntegrity',[StringComparison]::Ordinal)
     $checkDownloadIndex = $checkUpdatesScriptText.IndexOf('Get-DownloadedSourceRecords',[StringComparison]::Ordinal)
     Assert-Fixture -Condition ($checkIntegrityIndex -ge 0 -and $checkDownloadIndex -gt $checkIntegrityIndex -and $checkUpdatesScriptText.Contains('Update-ManagedChecksumsIfPresent -ProjectRoot $root -AllowLegacyActive:')) -Message 'Documentation update checking can use the network before package preflight or cannot reconcile a supported noncurrent active contract.'
+    $indexMaintenanceScriptText = Get-Content -LiteralPath (Join-Path $projectRoot 'scripts\IndexMaintenance.ps1') -Raw
+    $updateScriptText = Get-Content -LiteralPath (Join-Path $projectRoot 'scripts\Update-Documentation.ps1') -Raw
+    $rebuildScriptText = Get-Content -LiteralPath (Join-Path $projectRoot 'scripts\Rebuild-Index.ps1') -Raw
+    $packageScriptText = Get-Content -LiteralPath (Join-Path $projectRoot 'scripts\Package-Portable.ps1') -Raw
+    $packageWrapperText = Get-Content -LiteralPath (Join-Path $projectRoot 'Package-Portable.ps1') -Raw
+    Assert-Fixture -Condition (
+        $indexMaintenanceScriptText.Contains('function Assert-CandidateActivationAccepted') -and
+        $updateScriptText.Contains('Assert-CandidateActivationAccepted') -and
+        $rebuildScriptText.Contains('Assert-CandidateActivationAccepted') -and
+        $packageScriptText.Contains('Assert-CandidateActivationAccepted') -and
+        -not $updateScriptText.Contains('function Assert-ApplyTransitionAccepted') -and
+        -not $rebuildScriptText.Contains('function Assert-RebuildActivationAccepted')
+    ) -Message 'Update, rebuild, and candidate packaging do not share one activation-acceptance verifier.'
+    $packageBaseIndex = $packageScriptText.IndexOf('$activeBase = Assert-ManifestAndCorpus',[StringComparison]::Ordinal)
+    $packageAcceptanceIndex = $packageScriptText.IndexOf('Assert-CandidateActivationAccepted',[StringComparison]::Ordinal)
+    $packageNodeGateIndex = $packageScriptText.IndexOf('$node = Ensure-PinnedNodeRuntime',[StringComparison]::Ordinal)
+    Assert-Fixture -Condition (
+        $packageScriptText.Contains("(Join-Path `$PSScriptRoot 'IndexMaintenance.ps1')") -and
+        $packageNodeGateIndex -ge 0 -and
+        $packageBaseIndex -ge 0 -and
+        $packageNodeGateIndex -lt $packageAcceptanceIndex -and
+        $packageAcceptanceIndex -gt $packageBaseIndex -and
+        $packageScriptText.Contains('-BaseRevision $activeBase') -and
+        $packageScriptText.Contains('-NodePath $node') -and
+        $packageScriptText.Contains('-AcceptAssetReduction:$AcceptAssetReduction') -and
+        $packageWrapperText.Contains('[switch]$AcceptAssetReduction') -and
+        $packageWrapperText.Contains('$arguments.AcceptAssetReduction=$true')
+    ) -Message 'Candidate packaging does not verify pinned Node before semantic inspection, bind the verified runtime path, verify against the current active base, or forward explicit asset-reduction acknowledgement.'
     foreach($blockedByStageScript in @('Install-Codex.ps1','Package-Portable.ps1')){
         $blockedByStageText=Get-Content -LiteralPath (Join-Path $projectRoot "scripts\$blockedByStageScript") -Raw
         $artifactRepairPosition=$blockedByStageText.IndexOf('Repair-InterruptedMaintenanceArtifacts',[StringComparison]::Ordinal)
@@ -443,6 +646,9 @@ try {
     }
     $installScriptText=Get-Content -LiteralPath (Join-Path $projectRoot 'scripts\Install-Codex.ps1') -Raw
     Assert-Fixture -Condition ($installScriptText.Contains('Assert-PackageChecksums -ProjectRoot $root -AllowLegacyActive') -and -not $installScriptText.Contains('Assert-ManifestAndCorpus -ProjectRoot $root -RequireCurrent')) -Message 'The transitional installer cannot register the repaired runtime while a supported noncurrent index is active.'
+    $installSmokeIndex=$installScriptText.IndexOf('Smoke-Test-McpServer.mjs',[StringComparison]::Ordinal)
+    $installRegistrationIndex=$installScriptText.IndexOf('Install-CodexMql5ChmRegistration',[StringComparison]::Ordinal)
+    Assert-Fixture -Condition ($installSmokeIndex -ge 0 -and $installRegistrationIndex -gt $installSmokeIndex -and $installScriptText.Contains("'--expected-active-revision'") -and $installScriptText.Contains("'--expected-index-revision'") -and $installScriptText.Contains("'--expected-corpus-revision'")) -Message 'Installer does not complete the revision-bound MCP smoke test before Codex registration.'
     $rollbackScriptText = Get-Content -LiteralPath (Join-Path $projectRoot 'scripts\Rollback-Documentation.ps1') -Raw
     $rollbackArtifactRepairIndex = $rollbackScriptText.IndexOf('Repair-InterruptedMaintenanceArtifacts',[StringComparison]::Ordinal)
     $rollbackStageRepairIndex = $rollbackScriptText.IndexOf('Repair-InterruptedRevisionStageInstall',[StringComparison]::Ordinal)
@@ -469,12 +675,12 @@ function Start-RevisionTransition { param([string]$ProjectRoot,[string]$Operatio
 function Complete-RevisionTransition { param([string]$ProjectRoot) Add-ProbeCall $ProjectRoot 'transition-complete'; return [pscustomobject]@{from_revision=('a'*64);to_revision=('b'*64)} }
 function Clear-RevisionTransition { param([string]$ProjectRoot,[object]$ExpectedTransition) Add-ProbeCall $ProjectRoot 'transition-clear' }
 '@, (New-Object Text.UTF8Encoding($false)))
-    $rollbackProbe = Invoke-NativeCapture -FilePath (Get-Command pwsh -CommandType Application).Source -Arguments @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $rollbackProbeScripts 'Rollback-Documentation.ps1'),'-ProjectRoot',$rollbackProbeRoot)
+    $rollbackProbe = Invoke-NativeCapture -FilePath (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source -Arguments @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $rollbackProbeScripts 'Rollback-Documentation.ps1'),'-ProjectRoot',$rollbackProbeRoot)
     Assert-Fixture -Condition ($rollbackProbe.ExitCode -eq 0) -Message "Rollback stage-order integration probe failed. $($rollbackProbe.Text)"
     $rollbackOrder = @(Get-Content -LiteralPath (Join-Path $rollbackProbeRoot 'rollback-order.log'))
     $rollbackStageCall = [Array]::IndexOf($rollbackOrder,'stage')
     Assert-Fixture -Condition ($rollbackStageCall -gt [Array]::IndexOf($rollbackOrder,'artifacts') -and $rollbackStageCall -lt [Array]::IndexOf($rollbackOrder,'transition-read') -and $rollbackStageCall -lt [Array]::IndexOf($rollbackOrder,'integrity') -and $rollbackStageCall -lt [Array]::IndexOf($rollbackOrder,'transition-start')) -Message 'Rollback integration did not repair the pending stage transaction before reading or changing revision state.'
-    foreach($functionName in @('Test-PathWithinOrEqual','Test-PathsOverlap','Get-PhysicalPathDescriptor','Test-PhysicalDescriptorWithinOrEqual','Test-PhysicalDescriptorsEqual','Test-PhysicalDescriptorsOverlap','Test-PhysicalPathWithinOrEqual','Test-PhysicalPathsEqual','Test-PhysicalPathsOverlap','Assert-PackageOutputPlan','Reset-OwnedPackageStage','Assert-PackageZipMatchesStage','Test-JsonIntegerValue','Assert-PackageZipSidecar','Write-NewJsonDurable','Assert-PreparedPackageManifestShape','Repair-PackagePreparedOrphans','Repair-PackageZipPublicationContext','Publish-PackageZipAtomically')){
+    foreach($functionName in @('Test-PathWithinOrEqual','Test-PathsOverlap','Get-PhysicalPathDescriptor','Test-PhysicalDescriptorWithinOrEqual','Test-PhysicalDescriptorsEqual','Test-PhysicalDescriptorsOverlap','Test-PhysicalPathWithinOrEqual','Test-PhysicalPathsEqual','Test-PhysicalPathsOverlap','Assert-PackageOutputPlan','Reset-OwnedPackageStage','Write-CanonicalPortableActivePointer','New-ReproduciblePackageZip','Assert-PackageZipMatchesStage','Test-JsonIntegerValue','Assert-PackageZipSidecar','Write-PackageSidecarDurable','Assert-PreparedPackageManifestShape','Repair-PackagePreparedOrphans','Repair-PackageZipPublicationContext','Publish-PackageZipAtomically')){
         $definition=$packageAst.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $functionName},$true)
         if($null -eq $definition){throw "Package safety helper '$functionName' is missing."}
         Invoke-Expression $definition.Extent.Text
@@ -497,7 +703,7 @@ function Clear-RevisionTransition { param([string]$ProjectRoot,[object]$Expected
         $junctionOutputRejected=$false
         try{Assert-PackageOutputPlan -Root $developmentLayout -ReleaseRoot (Join-Path $outputJunction 'release') -StageRoot (Join-Path $outputJunction 'release\package') -ZipPath (Join-Path $outputJunction 'release\package.zip')|Out-Null}catch{$junctionOutputRejected=$true}
         Assert-Fixture -Condition $junctionOutputRejected -Message 'Package output through a reparse-point parent was accepted.'
-        Remove-Item -LiteralPath $outputJunction -Force
+        [IO.Directory]::Delete($outputJunction)
     }
     $ownedOutput=Join-Path $fixture 'owned-package-output';New-Item -ItemType Directory -Path $ownedOutput|Out-Null
     $ownedStage=Join-Path $ownedOutput 'package';New-Item -ItemType Directory -Path $ownedStage|Out-Null
@@ -520,15 +726,17 @@ function Clear-RevisionTransition { param([string]$ProjectRoot,[object]$Expected
     $mismatchSource=Join-Path $ownedOutput 'wrong-package-root';New-Item -ItemType Directory -Path $mismatchSource|Out-Null
     [IO.File]::WriteAllText((Join-Path $mismatchSource 'unexpected.txt'),'unexpected',(New-Object Text.UTF8Encoding($false)))
     $script:packageMismatchSource=$mismatchSource
-    function Compress-Archive {
+    $originalNewReproduciblePackageZip=(Get-Item Function:\New-ReproduciblePackageZip).ScriptBlock
+    function New-ReproduciblePackageZip {
         [CmdletBinding()]
-        param([string]$LiteralPath,[string]$DestinationPath,[string]$CompressionLevel)
-        Microsoft.PowerShell.Archive\Compress-Archive -LiteralPath $script:packageMismatchSource -DestinationPath $DestinationPath -CompressionLevel Optimal -Force
+        param([string]$ReleaseRoot,[string]$StageRoot,[string]$ZipPath,[string]$SevenZipPath)
+        Microsoft.PowerShell.Archive\Compress-Archive -LiteralPath $script:packageMismatchSource -DestinationPath $ZipPath -CompressionLevel Optimal -Force
+        return $ZipPath
     }
     try {
         $mismatchedZipRejected=$false;try{Publish-PackageZipAtomically -ReleaseRoot $ownedOutput -StageRoot $ownedStage -ZipPath $existingZip|Out-Null}catch{$mismatchedZipRejected=$true}
     } finally {
-        Remove-Item Function:\Compress-Archive -ErrorAction SilentlyContinue
+        Set-Item Function:\New-ReproduciblePackageZip -Value $originalNewReproduciblePackageZip
         Remove-Variable -Name packageMismatchSource -Scope Script -ErrorAction SilentlyContinue
     }
     Assert-Fixture -Condition ($mismatchedZipRejected -and (Get-FileHash -Algorithm SHA256 -LiteralPath $existingZip).Hash -ceq $existingZipHash) -Message 'A ZIP with the wrong immutable tree displaced the previous known-good ZIP.'
@@ -556,7 +764,7 @@ function Clear-RevisionTransition { param([string]$ProjectRoot,[object]$Expected
     $killedTemporary = Join-Path $killedWriteFixture ('data\.json.tmp-' + [Guid]::NewGuid().ToString('N'))
     $killHelper = Join-Path $fixture 'kill-writer.ps1'
     [IO.File]::WriteAllText($killHelper, "param([string]`$Target)`n[IO.File]::WriteAllText(`$Target,'partial')`nStop-Process -Id `$PID -Force`n", (New-Object Text.UTF8Encoding($false)))
-    $child = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList @('-NoProfile','-File',$killHelper,$killedTemporary) -Wait -PassThru -WindowStyle Hidden
+    $child = Start-Process -FilePath (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source -ArgumentList @('-NoProfile','-File',$killHelper,$killedTemporary) -Wait -PassThru -WindowStyle Hidden
     Assert-Fixture -Condition ($child.ExitCode -ne 0 -and (Test-Path -LiteralPath $killedTemporary -PathType Leaf)) -Message 'Hard-interruption fixture did not leave the expected atomic temporary.'
     Repair-InterruptedMaintenanceArtifacts -ProjectRoot $killedWriteFixture
     Assert-Fixture -Condition (-not (Test-Path -LiteralPath $killedTemporary)) -Message 'Temp-only active-pointer debris was not reconciled.'
@@ -586,7 +794,7 @@ function Clear-RevisionTransition { param([string]$ProjectRoot,[object]$Expected
         $nestedJunctionLockRejected=$false;$nestedJunctionLease=$null
         try{$nestedJunctionLease=Enter-ExclusiveFileLock -Path (Join-Path $junctionChild 'locks\.update.lock') -TimeoutSeconds 1}catch{$nestedJunctionLockRejected=$true}finally{if($null -ne $nestedJunctionLease){$nestedJunctionLease.Dispose()}}
         Assert-Fixture -Condition $nestedJunctionLockRejected -Message 'The shared lock primitive accepted a lock path beneath a reparse-point ancestor.'
-        Remove-Item -LiteralPath $junctionRoot -Force
+        [IO.Directory]::Delete($junctionRoot)
         Assert-PhysicalLockAliasSerialization -FixtureRoot $fixture
         $externalRevisionTarget=Join-Path $fixture 'external-revision-target';New-Item -ItemType Directory -Path $externalRevisionTarget|Out-Null
         $externalTemporary=Join-Path $externalRevisionTarget ('.json.tmp-'+[Guid]::NewGuid().ToString('N'));[IO.File]::WriteAllText($externalTemporary,'external-sentinel')
@@ -594,7 +802,7 @@ function Clear-RevisionTransition { param([string]$ProjectRoot,[object]$Expected
         $revisionJunction=Join-Path $recoveryRevisions ('a'*64);New-Item -ItemType Junction -Path $revisionJunction -Target $externalRevisionTarget|Out-Null
         $revisionJunctionRejected=$false;try{Repair-InterruptedMaintenanceArtifacts -ProjectRoot $killedWriteFixture}catch{$revisionJunctionRejected=$true}
         Assert-Fixture -Condition ($revisionJunctionRejected -and (Test-Path -LiteralPath $externalTemporary -PathType Leaf)) -Message 'Recovery traversed a revision junction or changed its external target.'
-        Remove-Item -LiteralPath $revisionJunction -Force
+        [IO.Directory]::Delete($revisionJunction)
     }
 
     $pointer = Set-ActiveRevisionPointer -ProjectRoot $fixture -ActiveRevision $expected -PreviousRevision $null
@@ -954,8 +1162,8 @@ function Clear-RevisionTransition { param([string]$ProjectRoot,[object]$Expected
     $packageFixtureFiles = @(
         '.mql5-chm-package-root','runtime\node.exe','runtime\LICENSE','app\server.mjs','app\indexer.mjs',
         'config\mql5-image-policy.json','config\mql5-query-expansions.json','data\active.json','maintenance\.update.lock',
-        'Install-Codex.ps1','Rebuild-Index.ps1','Uninstall-Codex.ps1','Package-Portable.ps1','Check-DocumentationUpdates.ps1','Update-Documentation.ps1','Rollback-Documentation.ps1','README.md','SPEC.md',
-        'scripts\build.mjs','scripts\Generate-BundledNotices.mjs','scripts\inspect-database.mjs','scripts\Common.ps1','scripts\IndexMaintenance.ps1','scripts\SevenZipRuntime.ps1','scripts\StageInstallRecovery.ps1','scripts\Install-Codex.ps1','scripts\Rebuild-Index.ps1','scripts\Uninstall-Codex.ps1','scripts\Package-Portable.ps1','scripts\Check-DocumentationUpdates.ps1','scripts\Update-Documentation.ps1','scripts\Rollback-Documentation.ps1','scripts\Test-Maintenance.ps1','scripts\Test-StageInstallRecovery.ps1',
+        'Install-Codex.ps1','Rebuild-Index.ps1','Uninstall-Codex.ps1','Package-Portable.ps1','Check-DocumentationUpdates.ps1','Update-Documentation.ps1','Rollback-Documentation.ps1','package.json','README.md','SPEC.md',
+        'scripts\build.mjs','scripts\Generate-BundledNotices.mjs','scripts\inspect-database.mjs','scripts\Common.ps1','scripts\IndexMaintenance.ps1','scripts\SevenZipRuntime.ps1','scripts\StageInstallRecovery.ps1','scripts\Smoke-Test-McpServer.mjs','scripts\Compare-OfficialDocumentationHashes.ps1','scripts\Test-DocumentationFreshness.ps1','scripts\Test-PowerShellSyntax.ps1','scripts\Invoke-PowerShellTestSuite.ps1','scripts\Install-Codex.ps1','scripts\Rebuild-Index.ps1','scripts\Uninstall-Codex.ps1','scripts\Package-Portable.ps1','scripts\Check-DocumentationUpdates.ps1','scripts\Update-Documentation.ps1','scripts\Rollback-Documentation.ps1','scripts\Test-Maintenance.ps1','scripts\Test-StageInstallRecovery.ps1',
         'licenses\7ZIP-LICENSE.txt','licenses\BUNDLED-NODE-NOTICES.txt','licenses\bundled-node-dependencies.json','licenses\bundled-node-notice-overrides.json','licenses\overrides\boolbase-1.0.0.txt','licenses\CHEERIO-LICENSE.txt','licenses\ESBUILD-LICENSE.txt','licenses\ICONV-LITE-LICENSE.txt','licenses\JPEG-JS-LICENSE.txt','licenses\MCP-SDK-LICENSE.txt','licenses\NODE-LICENSE.txt','licenses\THIRD-PARTY-NOTICES.md','licenses\ZOD-LICENSE.txt',
         'tools\7z.exe','tools\7z.dll','tools\7zip.provenance.json',
         "revisions\$packageRevision\manifest.json", "revisions\$packageRevision\mql5-docs.sqlite", "revisions\$packageRevision\mql5.chm", "revisions\$packageRevision\mql5book.chm", "revisions\$packageRevision\neuronetworksbook.chm", "revisions\$packageRevision\corpus.lock.json", "revisions\$packageRevision\assets\mql5\$assetName"
@@ -964,6 +1172,7 @@ function Clear-RevisionTransition { param([string]$ProjectRoot,[object]$Expected
         $path=Join-Path $packageFixture $relative; $parent=Split-Path -Parent $path; if(-not(Test-Path -LiteralPath $parent)){New-Item -ItemType Directory -Path $parent -Force|Out-Null}
         if ($relative -eq 'maintenance\.update.lock') { [IO.File]::WriteAllBytes($path, (New-Object byte[] 0)) }
         elseif ($relative -eq '.mql5-chm-package-root') { [IO.File]::WriteAllText($path,"mql5-chm-portable-package-v1`n",(New-Object Text.UTF8Encoding($false))) }
+        elseif ($relative -eq 'package.json') { Copy-Item -LiteralPath (Join-Path $projectRoot 'package.json') -Destination $path }
         else { [IO.File]::WriteAllText($path,"fixture-$relative") }
     }
     Copy-Item -LiteralPath $packageRevisionRoot -Destination (Join-Path $packageFixture "revisions\$packageRevisionNext") -Recurse
@@ -1017,6 +1226,20 @@ function Clear-RevisionTransition { param([string]$ProjectRoot,[object]$Expected
         $missingRequiredScriptRejected=$false;try{Assert-PackageChecksums -ProjectRoot $packageFixture|Out-Null}catch{$missingRequiredScriptRejected=$true}
         Assert-Fixture -Condition $missingRequiredScriptRejected -Message 'Package verification accepted a package missing an essential maintenance script and its checksum entry.'
         [IO.File]::WriteAllBytes($commonFixturePath,$commonFixtureBytes);[IO.File]::WriteAllText((Join-Path $packageFixture 'checksums.sha256'),$originalChecksumText,(New-Object Text.UTF8Encoding($false)))
+        $smokeFixturePath = Join-Path $packageFixture 'scripts\Smoke-Test-McpServer.mjs'; $smokeFixtureBytes = [IO.File]::ReadAllBytes($smokeFixturePath)
+        Remove-Item -LiteralPath $smokeFixturePath -Force
+        $withoutSmoke = @($originalChecksumText -split "`r?`n" | Where-Object { $_ -and $_ -notmatch '(?i)\*scripts[/\\]Smoke-Test-McpServer\.mjs$' })
+        [IO.File]::WriteAllLines((Join-Path $packageFixture 'checksums.sha256'), $withoutSmoke, (New-Object Text.UTF8Encoding($false)))
+        $missingSmokeRejected=$false;try{Assert-PackageChecksums -ProjectRoot $packageFixture|Out-Null}catch{$missingSmokeRejected=$true}
+        Assert-Fixture -Condition $missingSmokeRejected -Message 'Package verification accepted a package missing the pre-registration MCP smoke helper and its checksum entry.'
+        [IO.File]::WriteAllBytes($smokeFixturePath,$smokeFixtureBytes);[IO.File]::WriteAllText((Join-Path $packageFixture 'checksums.sha256'),$originalChecksumText,(New-Object Text.UTF8Encoding($false)))
+        $packageManifestFixturePath = Join-Path $packageFixture 'package.json'; $packageManifestFixtureBytes = [IO.File]::ReadAllBytes($packageManifestFixturePath)
+        Remove-Item -LiteralPath $packageManifestFixturePath -Force
+        $withoutPackageManifest = @($originalChecksumText -split "`r?`n" | Where-Object { $_ -and $_ -notmatch '(?i)\*package\.json$' })
+        [IO.File]::WriteAllLines((Join-Path $packageFixture 'checksums.sha256'), $withoutPackageManifest, (New-Object Text.UTF8Encoding($false)))
+        $missingPackageManifestRejected=$false;try{Assert-PackageChecksums -ProjectRoot $packageFixture|Out-Null}catch{$missingPackageManifestRejected=$true}
+        Assert-Fixture -Condition $missingPackageManifestRejected -Message 'Package verification accepted a package missing the installer version manifest and its checksum entry.'
+        [IO.File]::WriteAllBytes($packageManifestFixturePath,$packageManifestFixtureBytes);[IO.File]::WriteAllText((Join-Path $packageFixture 'checksums.sha256'),$originalChecksumText,(New-Object Text.UTF8Encoding($false)))
         $sevenZipRuntimeFixturePath = Join-Path $packageFixture 'scripts\SevenZipRuntime.ps1'; $sevenZipRuntimeFixtureBytes = [IO.File]::ReadAllBytes($sevenZipRuntimeFixturePath)
         Remove-Item -LiteralPath $sevenZipRuntimeFixturePath -Force
         $withoutSevenZipRuntime = @($originalChecksumText -split "`r?`n" | Where-Object { $_ -and $_ -notmatch '(?i)\*scripts[/\\]SevenZipRuntime\.ps1$' })
@@ -1180,6 +1403,7 @@ function Clear-RevisionTransition { param([string]$ProjectRoot,[object]$Expected
         $parent=Split-Path -Parent $path;if(-not(Test-Path -LiteralPath $parent)){New-Item -ItemType Directory -Path $parent -Force|Out-Null}
         if($relative -eq 'maintenance\.update.lock'){[IO.File]::WriteAllBytes($path,(New-Object byte[] 0))}
         elseif($relative -eq '.mql5-chm-package-root'){[IO.File]::WriteAllText($path,"mql5-chm-portable-package-v1`n",(New-Object Text.UTF8Encoding($false)))}
+        elseif($relative -eq 'package.json'){Copy-Item -LiteralPath (Join-Path $projectRoot 'package.json') -Destination $path}
         else{[IO.File]::WriteAllText($path,"fixture-$relative")}
     }
     $portableMigrationLines=Get-ChildItem -LiteralPath $portableMigrationFixture -Recurse -File|Where-Object FullName -ne (Join-Path $portableMigrationFixture 'checksums.sha256')|ForEach-Object{
@@ -1233,6 +1457,7 @@ function Clear-RevisionTransition { param([string]$ProjectRoot,[object]$Expected
         $parent=Split-Path -Parent $path;if(-not(Test-Path -LiteralPath $parent)){New-Item -ItemType Directory -Path $parent -Force|Out-Null}
         if($relative -eq 'maintenance\.update.lock'){[IO.File]::WriteAllBytes($path,(New-Object byte[] 0))}
         elseif($relative -eq '.mql5-chm-package-root'){[IO.File]::WriteAllText($path,"mql5-chm-portable-package-v1`n",(New-Object Text.UTF8Encoding($false)))}
+        elseif($relative -eq 'package.json'){Copy-Item -LiteralPath (Join-Path $projectRoot 'package.json') -Destination $path}
         else{[IO.File]::WriteAllText($path,"fixture-$relative")}
     }
     $legacyTransition=[ordered]@{schema_version=1;operation='rollback';from_revision=$legacyTransitionFrom.Corpus;to_revision=$legacyTransitionTo.Corpus;started_at='2026-07-18T00:56:00Z'}
@@ -1285,7 +1510,8 @@ function Clear-RevisionTransition { param([string]$ProjectRoot,[object]$Expected
     Assert-Fixture -Condition $migrationConflictRejected -Message 'Legacy migration accepted a conflicting pre-existing index directory.'
     Assert-Fixture -Condition ([int](Get-ActiveRevisionPointer -ProjectRoot $migrationConflict).schema_version -eq 1) -Message 'Failed migration changed the legacy pointer.'
 
-    Write-Host 'Maintenance fixtures passed: package-layout trust, independent CHM counts, integrity/ranking/topic-loss refusal, exact asset closure and package tamper refusal, legacy pointer migration/retry/conflict refusal, checksum migration, stage-report refresh, strict schema-2 journals, idempotent apply/rollback, and interruption recovery.'
+    $corpusResult = if ($SkipInstalledCorpusValidation) { 'installed CHM counts deferred to the release suite' } else { 'independent CHM counts' }
+    Write-Host "Maintenance fixtures passed: package-layout trust, $corpusResult, integrity/ranking/topic-loss refusal, exact asset closure and package tamper refusal, legacy pointer migration/retry/conflict refusal, checksum migration, stage-report refresh, strict schema-2 journals, idempotent apply/rollback, and interruption recovery."
 } finally {
     if (Test-Path -LiteralPath $fixture -PathType Container) { Remove-SafeDirectory -ConfinementRoot $tempBase -Path $fixture }
 }
