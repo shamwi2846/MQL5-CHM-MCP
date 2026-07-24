@@ -17,6 +17,7 @@ foreach($functionAst in $packageAst.FindAll({param($node) $node -is [Management.
 
 function Resolve-PackagingTestNodeFixtureSource {
     [CmdletBinding()]
+    [OutputType([string])]
     param(
         [Parameter(Mandatory)][string]$ProjectRoot,
         [Parameter(Mandatory)][string]$LicensePath
