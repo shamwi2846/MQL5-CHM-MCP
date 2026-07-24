@@ -15,14 +15,27 @@ foreach($functionAst in $packageAst.FindAll({param($node) $node -is [Management.
     Invoke-Expression $functionAst.Extent.Text
 }
 
+function Resolve-PackagingTestNodeFixtureSource {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [Parameter(Mandatory)][string]$LicensePath
+    )
+
+    $bundledNode = Join-Path $ProjectRoot 'runtime\node.exe'
+    if (Test-PinnedNodeRuntimePair -NodePath $bundledNode -LicensePath $LicensePath) {
+        return $bundledNode
+    }
+
+    $nodeCommand = Get-Command node.exe -CommandType Application -ErrorAction Stop |
+        Select-Object -First 1
+    return [string]$nodeCommand.Source
+}
+
 $projectRoot = Resolve-FullPath -Path (Split-Path -Parent $PSScriptRoot) -MustExist -PathType Container
 $nodeFixtureLicense = Join-Path $projectRoot 'licenses\NODE-LICENSE.txt'
-$bundledNodeFixture = Join-Path $projectRoot 'runtime\node.exe'
-$nodeFixtureSource = if (Test-PinnedNodeRuntimePair -NodePath $bundledNodeFixture -LicensePath $nodeFixtureLicense) {
-    $bundledNodeFixture
-} else {
-    (Get-Command node -CommandType Application -ErrorAction Stop).Source
-}
+$nodeFixtureSource = Resolve-PackagingTestNodeFixtureSource -ProjectRoot $projectRoot -LicensePath $nodeFixtureLicense
 if (-not (Test-PinnedNodeRuntimePair -NodePath $nodeFixtureSource -LicensePath $nodeFixtureLicense)) {
     throw 'Packaging repair tests require the exact Node.js 24.17.0 x64 executable either in runtime or on PATH.'
 }
@@ -254,6 +267,46 @@ try {
     Assert-Test ($metadataProbe.ExitCode -eq 0) 'Package version or exact Node engine metadata is inconsistent.'
 
     Assert-Test (Test-PinnedNodeRuntimePair -NodePath $nodeFixtureSource -LicensePath $nodeFixtureLicense) 'Available Node runtime fixture is not the pinned distribution.'
+
+    $nodeSelectionRoot = Join-Path $testRoot 'multi-install-node-selection'
+    $fallbackProjectRoot = Join-Path $nodeSelectionRoot 'project-without-runtime'
+    $firstNodeDirectory = Join-Path $nodeSelectionRoot 'node-first'
+    $secondNodeDirectory = Join-Path $nodeSelectionRoot 'node-second'
+    New-Item -ItemType Directory -Path $fallbackProjectRoot -Force | Out-Null
+    $nodeFixtureDirectory = Split-Path -Parent $nodeFixtureSource
+    $priorPath = $env:PATH
+    try {
+        New-Item -ItemType Junction -Path $firstNodeDirectory -Target $nodeFixtureDirectory | Out-Null
+        New-Item -ItemType Junction -Path $secondNodeDirectory -Target $nodeFixtureDirectory | Out-Null
+        $env:PATH = "$firstNodeDirectory;$secondNodeDirectory;$priorPath"
+        $visibleNodeCommands = @(Get-Command node.exe -CommandType Application -ErrorAction Stop)
+        Assert-Test ($visibleNodeCommands.Count -ge 2) 'Multi-install Node fixture did not expose two PATH candidates.'
+        $selectedNodeFixture = Resolve-PackagingTestNodeFixtureSource `
+            -ProjectRoot $fallbackProjectRoot `
+            -LicensePath $nodeFixtureLicense
+        $expectedFirstNode = [IO.Path]::GetFullPath((Join-Path $firstNodeDirectory 'node.exe'))
+        Assert-Test (
+            $selectedNodeFixture -is [string] -and
+            [string]$selectedNodeFixture -ceq $expectedFirstNode
+        ) 'Node fixture fallback did not return the first PATH application as one string.'
+        Assert-Test (
+            Test-PinnedNodeRuntimePair -NodePath $selectedNodeFixture -LicensePath $nodeFixtureLicense
+        ) 'Selected multi-install Node fixture did not preserve pinned runtime validation.'
+    } finally {
+        $env:PATH = $priorPath
+        $junctionCleanupErrors = @()
+        foreach ($junction in @($firstNodeDirectory,$secondNodeDirectory)) {
+            try {
+                if (Test-Path -LiteralPath $junction) { [IO.Directory]::Delete($junction) }
+            } catch {
+                $junctionCleanupErrors += "$junction`: $($_.Exception.Message)"
+            }
+        }
+        if ($junctionCleanupErrors.Count -gt 0) {
+            throw "Could not clean multi-install Node fixture junctions: $($junctionCleanupErrors -join '; ')"
+        }
+    }
+
     Assert-SevenZipProvenance -ProjectRoot $projectRoot | Out-Null
     Assert-Test $true 'Pinned 7-Zip provenance validation failed.'
     $currentPolicyHash = Get-CanonicalImagePolicySha256 -ProjectRoot $projectRoot

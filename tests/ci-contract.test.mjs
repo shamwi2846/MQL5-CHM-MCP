@@ -280,6 +280,18 @@ test("release validation runs full suites under PowerShell 7 and Windows PowerSh
   assert.match(workflow, /SHA-256|sha256|Get-FileHash/u);
 });
 
+test("release packaging tests select one Node application on multi-install Windows runners", async () => {
+  const script = await text("scripts/Test-PackagingRepairs.ps1");
+  assert.match(
+    script,
+    /\$nodeCommand\s*=\s*Get-Command node\.exe -CommandType Application -ErrorAction Stop\s*\|\s*\n\s*Select-Object -First 1/u,
+  );
+  assert.match(script, /return \[string\]\$nodeCommand\.Source/u);
+  assert.match(script, /\$visibleNodeCommands\.Count -ge 2/u);
+  assert.match(script, /\$selectedNodeFixture -is \[string\]/u);
+  assert.match(script, /Test-PinnedNodeRuntimePair -NodePath \$selectedNodeFixture/u);
+});
+
 test("release validation retains the exact verified ZIP and sidecar", async () => {
   const workflow = await text(".github/workflows/release-validation.yml");
   const buildIndex = workflow.indexOf("Build the portable package twice and compare SHA-256");
