@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 
@@ -8,6 +10,7 @@ import {
   INDEX_CONTRACT,
   SCHEMA_VERSION,
   SOURCE_DEFINITIONS,
+  buildIndex,
   computeCorpusRevision,
   createSchema,
   decodeHtml,
@@ -15,6 +18,42 @@ import {
   parseHtmlTopic,
   resolveInternalLink,
 } from "../src/indexer.mjs";
+
+async function createDefaultCliCorpus(root) {
+  const sourceRoot = path.join(root, "sources");
+  const extractedRoot = path.join(root, "build", "extracted");
+  await mkdir(sourceRoot, { recursive: true });
+  await mkdir(path.join(root, "config"), { recursive: true });
+  await writeFile(
+    path.join(root, "config", "mql5-image-policy.json"),
+    await readFile(new URL("../config/mql5-image-policy.json", import.meta.url)),
+  );
+
+  const sources = [];
+  for (const definition of SOURCE_DEFINITIONS) {
+    const chmBytes = Buffer.from(`default-cli-${definition.source}`, "utf8");
+    await writeFile(path.join(sourceRoot, definition.filename), chmBytes);
+    const extractedDirectory = path.join(extractedRoot, definition.extractedDirectory);
+    await mkdir(extractedDirectory, { recursive: true });
+    await writeFile(
+      path.join(extractedDirectory, "topic.htm"),
+      `<div id="help"><h1>${definition.source}</h1><p>Default CLI fixture.</p></div>`,
+      "utf8",
+    );
+    sources.push({
+      id: definition.source,
+      filename: definition.filename,
+      sha256: createHash("sha256").update(chmBytes).digest("hex"),
+      bytes: chmBytes.length,
+      expected_topics: 1,
+    });
+  }
+  await writeFile(path.join(root, "corpus.lock.json"), JSON.stringify({
+    schema_version: 1,
+    expected_total_topics: sources.length,
+    sources,
+  }));
+}
 
 function hasUnpairedSurrogate(value) {
   for (let index = 0; index < value.length; index += 1) {
@@ -30,6 +69,17 @@ function hasUnpairedSurrogate(value) {
   }
   return false;
 }
+
+test("direct indexer defaults keep sources and output in separate directories", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "mql5-index-default-cli-"));
+  try {
+    await createDefaultCliCorpus(root);
+    const result = await buildIndex(root);
+    assert.equal(path.dirname(result.databasePath), path.join(root, "build", "index-candidate"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("schema v3 keeps deterministic source identity and adds the image catalog", () => {
   const database = new DatabaseSync(":memory:");

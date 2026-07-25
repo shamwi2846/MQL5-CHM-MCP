@@ -33,6 +33,8 @@ async function buildFixture({
   indexContract = "mql5-chm-index-v3-assets-v1",
   invalidIdentity = null,
   invalidIntegrity = null,
+  databaseApplicationId = 1_297_173_557,
+  databaseUserVersion = schemaVersion,
 } = {}) {
   const root = path.join(tmpdir(), `mql5-chm-v12-runtime-${process.pid}-${Date.now()}`);
   const candidate = path.join(root, "candidate");
@@ -75,6 +77,10 @@ async function buildFixture({
       PRAGMA foreign_keys = ON;
     `);
   }
+  database.exec(`
+    PRAGMA application_id = ${databaseApplicationId};
+    PRAGMA user_version = ${databaseUserVersion};
+  `);
 
   const insertSource = database.prepare(
     schemaVersion === 3
@@ -550,6 +556,47 @@ test("schema-2 rollback fixture passes the semantic startup verifier", async () 
   } finally {
     service?.close();
     await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("schema-2 and schema-3 startup reject the wrong SQLite application ID", async () => {
+  for (const schemaVersion of [2, 3]) {
+    const fixture = await buildFixture({ schemaVersion, databaseApplicationId: 0 });
+    let opened;
+    try {
+      await assert.rejects(
+        async () => {
+          opened = await createSearchService({ root: fixture.root });
+          return opened;
+        },
+        (error) => error?.code === "INVALID_INDEX" && /application ID/i.test(error.message),
+      );
+    } finally {
+      opened?.close();
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("schema-2 and schema-3 startup reject SQLite user_version drift", async () => {
+  for (const schemaVersion of [2, 3]) {
+    const fixture = await buildFixture({
+      schemaVersion,
+      databaseUserVersion: schemaVersion === 2 ? 3 : 2,
+    });
+    let opened;
+    try {
+      await assert.rejects(
+        async () => {
+          opened = await createSearchService({ root: fixture.root });
+          return opened;
+        },
+        (error) => error?.code === "INVALID_INDEX" && /schema version/i.test(error.message),
+      );
+    } finally {
+      opened?.close();
+      await rm(fixture.root, { recursive: true, force: true });
+    }
   }
 });
 

@@ -113,6 +113,76 @@ switch ($arguments[1]) {
     $shim = "@echo off`r`npwsh -NoProfile -ExecutionPolicy Bypass -File `"%~dp0fake-codex.ps1`" %*`r`nexit /b %ERRORLEVEL%`r`n"
     $codexPath = Join-Path $binRoot 'codex.cmd'
     [IO.File]::WriteAllText($codexPath, $shim, [Text.Encoding]::ASCII)
+    $resolverPriorityPathRoot = Join-Path $fixtureRoot 'resolver-path-priority'
+    $resolverPathRoot = Join-Path $fixtureRoot 'resolver-path'
+    $resolverDesktopRoot = Join-Path $fixtureRoot 'resolver-local-app-data'
+    $resolverDesktopBin = Join-Path $resolverDesktopRoot 'OpenAI\Codex\bin'
+    New-Item -ItemType Directory -Path $resolverPriorityPathRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $resolverPathRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $resolverDesktopBin 'newer-unrunnable') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $resolverDesktopBin 'older-runnable') -Force | Out-Null
+    $resolverPriorityPathExe = Join-Path $resolverPriorityPathRoot 'codex.exe'
+    $resolverPathShim = Join-Path $resolverPathRoot 'codex.cmd'
+    $resolverPathExe = Join-Path $resolverPathRoot 'codex.exe'
+    $resolverDesktopNewer = Join-Path $resolverDesktopBin 'newer-unrunnable\codex.exe'
+    $resolverDesktopFallback = Join-Path $resolverDesktopBin 'older-runnable\codex.exe'
+    foreach ($resolverFixture in @($resolverPriorityPathExe,$resolverPathShim,$resolverPathExe,$resolverDesktopNewer,$resolverDesktopFallback)) {
+        [IO.File]::WriteAllText($resolverFixture, 'resolver fixture', [Text.Encoding]::ASCII)
+    }
+    [IO.File]::SetLastWriteTimeUtc($resolverDesktopNewer, [DateTime]::UtcNow)
+    [IO.File]::SetLastWriteTimeUtc($resolverDesktopFallback, [DateTime]::UtcNow.AddMinutes(-1))
+    $originalPath = $env:Path
+    $originalLocalAppData = $env:LOCALAPPDATA
+    $originalNativeCapture = (Get-Command Invoke-NativeCapture -CommandType Function).ScriptBlock
+    $script:resolverProbePaths = New-Object System.Collections.Generic.List[string]
+    $script:resolverProbeTimeouts = New-Object System.Collections.Generic.List[int]
+    try {
+        $env:Path = "$resolverPriorityPathRoot$([IO.Path]::PathSeparator)$resolverPathRoot"
+        $env:LOCALAPPDATA = $resolverDesktopRoot
+        function Invoke-NativeCapture {
+            [CmdletBinding()]
+            param(
+                [Parameter(Mandatory)][string]$FilePath,
+                [string[]]$Arguments = @(),
+                [ValidateRange(1,1800)][int]$TimeoutSeconds = 300
+            )
+            $resolvedProbe = [IO.Path]::GetFullPath($FilePath)
+            $script:resolverProbePaths.Add($resolvedProbe)
+            $script:resolverProbeTimeouts.Add($TimeoutSeconds)
+            if ($resolvedProbe.Equals($resolverPathShim, [StringComparison]::OrdinalIgnoreCase)) {
+                throw [UnauthorizedAccessException]::new('simulated inaccessible PATH shim')
+            }
+            if (
+                $resolvedProbe.Equals($resolverPriorityPathExe, [StringComparison]::OrdinalIgnoreCase) -or
+                $resolvedProbe.Equals($resolverPathExe, [StringComparison]::OrdinalIgnoreCase)
+            ) {
+                return [pscustomobject]@{ExitCode=0;Text='not-codex 9.9.9';Lines=@('not-codex 9.9.9');DiagnosticTail='not-codex 9.9.9'}
+            }
+            if ($resolvedProbe.Equals($resolverDesktopNewer, [StringComparison]::OrdinalIgnoreCase)) {
+                return [pscustomobject]@{ExitCode=9;Text='codex-cli 9.9.9';Lines=@('codex-cli 9.9.9');DiagnosticTail='codex-cli 9.9.9'}
+            }
+            return [pscustomobject]@{ExitCode=0;Text='codex-cli 9.9.9';Lines=@('codex-cli 9.9.9');DiagnosticTail='codex-cli 9.9.9'}
+        }
+        $resolvedCodexFixture = Resolve-CodexExecutable
+        Assert-Test (
+            $resolvedCodexFixture.Equals($resolverDesktopFallback, [StringComparison]::OrdinalIgnoreCase)
+        ) 'Codex resolver did not reject inaccessible, malformed, and nonzero candidates before using the runnable Desktop fallback.'
+        Assert-Test (
+            $script:resolverProbePaths.Count -eq 5 -and
+            $script:resolverProbePaths[0].Equals($resolverPriorityPathExe, [StringComparison]::OrdinalIgnoreCase) -and
+            $script:resolverProbePaths[1].Equals($resolverPathShim, [StringComparison]::OrdinalIgnoreCase) -and
+            $script:resolverProbePaths[2].Equals($resolverPathExe, [StringComparison]::OrdinalIgnoreCase) -and
+            $script:resolverProbePaths[3].Equals($resolverDesktopNewer, [StringComparison]::OrdinalIgnoreCase) -and
+            $script:resolverProbePaths[4].Equals($resolverDesktopFallback, [StringComparison]::OrdinalIgnoreCase)
+        ) 'Codex resolver did not preserve PATH directory precedence and deterministic within-directory ordering.'
+        Assert-Test (
+            @($script:resolverProbeTimeouts | Where-Object { $_ -ne 5 }).Count -eq 0
+        ) 'Codex resolver capability probes were not bounded.'
+    } finally {
+        Set-Item -LiteralPath Function:\Invoke-NativeCapture -Value $originalNativeCapture
+        $env:Path = $originalPath
+        $env:LOCALAPPDATA = $originalLocalAppData
+    }
     $nodePath = Join-Path $fixtureRoot 'package\runtime\node.exe'
     $serverPath = Join-Path $fixtureRoot 'package\app\server.mjs'
     $otherNode = 'C:\other-package\runtime\node.exe'

@@ -11,9 +11,45 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1";
 const SETUP_NODE_ACTION = "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020";
 const UPLOAD_ARTIFACT_ACTION = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
+const PINNED_HONO_NODE_SERVER_VERSION = "2.0.11";
+const APPROVED_HONO_NODE_SERVER_VERSIONS = new Set([PINNED_HONO_NODE_SERVER_VERSION]);
+const RELEASE_VERSION_SOURCE = String.raw`(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?`;
 
 async function text(relativePath) {
   return readFile(path.join(root, relativePath), "utf8");
+}
+
+function assertCurrentProductVersions(content, versionPattern, expectedVersion, context) {
+  const versions = [...content.matchAll(versionPattern)].map((match) => match.groups.version);
+  assert.ok(versions.length > 0, `${context} does not contain a product release identity`);
+  for (const actualVersion of versions) {
+    assert.equal(
+      actualVersion,
+      expectedVersion,
+      `${context} reports stale product release ${actualVersion}; expected only ${expectedVersion}`,
+    );
+  }
+}
+
+function releaseIdentityPattern(prefixSource, suffixSource, flags = "gu") {
+  return new RegExp(
+    `${prefixSource}(?<version>${RELEASE_VERSION_SOURCE})${suffixSource}`,
+    flags,
+  );
+}
+
+function assertPatchedHonoResolutions(lockMetadata) {
+  const packageEntries = Object.entries(lockMetadata.packages ?? {})
+    .filter(([packagePath]) => (
+      /(?:^|\/)node_modules\/@hono\/node-server$/u.test(packagePath.replaceAll("\\", "/"))
+    ));
+  assert.ok(packageEntries.length > 0, "package-lock.json does not resolve @hono/node-server");
+  for (const [packagePath, metadata] of packageEntries) {
+    assert.ok(
+      APPROVED_HONO_NODE_SERVER_VERSIONS.has(metadata?.version),
+      `${packagePath} resolves unapproved @hono/node-server ${metadata?.version ?? "<missing>"}`,
+    );
+  }
 }
 
 function workflowSteps(workflow) {
@@ -170,26 +206,125 @@ test("release version remains consistent across package, runtime, documentation,
   assert.equal(lockMetadata.packages[""].version, version);
 
   const identityFiles = [
-    ["src/server.mjs", `version: "${version}"`],
-    ["README.md", `# MQL5 CHM MCP ${version}`],
-    ["SPEC.md", `# Portable Read-Only MQL5 CHM MCP v${version}`],
-    ["SPEC.md", `Server/package version: ${version}`],
-    ["scripts/Common.ps1", `mql5-chm-mcp-packager/${version}`],
-    ["scripts/Common.ps1", `mql5-chm-mcp/${version}`],
-    ["scripts/SevenZipRuntime.ps1", `mql5-chm-mcp-packager/${version}`],
+    [
+      "src/server.mjs",
+      `version: "${version}"`,
+      releaseIdentityPattern(
+        String.raw`\{\s*name:\s*"mql5-chm",\s*version:\s*"`,
+        String.raw`"\s*\}`,
+      ),
+    ],
+    [
+      "app/server.mjs",
+      `version: "${version}"`,
+      releaseIdentityPattern(
+        String.raw`\{\s*name:\s*"mql5-chm",\s*version:\s*"`,
+        String.raw`"\s*\}`,
+      ),
+    ],
+    [
+      "README.md",
+      `# MQL5 CHM MCP ${version}`,
+      releaseIdentityPattern(String.raw`^# MQL5 CHM MCP `, String.raw`\r?$`, "gmu"),
+    ],
+    [
+      "SPEC.md",
+      `# Portable Read-Only MQL5 CHM MCP v${version}`,
+      releaseIdentityPattern(
+        String.raw`^# Portable Read-Only MQL5 CHM MCP v`,
+        String.raw`\r?$`,
+        "gmu",
+      ),
+    ],
+    [
+      "SPEC.md",
+      `Server/package version: ${version}`,
+      releaseIdentityPattern(String.raw`Server\/package version:\s*`, String.raw`\.`),
+    ],
+    [
+      "SPEC.md",
+      `v${version} emits \`mql5-chm-index-v3-assets-v3\``,
+      releaseIdentityPattern(
+        String.raw`\bv`,
+        "\\s+emits\\s+`mql5-chm-index-v3-assets-v3`",
+      ),
+    ],
+    [
+      "scripts/Common.ps1",
+      `mql5-chm-mcp-packager/${version}`,
+      releaseIdentityPattern(String.raw`mql5-chm-mcp(?:-packager)?\/`, "'"),
+    ],
+    [
+      "scripts/Common.ps1",
+      `mql5-chm-mcp/${version}`,
+      releaseIdentityPattern(String.raw`mql5-chm-mcp(?:-packager)?\/`, "'"),
+    ],
+    [
+      "scripts/SevenZipRuntime.ps1",
+      `mql5-chm-mcp-packager/${version}`,
+      releaseIdentityPattern(String.raw`mql5-chm-mcp-packager\/`, "'"),
+    ],
   ];
-  for (const [relativePath, expected] of identityFiles) {
-    assert.ok((await text(relativePath)).includes(expected), `${relativePath} does not report release ${version}`);
+  for (const [relativePath, expected, versionPattern] of identityFiles) {
+    const content = await text(relativePath);
+    assert.ok(content.includes(expected), `${relativePath} does not report release ${version}`);
+    assertCurrentProductVersions(content, versionPattern, version, relativePath);
   }
 });
 
+test("release identity validation rejects mixed current and stale product versions", () => {
+  const fixture = [
+    "'mql5-chm-mcp/1.2.5'",
+    "'mql5-chm-mcp-packager/1.2.4'",
+  ].join("\n");
+  assert.throws(
+    () => assertCurrentProductVersions(
+      fixture,
+      releaseIdentityPattern(String.raw`mql5-chm-mcp(?:-packager)?\/`, "'"),
+      "1.2.5",
+      "identity fixture",
+    ),
+    /reports stale product release 1\.2\.4/u,
+  );
+});
+
+test("release identity validation accepts supported prerelease and build SemVer", () => {
+  assert.doesNotThrow(() => assertCurrentProductVersions(
+    "'mql5-chm-mcp/1.2.6-rc.1+build.7'",
+    releaseIdentityPattern(String.raw`mql5-chm-mcp(?:-packager)?\/`, "'"),
+    "1.2.6-rc.1+build.7",
+    "prerelease identity fixture",
+  ));
+});
+
 test("lockfile resolves the patched Hono Node server release", async () => {
+  const packageMetadata = JSON.parse(await text("package.json"));
   const lockMetadata = JSON.parse(await text("package-lock.json"));
   assert.equal(
-    lockMetadata.packages["node_modules/@hono/node-server"]?.version,
-    "1.19.15",
-    "package-lock.json must not resolve GHSA-frvp-7c67-39w9-vulnerable @hono/node-server releases",
+    packageMetadata.overrides?.["@hono/node-server"],
+    PINNED_HONO_NODE_SERVER_VERSION,
+    "package.json must override the SDK's vulnerable @hono/node-server 1.x range",
   );
+  assertPatchedHonoResolutions(lockMetadata);
+});
+
+test("Hono lockfile validation rejects a vulnerable nested resolution", () => {
+  assert.throws(
+    () => assertPatchedHonoResolutions({
+      packages: {
+        "node_modules/@hono/node-server": { version: "2.0.11" },
+        "node_modules/example/node_modules/@hono/node-server": { version: "1.19.15" },
+      },
+    }),
+    /node_modules\/example\/node_modules\/@hono\/node-server resolves unapproved .* 1\.19\.15/u,
+  );
+});
+
+test("Hono security override preserves the MCP SDK HTTP adapter API", async () => {
+  const honoNodeServer = await import("@hono/node-server");
+  const sdkHttpTransport = await import("@modelcontextprotocol/sdk/server/streamableHttp.js");
+  assert.equal(typeof honoNodeServer.getRequestListener, "function");
+  assert.equal(typeof sdkHttpTransport.StreamableHTTPServerTransport, "function");
 });
 
 test("workflow action inspection covers concise and quoted YAML forms", () => {
@@ -253,7 +388,7 @@ test("package scripts expose explicit fast, maintenance, and release suites", as
   assert.match(packageJson.scripts["test:release"], /test:prepare-corpus/u);
 });
 
-test("Windows CI runs the fast suite on pull requests with the pinned toolchain", async () => {
+test("Windows CI runs fast and cross-shell maintenance suites on pull requests with the pinned toolchain", async () => {
   const workflow = await text(".github/workflows/windows-ci.yml");
   const setupNodeSteps = verifiedActionSteps(workflow, "actions/setup-node@", "Windows CI");
   assert.match(workflow, /\bpull_request\s*:/u);
@@ -263,8 +398,13 @@ test("Windows CI runs the fast suite on pull requests with the pinned toolchain"
   assert.equal(setupNodeInputs.get("node-version"), "24.17.0");
   assert.equal(setupNodeInputs.get("cache"), "npm");
   assert.match(workflow, /npm run test:fast/u);
-  assert.match(workflow, /\bpwsh\b/u);
-  assert.match(workflow, /\bpowershell(?:\.exe)?\b/u);
+  const steps = workflowSteps(workflow);
+  const pwshMaintenance = steps.find((step) => step.includes("npm run test:maintenance"));
+  const windowsPowerShellMaintenance = steps.find((step) => (
+    /Invoke-PowerShellTestSuite\.ps1\s+-Suite\s+Maintenance/u.test(step)
+  ));
+  assert.match(pwshMaintenance ?? "", /\bshell:\s*pwsh\b/u);
+  assert.match(windowsPowerShellMaintenance ?? "", /\bshell:\s*powershell\b/u);
 });
 
 test("GitHub workflows never persist checkout credentials", async () => {

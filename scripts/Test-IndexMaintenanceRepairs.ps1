@@ -151,8 +151,35 @@ Start-Sleep -Milliseconds 100
 
     $nativeHelper = Join-Path $fixtureRoot 'native timeout helper.ps1'
     [IO.File]::WriteAllText($nativeHelper, @'
-param([string]$Mode,[string]$OutputPath)
+param(
+    [string]$Mode,
+    [string]$OutputPath,
+    [Parameter(ValueFromRemainingArguments=$true)][string[]]$RemainingArguments
+)
 if ($Mode -ceq 'sleep') { Start-Sleep -Seconds 30; exit 0 }
+if ($Mode -ceq 'spawn-child') {
+    $escapedOutput = $OutputPath.Replace("'","''")
+    $childCommand = "Start-Sleep -Seconds 2; [IO.File]::WriteAllText('$escapedOutput','descendant-survived',[Text.Encoding]::UTF8)"
+    $encodedChild = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childCommand))
+    Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList @('-NoProfile','-EncodedCommand',$encodedChild) -WindowStyle Hidden | Out-Null
+    Start-Sleep -Seconds 30
+    exit 0
+}
+if ($Mode -ceq 'capture') {
+    [Console]::Out.WriteLine('captured-stdout')
+    [Console]::Error.WriteLine('captured-stderr')
+    exit 7
+}
+if ($Mode -ceq 'cwd') {
+    [Console]::Out.Write([Environment]::CurrentDirectory)
+    exit 0
+}
+if ($Mode -ceq 'arguments') {
+    $values = @($OutputPath) + @($RemainingArguments)
+    $json = ConvertTo-Json -InputObject ([pscustomobject]@{ arguments=[string[]]$values }) -Compress
+    [Console]::Out.Write([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json)))
+    exit 0
+}
 [IO.File]::WriteAllText($OutputPath,'argument-preserved',[Text.Encoding]::UTF8)
 '@, (New-Object Text.UTF8Encoding($false)))
     $hostExecutable = (Get-Process -Id $PID).Path
@@ -161,6 +188,122 @@ if ($Mode -ceq 'sleep') { Start-Sleep -Seconds 30; exit 0 }
         Invoke-NativeProcessWithTimeout -FilePath $hostExecutable -Arguments @('-NoProfile','-ExecutionPolicy','Bypass','-File',$nativeHelper,'sleep','unused') -TimeoutSeconds 1 | Out-Null
     } -Pattern 'deadline' -Message 'A hung native extractor was not terminated at its deadline.'
     Assert-RepairFixture -Condition ($timeoutTimer.Elapsed.TotalSeconds -lt 8) -Message 'Native extraction timeout did not return promptly.'
+    $descendantOutput = Join-Path $fixtureRoot 'timed-out-descendant.txt'
+    Assert-RepairThrows -Action {
+        Invoke-NativeProcessWithTimeout -FilePath $hostExecutable -Arguments @('-NoProfile','-ExecutionPolicy','Bypass','-File',$nativeHelper,'spawn-child',$descendantOutput) -TimeoutSeconds 1 | Out-Null
+    } -Pattern 'deadline' -Message 'A native process tree did not report its deadline.'
+    Start-Sleep -Milliseconds 2500
+    Assert-RepairFixture -Condition (-not (Test-Path -LiteralPath $descendantOutput)) -Message 'A timed-out native process left a descendant running after cleanup began.'
+
+    Assert-RepairThrows -Action {
+        Invoke-NativeCapture -FilePath $hostExecutable -Arguments @('-NoProfile','-ExecutionPolicy','Bypass','-File',$nativeHelper,'sleep','unused') -TimeoutSeconds 1 | Out-Null
+    } -Pattern 'deadline' -Message 'Invoke-NativeCapture did not enforce its requested deadline.'
+    Assert-RepairThrows -Action {
+        Invoke-NativeChecked -FilePath $hostExecutable -Arguments @('-NoProfile','-ExecutionPolicy','Bypass','-File',$nativeHelper,'sleep','unused') -TimeoutSeconds 1
+    } -Pattern 'deadline' -Message 'Invoke-NativeChecked did not enforce its requested deadline.'
+    $nativeNode = Resolve-NodeExecutable -ProjectRoot (Split-Path -Parent $PSScriptRoot)
+    $inheritedHandleOutput = Join-Path $fixtureRoot 'inherited-handle-descendant.txt'
+    $escapedInheritedHandleOutput = ConvertTo-Json -InputObject $inheritedHandleOutput -Compress
+    $inheritedHandleChildScript = "setTimeout(()=>require('node:fs').writeFileSync($escapedInheritedHandleOutput,'descendant-survived'),2000);setTimeout(()=>{},5000)"
+    $escapedInheritedHandleChildScript = ConvertTo-Json -InputObject $inheritedHandleChildScript -Compress
+    $inheritedHandleScript = "const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e',$escapedInheritedHandleChildScript],{detached:true,stdio:['ignore',1,2]});child.unref();"
+    $inheritedHandleTimer = [Diagnostics.Stopwatch]::StartNew()
+    $inheritedHandleResult = Invoke-NativeCapture -FilePath $nativeNode -Arguments @('--input-type=commonjs','-e',$inheritedHandleScript) -TimeoutSeconds 1
+    Assert-RepairFixture -Condition (
+        $inheritedHandleResult.ExitCode -eq 0 -and $inheritedHandleTimer.Elapsed.TotalSeconds -lt 4
+    ) -Message 'A parent-exited native descendant retained inherited output handles after contained cleanup.'
+    Start-Sleep -Milliseconds 2500
+    Assert-RepairFixture -Condition (-not (Test-Path -LiteralPath $inheritedHandleOutput)) -Message 'A parent-exited native descendant survived its containment deadline.'
+
+    $successfulDetachedOutput = Join-Path $fixtureRoot 'successful-detached-descendant.txt'
+    $escapedSuccessfulDetachedOutput = ConvertTo-Json -InputObject $successfulDetachedOutput -Compress
+    $successfulDetachedChildScript = "setTimeout(()=>require('node:fs').writeFileSync($escapedSuccessfulDetachedOutput,'descendant-survived'),2000);setTimeout(()=>{},5000)"
+    $escapedSuccessfulDetachedChildScript = ConvertTo-Json -InputObject $successfulDetachedChildScript -Compress
+    $successfulDetachedParentScript = "const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e',$escapedSuccessfulDetachedChildScript],{detached:true,stdio:'ignore'});child.unref();"
+    $successfulDetached = Invoke-NativeCapture -FilePath $nativeNode -Arguments @('--input-type=commonjs','-e',$successfulDetachedParentScript) -TimeoutSeconds 10
+    Assert-RepairFixture -Condition ($successfulDetached.ExitCode -eq 0) -Message 'A successful native parent with a detached descendant did not preserve its exit code.'
+    Start-Sleep -Milliseconds 2500
+    Assert-RepairFixture -Condition (-not (Test-Path -LiteralPath $successfulDetachedOutput)) -Message 'A detached no-pipe descendant survived successful native invocation cleanup.'
+
+    $capturedFailure = Invoke-NativeCapture -FilePath $hostExecutable -Arguments @('-NoProfile','-ExecutionPolicy','Bypass','-File',$nativeHelper,'capture','unused') -TimeoutSeconds 10
+    Assert-RepairFixture -Condition (
+        $capturedFailure.ExitCode -eq 7 -and
+        $capturedFailure.Text.Contains('captured-stdout') -and
+        $capturedFailure.Text.Contains('captured-stderr')
+    ) -Message 'Bounded native capture did not preserve the exit code and diagnostic streams.'
+
+    $batchHelper = Join-Path $fixtureRoot 'native batch helper with spaces.cmd'
+    [IO.File]::WriteAllText($batchHelper, @'
+@echo off
+if "%~1"=="sleep" (
+  "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -Command "Start-Sleep -Seconds 30"
+  exit /b 0
+)
+if "%~1"=="spawn-child" (
+  start "" /b "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -EncodedCommand "%~2"
+  exit /b 0
+)
+echo [%~1]
+echo [%~2]
+exit /b 7
+'@.Replace("`r`n","`n").Replace("`r","`n").Replace("`n","`r`n"), [Text.Encoding]::ASCII)
+    $batchCapture = Invoke-NativeCapture -FilePath $batchHelper -Arguments @('contains spaces','') -TimeoutSeconds 10
+    Assert-RepairFixture -Condition (
+        $batchCapture.ExitCode -eq 7 -and
+        $batchCapture.Text -match '(?m)^\[contains spaces\]\r?$' -and
+        $batchCapture.Text -match '(?m)^\[\]\r?$'
+    ) -Message 'Bounded native capture did not preserve synchronous .cmd output, empty arguments, spaces, and exit code.'
+    $batchTimeoutTimer = [Diagnostics.Stopwatch]::StartNew()
+    Assert-RepairThrows -Action {
+        Invoke-NativeCapture -FilePath $batchHelper -Arguments @('sleep') -TimeoutSeconds 1 | Out-Null
+    } -Pattern 'deadline' -Message 'A timed-out .cmd target was not contained.'
+    Assert-RepairFixture -Condition ($batchTimeoutTimer.Elapsed.TotalSeconds -lt 8) -Message 'A timed-out .cmd target did not return promptly.'
+    $batchDescendantOutput = Join-Path $fixtureRoot 'batch-inherited-handle-descendant.txt'
+    $escapedBatchDescendantOutput = $batchDescendantOutput.Replace("'","''")
+    $batchDescendantCommand = "Start-Sleep -Seconds 2; [IO.File]::WriteAllText('$escapedBatchDescendantOutput','batch-descendant-survived',[Text.Encoding]::UTF8); Start-Sleep -Seconds 30"
+    $encodedBatchDescendant = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($batchDescendantCommand))
+    $batchDescendantTimer = [Diagnostics.Stopwatch]::StartNew()
+    $batchDescendantResult = Invoke-NativeCapture -FilePath $batchHelper -Arguments @('spawn-child',$encodedBatchDescendant) -TimeoutSeconds 5
+    Assert-RepairFixture -Condition (
+        $batchDescendantResult.ExitCode -eq 0 -and $batchDescendantTimer.Elapsed.TotalSeconds -lt 4
+    ) -Message 'A successful .cmd descendant retained inherited output handles after its parent exited.'
+    Start-Sleep -Milliseconds 2500
+    Assert-RepairFixture -Condition (-not (Test-Path -LiteralPath $batchDescendantOutput)) -Message 'A successful .cmd descendant survived outer job cleanup.'
+
+    $nativeWorkingDirectory = New-Item -ItemType Directory -Path (Join-Path $fixtureRoot 'native current directory')
+    Push-Location $nativeWorkingDirectory.FullName
+    try {
+        $workingDirectoryResult = Invoke-NativeCapture -FilePath $hostExecutable -Arguments @('-NoProfile','-ExecutionPolicy','Bypass','-File',$nativeHelper,'cwd','unused') -TimeoutSeconds 10
+    } finally {
+        Pop-Location
+    }
+    Assert-RepairFixture -Condition (
+        $workingDirectoryResult.ExitCode -eq 0 -and
+        $workingDirectoryResult.Text.Trim().Equals($nativeWorkingDirectory.FullName, [StringComparison]::OrdinalIgnoreCase)
+    ) -Message 'Bounded native invocation did not preserve the caller filesystem working directory.'
+
+    $unicodeArgument = 'unicode-' + [char]0x2603 + '-' + [char]0x6f22
+    $nativeArgumentValues = [string[]]@(
+        '',
+        'contains spaces',
+        'embedded"quote',
+        'trailing\',
+        'slashes\\before"quote',
+        $unicodeArgument
+    )
+    $argumentProbeCommand = [string[]]@(
+        '-NoProfile','-ExecutionPolicy','Bypass','-File',$nativeHelper,'arguments'
+    ) + $nativeArgumentValues
+    $argumentProbe = Invoke-NativeCapture -FilePath $hostExecutable -Arguments $argumentProbeCommand -TimeoutSeconds 10
+    $argumentProbeJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($argumentProbe.Text))
+    $argumentProbeValues = @((ConvertFrom-Json -InputObject $argumentProbeJson).arguments)
+    Assert-RepairFixture -Condition ($argumentProbe.ExitCode -eq 0 -and $argumentProbeValues.Count -eq $nativeArgumentValues.Count) -Message 'Bounded native invocation changed the argument count.'
+    for ($argumentIndex = 0; $argumentIndex -lt $nativeArgumentValues.Count; $argumentIndex++) {
+        Assert-RepairFixture -Condition (
+            [string]$argumentProbeValues[$argumentIndex] -ceq $nativeArgumentValues[$argumentIndex]
+        ) -Message "Bounded native invocation corrupted argument $argumentIndex."
+    }
+
     $argumentOutput = Join-Path $fixtureRoot 'path containing spaces\argument output.txt'
     New-Item -ItemType Directory -Path (Split-Path -Parent $argumentOutput) | Out-Null
     Invoke-NativeProcessWithTimeout -FilePath $hostExecutable -Arguments @('-NoProfile','-ExecutionPolicy','Bypass','-File',$nativeHelper,'write',$argumentOutput) -TimeoutSeconds 10 | Out-Null

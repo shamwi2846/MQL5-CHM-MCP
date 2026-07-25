@@ -15952,7 +15952,7 @@ async function buildIndex(projectRootInput, options = {}) {
   await assertRealDirectory(projectRoot, "Project root");
   const workspaceRoot = options.workspaceRoot ? path.resolve(projectRoot, options.workspaceRoot) : projectRoot;
   await assertRealDirectory(workspaceRoot, "Maintenance workspace root");
-  const sourceDirectory = options.sourceDirectory ? path.resolve(workspaceRoot, options.sourceDirectory) : workspaceRoot;
+  const sourceDirectory = options.sourceDirectory ? path.resolve(workspaceRoot, options.sourceDirectory) : path.join(workspaceRoot, "sources");
   const extractedRoot = options.extractedDirectory ? path.resolve(workspaceRoot, options.extractedDirectory) : path.join(workspaceRoot, "build", "extracted");
   const outputDirectory = options.outputDirectory ? path.resolve(workspaceRoot, options.outputDirectory) : path.join(workspaceRoot, "build", "index-candidate");
   const corpusLockPath = options.corpusLockPath ? path.resolve(workspaceRoot, options.corpusLockPath) : path.join(workspaceRoot, "corpus.lock.json");

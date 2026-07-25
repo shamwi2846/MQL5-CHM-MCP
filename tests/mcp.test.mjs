@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { lstat, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -15,6 +15,7 @@ const nodePath = path.resolve(process.env.MQL5_CHM_TEST_NODE ?? path.join(root, 
 const serverPath = path.resolve(
   process.env.MQL5_CHM_TEST_SERVER ?? path.join(root, "build", "candidate-v12", "app", "server.mjs"),
 );
+const directServerInvocation = process.env.MQL5_CHM_TEST_DIRECT_SERVER === "1";
 
 async function activeArtifactHashes() {
   const activePath = path.join(packageRoot, "data", "active.json");
@@ -39,13 +40,22 @@ async function activeArtifactHashes() {
   );
 }
 
-test("portable stdio MCP lists and calls the four v1.2 read-only tools", async () => {
+test("portable stdio MCP resists ambient root redirection and calls the four v1.2 read-only tools", async () => {
   const beforeHashes = await activeArtifactHashes();
+  const bootstrap = [
+    `import { main } from ${JSON.stringify(pathToFileURL(serverPath).href)};`,
+    `await main({ root: ${JSON.stringify(packageRoot)} });`,
+  ].join("\n");
   const transport = new StdioClientTransport({
     command: nodePath,
-    args: [serverPath],
+    args: directServerInvocation
+      ? [serverPath]
+      : ["--input-type=module", "--eval", bootstrap],
     cwd: packageRoot,
-    env: { ...process.env, MQL5_CHM_MCP_ROOT: packageRoot },
+    env: {
+      ...process.env,
+      MQL5_CHM_MCP_ROOT: path.join(packageRoot, "hostile-ambient-root-that-must-not-be-used"),
+    },
   });
   const client = new Client({ name: "mql5-chm-test", version: "1.2.0" });
   try {

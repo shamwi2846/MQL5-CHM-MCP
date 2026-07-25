@@ -3,9 +3,11 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { fileURLToPath } from "node:url";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 
 import { Mql5ChmError, createSearchService } from "./search-service.mjs";
+
+const MODULE_PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 const TOOL_ANNOTATIONS = Object.freeze({
   readOnlyHint: true,
@@ -446,11 +448,11 @@ export function createMcpServer(service) {
   return server;
 }
 
-export async function main() {
+export async function main({ root = MODULE_PROJECT_ROOT } = {}) {
   let service;
   let server;
   try {
-    service = await createSearchService();
+    service = await createSearchService({ root });
     server = createMcpServer(service);
     const transport = new StdioServerTransport();
     await server.connect(transport);

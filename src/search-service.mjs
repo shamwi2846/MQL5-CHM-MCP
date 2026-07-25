@@ -21,6 +21,7 @@ var MODULE_PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..")
 var ACTIVE_RELATIVE_PATH = "data/active.json";
 var UPDATE_STATUS_RELATIVE_PATH = "maintenance/update-status.json";
 var DATABASE_FILENAME = "mql5-docs.sqlite";
+var DATABASE_APPLICATION_ID = 1_297_173_557;
 var LEGACY_SCHEMA_VERSION = 2;
 var IMAGE_SCHEMA_VERSION = 3;
 var LEGACY_INDEX_CONTRACT = "mql5-chm-index-v3-assets-v1";
@@ -1049,6 +1050,14 @@ function verifyAssetCatalog(database, manifest, packageInfo) {
   }
 }
 function verifyDatabase(database, manifest, packageInfo) {
+  const applicationId = Number(database.prepare("PRAGMA application_id").get()?.application_id);
+  if (applicationId !== DATABASE_APPLICATION_ID) {
+    fail("INVALID_INDEX", "The documentation database application ID is invalid.");
+  }
+  const userVersion = Number(database.prepare("PRAGMA user_version").get()?.user_version);
+  if (userVersion !== manifest.schema_version) {
+    fail("INVALID_INDEX", "The documentation database schema version does not match the package manifest.");
+  }
   const integrityRows = database.prepare("PRAGMA integrity_check(1)").all();
   if (integrityRows.length !== 1 || String(integrityRows[0][Object.keys(integrityRows[0])[0]]).toLowerCase() !== "ok") {
     fail("INVALID_INDEX", "The documentation database failed its integrity check.");

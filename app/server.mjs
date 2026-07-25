@@ -33111,7 +33111,7 @@ var StdioServerTransport = class {
 
 // src/server.mjs
 import { fileURLToPath as fileURLToPath2 } from "node:url";
-import { resolve as resolve2 } from "node:path";
+import { dirname as dirname2, resolve as resolve2 } from "node:path";
 
 // src/search-service.mjs
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
@@ -33165,6 +33165,7 @@ var MODULE_PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..")
 var ACTIVE_RELATIVE_PATH = "data/active.json";
 var UPDATE_STATUS_RELATIVE_PATH = "maintenance/update-status.json";
 var DATABASE_FILENAME = "mql5-docs.sqlite";
+var DATABASE_APPLICATION_ID = 1297173557;
 var LEGACY_SCHEMA_VERSION = 2;
 var IMAGE_SCHEMA_VERSION = 3;
 var LEGACY_INDEX_CONTRACT = "mql5-chm-index-v3-assets-v1";
@@ -34168,6 +34169,14 @@ function verifyAssetCatalog(database, manifest, packageInfo) {
   }
 }
 function verifyDatabase(database, manifest, packageInfo) {
+  const applicationId = Number(database.prepare("PRAGMA application_id").get()?.application_id);
+  if (applicationId !== DATABASE_APPLICATION_ID) {
+    fail("INVALID_INDEX", "The documentation database application ID is invalid.");
+  }
+  const userVersion = Number(database.prepare("PRAGMA user_version").get()?.user_version);
+  if (userVersion !== manifest.schema_version) {
+    fail("INVALID_INDEX", "The documentation database schema version does not match the package manifest.");
+  }
   const integrityRows = database.prepare("PRAGMA integrity_check(1)").all();
   if (integrityRows.length !== 1 || String(integrityRows[0][Object.keys(integrityRows[0])[0]]).toLowerCase() !== "ok") {
     fail("INVALID_INDEX", "The documentation database failed its integrity check.");
@@ -35252,6 +35261,7 @@ async function createSearchService(options = {}) {
 }
 
 // src/server.mjs
+var MODULE_PROJECT_ROOT2 = resolve2(dirname2(fileURLToPath2(import.meta.url)), "..");
 var TOOL_ANNOTATIONS = Object.freeze({
   readOnlyHint: true,
   destructiveHint: false,
@@ -35648,11 +35658,11 @@ function createMcpServer(service) {
   installInvalidToolRequestMapping(server);
   return server;
 }
-async function main() {
+async function main({ root = MODULE_PROJECT_ROOT2 } = {}) {
   let service;
   let server;
   try {
-    service = await createSearchService();
+    service = await createSearchService({ root });
     server = createMcpServer(service);
     const transport = new StdioServerTransport();
     await server.connect(transport);

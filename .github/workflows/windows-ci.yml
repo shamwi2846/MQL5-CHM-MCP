@@ -15,9 +15,9 @@ concurrency:
 
 jobs:
   fast:
-    name: Fast MCP tests
+    name: Fast and maintenance MCP tests
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
       - name: Check out source without credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -42,9 +42,14 @@ jobs:
         shell: pwsh
         run: npm run test:fast
 
-      - name: Confirm Windows PowerShell 5.1 is available
+      - name: Run maintenance tests under PowerShell 7
+        shell: pwsh
+        run: npm run test:maintenance
+
+      - name: Run maintenance tests under Windows PowerShell 5.1
         shell: powershell
         run: |
           if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) {
               throw "Expected Windows PowerShell 5.1, found $($PSVersionTable.PSVersion)."
           }
+          & .\scripts\Invoke-PowerShellTestSuite.ps1 -Suite Maintenance

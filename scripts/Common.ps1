@@ -298,38 +298,26 @@ function Assert-FileSha256 {
 
 function Invoke-NativeChecked {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$FilePath, [string[]]$Arguments = @(), [string]$FailureMessage = 'Native command failed.')
-    $preferenceVariable = Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue
-    $previous = if ($null -ne $preferenceVariable) { [bool]$preferenceVariable.Value } else { $false }
-    $previousErrorAction = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        if ($null -ne $preferenceVariable) { $PSNativeCommandUseErrorActionPreference = $false }
-        & $FilePath @Arguments | Out-Host
-        $exitCode = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previousErrorAction
-        if ($null -ne $preferenceVariable) { $PSNativeCommandUseErrorActionPreference = $previous }
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$Arguments = @(),
+        [string]$FailureMessage = 'Native command failed.',
+        [ValidateRange(1,1800)][int]$TimeoutSeconds = 1800
+    )
+    $result = Invoke-NativeProcessWithTimeout -FilePath $FilePath -Arguments $Arguments -TimeoutSeconds $TimeoutSeconds -FailureMessage $FailureMessage
+    if (-not [string]::IsNullOrEmpty($result.Text)) {
+        $result.Text | Out-Host
     }
-    if ($exitCode -ne 0) { throw "$FailureMessage Exit code: $exitCode" }
 }
 
 function Invoke-NativeCapture {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$FilePath, [string[]]$Arguments = @())
-    $preferenceVariable = Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue
-    $previous = if ($null -ne $preferenceVariable) { [bool]$preferenceVariable.Value } else { $false }
-    $previousErrorAction = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        if ($null -ne $preferenceVariable) { $PSNativeCommandUseErrorActionPreference = $false }
-        $captured = @(& $FilePath @Arguments 2>&1 | ForEach-Object { $_.ToString() })
-        $exitCode = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previousErrorAction
-        if ($null -ne $preferenceVariable) { $PSNativeCommandUseErrorActionPreference = $previous }
-    }
-    return [pscustomobject]@{ ExitCode = $exitCode; Lines = $captured; Text = ($captured -join [Environment]::NewLine) }
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$Arguments = @(),
+        [ValidateRange(1,1800)][int]$TimeoutSeconds = 300
+    )
+    return Invoke-NativeProcessWithTimeout -FilePath $FilePath -Arguments $Arguments -TimeoutSeconds $TimeoutSeconds -AllowNonZeroExit
 }
 
 function ConvertTo-WindowsNativeArgument {
@@ -367,51 +355,821 @@ function Get-NativeDiagnosticTail {
     return '[output tail] ' + $trimmed.Substring($trimmed.Length - $MaximumCharacters)
 }
 
+function New-NativeProcessJob {
+    [CmdletBinding()]
+    param()
+
+    if ($null -eq ('Mql5ChmMcp.NativeProcessJob' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+namespace Mql5ChmMcp
+{
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct JobObjectBasicLimitInformation
+    {
+        internal long PerProcessUserTimeLimit;
+        internal long PerJobUserTimeLimit;
+        internal uint LimitFlags;
+        internal UIntPtr MinimumWorkingSetSize;
+        internal UIntPtr MaximumWorkingSetSize;
+        internal uint ActiveProcessLimit;
+        internal UIntPtr Affinity;
+        internal uint PriorityClass;
+        internal uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct IoCounters
+    {
+        internal ulong ReadOperationCount;
+        internal ulong WriteOperationCount;
+        internal ulong OtherOperationCount;
+        internal ulong ReadTransferCount;
+        internal ulong WriteTransferCount;
+        internal ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct JobObjectExtendedLimitInformation
+    {
+        internal JobObjectBasicLimitInformation BasicLimitInformation;
+        internal IoCounters IoInfo;
+        internal UIntPtr ProcessMemoryLimit;
+        internal UIntPtr JobMemoryLimit;
+        internal UIntPtr PeakProcessMemoryUsed;
+        internal UIntPtr PeakJobMemoryUsed;
+    }
+
+    public sealed class NativeProcessJob : IDisposable
+    {
+        private const int JobObjectExtendedLimitInformationClass = 9;
+        private const uint JobObjectLimitKillOnJobClose = 0x00002000;
+        private SafeFileHandle handle;
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr CreateJobObjectW(IntPtr jobAttributes, string name);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetInformationJobObject(
+            SafeFileHandle job,
+            int informationClass,
+            IntPtr information,
+            uint informationLength);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool AssignProcessToJobObject(SafeFileHandle job, IntPtr process);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool TerminateJobObject(SafeFileHandle job, uint exitCode);
+
+        public NativeProcessJob()
+        {
+            IntPtr rawHandle = CreateJobObjectW(IntPtr.Zero, null);
+            if (rawHandle == IntPtr.Zero)
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not create the native process containment job.");
+            }
+
+            handle = new SafeFileHandle(rawHandle, true);
+            IntPtr information = IntPtr.Zero;
+            try
+            {
+                JobObjectExtendedLimitInformation limits = new JobObjectExtendedLimitInformation();
+                limits.BasicLimitInformation.LimitFlags = JobObjectLimitKillOnJobClose;
+                int size = Marshal.SizeOf(typeof(JobObjectExtendedLimitInformation));
+                information = Marshal.AllocHGlobal(size);
+                Marshal.StructureToPtr(limits, information, false);
+                if (!SetInformationJobObject(
+                    handle,
+                    JobObjectExtendedLimitInformationClass,
+                    information,
+                    checked((uint)size)))
+                {
+                    throw new Win32Exception(
+                        Marshal.GetLastWin32Error(),
+                        "Could not configure the native process containment job.");
+                }
+            }
+            catch
+            {
+                handle.Dispose();
+                handle = null;
+                throw;
+            }
+            finally
+            {
+                if (information != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(information);
+                }
+            }
+        }
+
+        public void Assign(Process process)
+        {
+            if (process == null) throw new ArgumentNullException("process");
+            ThrowIfDisposed();
+            if (!AssignProcessToJobObject(handle, process.Handle))
+            {
+                throw new Win32Exception(
+                    Marshal.GetLastWin32Error(),
+                    "Could not assign the native bootstrap to its containment job.");
+            }
+        }
+
+        public void Terminate(uint exitCode)
+        {
+            ThrowIfDisposed();
+            if (!TerminateJobObject(handle, exitCode))
+            {
+                throw new Win32Exception(
+                    Marshal.GetLastWin32Error(),
+                    "Could not terminate the native process containment job.");
+            }
+        }
+
+        private void ThrowIfDisposed()
+        {
+            if (handle == null || handle.IsClosed || handle.IsInvalid)
+            {
+                throw new ObjectDisposedException("NativeProcessJob");
+            }
+        }
+
+        public void Dispose()
+        {
+            if (handle == null) return;
+            handle.Dispose();
+            handle = null;
+        }
+    }
+}
+'@
+    }
+    return New-Object Mql5ChmMcp.NativeProcessJob
+}
+
+function Get-NativeBootstrapScript {
+    [CmdletBinding()]
+    param()
+    $bootstrap = @'
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+try {
+    $payloadLine = [Console]::In.ReadLine()
+    $payloadMarker = 'MQL5CHMMCP1:'
+    $payloadMarkerIndex = if ($null -eq $payloadLine) { -1 } else { $payloadLine.IndexOf($payloadMarker, [StringComparison]::Ordinal) }
+    if ($payloadMarkerIndex -lt 0) { throw 'The native bootstrap did not receive a valid launch payload.' }
+    $payloadBase64 = $payloadLine.Substring($payloadMarkerIndex + $payloadMarker.Length)
+    if ([string]::IsNullOrEmpty($payloadBase64)) { throw 'The native bootstrap received an empty launch payload.' }
+    $strictUtf8 = New-Object Text.UTF8Encoding($false,$true)
+    try {
+        $payloadBytes = [Convert]::FromBase64String($payloadBase64)
+    } catch {
+        throw 'The native bootstrap launch payload is not valid base64.'
+    }
+    $payloadText = $strictUtf8.GetString($payloadBytes)
+    $payload = ConvertFrom-Json -InputObject $payloadText -ErrorAction Stop
+    $filePath = [string]$payload.file_path
+    if ([string]::IsNullOrWhiteSpace($filePath) -or -not [IO.Path]::IsPathRooted($filePath)) {
+        throw 'The native bootstrap received an invalid executable path.'
+    }
+    $workingDirectory = [string]$payload.working_directory
+    if ([string]::IsNullOrWhiteSpace($workingDirectory) -or -not [IO.Path]::IsPathRooted($workingDirectory)) {
+        throw 'The native bootstrap received an invalid working directory.'
+    }
+    $extension = [IO.Path]::GetExtension($filePath)
+    if ($extension.Equals('.cmd', [StringComparison]::OrdinalIgnoreCase) -or
+        $extension.Equals('.bat', [StringComparison]::OrdinalIgnoreCase)) {
+        $argumentValues = [string[]]@($payload.argument_values | ForEach-Object { [string]$_ })
+        if (@($argumentValues | Where-Object {
+            $_.IndexOf([char]0) -ge 0 -or $_.IndexOfAny([char[]]"`r`n") -ge 0
+        }).Count -gt 0) {
+            throw 'Batch command arguments must not contain NUL, CR, or LF characters.'
+        }
+        $nativePreference = Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue
+        if ($null -ne $nativePreference) { $PSNativeCommandUseErrorActionPreference = $false }
+        $ErrorActionPreference = 'Continue'
+        $global:LASTEXITCODE = 0
+        & $filePath @argumentValues
+        exit ([int]$LASTEXITCODE)
+    }
+    if (-not $extension.Equals('.exe', [StringComparison]::OrdinalIgnoreCase) -and
+        -not $extension.Equals('.com', [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The native bootstrap received an unsupported target type.'
+    }
+    Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace Mql5ChmMcp
+{
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    internal struct NativeStartupInfo
+    {
+        internal int cb;
+        internal string lpReserved;
+        internal string lpDesktop;
+        internal string lpTitle;
+        internal int dwX;
+        internal int dwY;
+        internal int dwXSize;
+        internal int dwYSize;
+        internal int dwXCountChars;
+        internal int dwYCountChars;
+        internal int dwFillAttribute;
+        internal int dwFlags;
+        internal short wShowWindow;
+        internal short cbReserved2;
+        internal IntPtr lpReserved2;
+        internal IntPtr hStdInput;
+        internal IntPtr hStdOutput;
+        internal IntPtr hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct NativeProcessInformation
+    {
+        internal IntPtr hProcess;
+        internal IntPtr hThread;
+        internal uint dwProcessId;
+        internal uint dwThreadId;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct NativeJobBasicLimitInformation
+    {
+        internal long PerProcessUserTimeLimit;
+        internal long PerJobUserTimeLimit;
+        internal uint LimitFlags;
+        internal UIntPtr MinimumWorkingSetSize;
+        internal UIntPtr MaximumWorkingSetSize;
+        internal uint ActiveProcessLimit;
+        internal UIntPtr Affinity;
+        internal uint PriorityClass;
+        internal uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct NativeIoCounters
+    {
+        internal ulong ReadOperationCount;
+        internal ulong WriteOperationCount;
+        internal ulong OtherOperationCount;
+        internal ulong ReadTransferCount;
+        internal ulong WriteTransferCount;
+        internal ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct NativeJobExtendedLimitInformation
+    {
+        internal NativeJobBasicLimitInformation BasicLimitInformation;
+        internal NativeIoCounters IoInfo;
+        internal UIntPtr ProcessMemoryLimit;
+        internal UIntPtr JobMemoryLimit;
+        internal UIntPtr PeakProcessMemoryUsed;
+        internal UIntPtr PeakJobMemoryUsed;
+    }
+
+    public static class NativeSuspendedLauncher
+    {
+        private const uint CreateSuspended = 0x00000004;
+        private const uint CreateNoWindow = 0x08000000;
+        private const int StartfUseStdHandles = 0x00000100;
+        private const int StdInputHandle = -10;
+        private const int StdOutputHandle = -11;
+        private const int StdErrorHandle = -12;
+        private const int JobObjectExtendedLimitInformationClass = 9;
+        private const uint JobObjectLimitKillOnJobClose = 0x00002000;
+        private const uint Infinite = 0xffffffff;
+        private const uint WaitObject0 = 0x00000000;
+        private const uint WaitTimeout = 0x00000102;
+        private const uint HandleFlagInherit = 0x00000001;
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
+        private static extern IntPtr CreateJobObjectW(IntPtr jobAttributes, string name);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetInformationJobObject(
+            IntPtr job,
+            int informationClass,
+            IntPtr information,
+            uint informationLength);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CreateProcessW(
+            string applicationName,
+            StringBuilder commandLine,
+            IntPtr processAttributes,
+            IntPtr threadAttributes,
+            [MarshalAs(UnmanagedType.Bool)] bool inheritHandles,
+            uint creationFlags,
+            IntPtr environment,
+            string currentDirectory,
+            ref NativeStartupInfo startupInfo,
+            out NativeProcessInformation processInformation);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint ResumeThread(IntPtr thread);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool TerminateProcess(IntPtr process, uint exitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr GetStdHandle(int standardHandle);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetHandleInformation(IntPtr handle, uint mask, uint flags);
+
+        private static string QuoteArgument(string value)
+        {
+            if (value.Length > 0 && value.IndexOfAny(new[] { ' ', '\t', '\r', '\n', '"' }) < 0)
+            {
+                return value;
+            }
+            StringBuilder quoted = new StringBuilder();
+            quoted.Append('"');
+            int slashes = 0;
+            foreach (char character in value)
+            {
+                if (character == '\\')
+                {
+                    slashes++;
+                    continue;
+                }
+                if (character == '"')
+                {
+                    quoted.Append('\\', (slashes * 2) + 1);
+                    quoted.Append('"');
+                    slashes = 0;
+                    continue;
+                }
+                if (slashes > 0)
+                {
+                    quoted.Append('\\', slashes);
+                    slashes = 0;
+                }
+                quoted.Append(character);
+            }
+            if (slashes > 0) quoted.Append('\\', slashes * 2);
+            quoted.Append('"');
+            return quoted.ToString();
+        }
+
+        public static int Run(string executable, string argumentLine, string workingDirectory)
+        {
+            IntPtr job = IntPtr.Zero;
+            IntPtr information = IntPtr.Zero;
+            NativeProcessInformation process = new NativeProcessInformation();
+            bool created = false;
+            bool assigned = false;
+            bool completed = false;
+            int result = 0;
+            Exception primaryFailure = null;
+            List<Exception> cleanupFailures = new List<Exception>();
+            try
+            {
+                if (String.IsNullOrWhiteSpace(executable) ||
+                    String.IsNullOrWhiteSpace(workingDirectory) ||
+                    executable.IndexOf('\0') >= 0 ||
+                    workingDirectory.IndexOf('\0') >= 0 ||
+                    (argumentLine != null && argumentLine.IndexOf('\0') >= 0))
+                {
+                    throw new ArgumentException("The contained native target path, arguments, or working directory are invalid.");
+                }
+                if (argumentLine == null) argumentLine = String.Empty;
+
+                job = CreateJobObjectW(IntPtr.Zero, null);
+                if (job == IntPtr.Zero)
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not create the target containment job.");
+                }
+
+                NativeJobExtendedLimitInformation limits = new NativeJobExtendedLimitInformation();
+                limits.BasicLimitInformation.LimitFlags = JobObjectLimitKillOnJobClose;
+                int informationSize = Marshal.SizeOf(typeof(NativeJobExtendedLimitInformation));
+                information = Marshal.AllocHGlobal(informationSize);
+                Marshal.StructureToPtr(limits, information, false);
+                if (!SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformationClass,
+                    information,
+                    checked((uint)informationSize)))
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not configure the target containment job.");
+                }
+
+                NativeStartupInfo startup = new NativeStartupInfo();
+                startup.cb = Marshal.SizeOf(typeof(NativeStartupInfo));
+                startup.dwFlags = StartfUseStdHandles;
+                startup.hStdInput = GetStdHandle(StdInputHandle);
+                startup.hStdOutput = GetStdHandle(StdOutputHandle);
+                startup.hStdError = GetStdHandle(StdErrorHandle);
+                IntPtr invalidHandle = new IntPtr(-1);
+                foreach (IntPtr standardHandle in new[] { startup.hStdInput, startup.hStdOutput, startup.hStdError })
+                {
+                    if (standardHandle == IntPtr.Zero || standardHandle == invalidHandle)
+                    {
+                        throw new Win32Exception("The native bootstrap has an invalid standard handle.");
+                    }
+                    if (!SetHandleInformation(standardHandle, HandleFlagInherit, HandleFlagInherit))
+                    {
+                        throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not make a native standard handle inheritable.");
+                    }
+                }
+                string commandLineText = QuoteArgument(executable) +
+                    (String.IsNullOrEmpty(argumentLine) ? String.Empty : " " + argumentLine);
+                if (commandLineText.Length > 32766)
+                {
+                    throw new ArgumentException("The contained native target command line exceeds the Windows limit.");
+                }
+                StringBuilder commandLine = new StringBuilder(commandLineText);
+
+                if (!CreateProcessW(
+                    executable,
+                    commandLine,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    true,
+                    CreateSuspended | CreateNoWindow,
+                    IntPtr.Zero,
+                    workingDirectory,
+                    ref startup,
+                    out process))
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not create the suspended native target.");
+                }
+                created = true;
+
+                if (!AssignProcessToJobObject(job, process.hProcess))
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not assign the suspended native target to its containment job.");
+                }
+                assigned = true;
+
+                if (ResumeThread(process.hThread) == 0xffffffff)
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not resume the contained native target.");
+                }
+                if (WaitForSingleObject(process.hProcess, Infinite) != WaitObject0)
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not wait for the contained native target.");
+                }
+                uint exitCode;
+                if (!GetExitCodeProcess(process.hProcess, out exitCode))
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not read the contained native target exit code.");
+                }
+                result = unchecked((int)exitCode);
+                completed = true;
+            }
+            catch (Exception error)
+            {
+                primaryFailure = error;
+            }
+            finally
+            {
+                if (created && !assigned)
+                {
+                    try
+                    {
+                        if (!TerminateProcess(process.hProcess, 1))
+                        {
+                            throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not terminate the unassigned suspended native target.");
+                        }
+                    }
+                    catch (Exception error)
+                    {
+                        cleanupFailures.Add(error);
+                    }
+                }
+                if (created && assigned && !completed)
+                {
+                    try
+                    {
+                        if (!TerminateJobObject(job, 1))
+                        {
+                            throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not terminate the assigned native target job.");
+                        }
+                    }
+                    catch (Exception error)
+                    {
+                        cleanupFailures.Add(error);
+                    }
+                }
+                if (job != IntPtr.Zero)
+                {
+                    try
+                    {
+                        if (!CloseHandle(job))
+                        {
+                            throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not close the target containment job.");
+                        }
+                    }
+                    catch (Exception error)
+                    {
+                        cleanupFailures.Add(error);
+                    }
+                    job = IntPtr.Zero;
+                }
+                if (created && !completed)
+                {
+                    try
+                    {
+                        uint cleanupWait = WaitForSingleObject(process.hProcess, 5000);
+                        if (cleanupWait == WaitTimeout)
+                        {
+                            throw new TimeoutException("The contained native target did not terminate during bounded cleanup.");
+                        }
+                        if (cleanupWait != WaitObject0)
+                        {
+                            throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not wait for the contained native target during cleanup.");
+                        }
+                    }
+                    catch (Exception error)
+                    {
+                        cleanupFailures.Add(error);
+                    }
+                }
+                if (process.hThread != IntPtr.Zero)
+                {
+                    try
+                    {
+                        if (!CloseHandle(process.hThread))
+                        {
+                            throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not close the contained native target thread handle.");
+                        }
+                    }
+                    catch (Exception error)
+                    {
+                        cleanupFailures.Add(error);
+                    }
+                }
+                if (process.hProcess != IntPtr.Zero)
+                {
+                    try
+                    {
+                        if (!CloseHandle(process.hProcess))
+                        {
+                            throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not close the contained native target process handle.");
+                        }
+                    }
+                    catch (Exception error)
+                    {
+                        cleanupFailures.Add(error);
+                    }
+                }
+                if (information != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(information);
+                    information = IntPtr.Zero;
+                }
+            }
+            if (primaryFailure != null)
+            {
+                if (cleanupFailures.Count == 0) throw primaryFailure;
+                cleanupFailures.Insert(0, primaryFailure);
+                throw new AggregateException("The contained native target failed and cleanup also encountered errors.", cleanupFailures);
+            }
+            if (cleanupFailures.Count > 0)
+            {
+                throw new AggregateException("The contained native target cleanup failed.", cleanupFailures);
+            }
+            return result;
+        }
+    }
+}
+"@
+    $targetExitCode = [Mql5ChmMcp.NativeSuspendedLauncher]::Run(
+        $filePath,
+        [string]$payload.argument_line,
+        $workingDirectory
+    )
+    exit ([int]$targetExitCode)
+} catch {
+    [Console]::Error.WriteLine('Native bootstrap failed: ' + $_.Exception.Message)
+    exit 255
+}
+'@
+    return $bootstrap
+}
+
+function Get-NativeBootstrapEncodedCommand {
+    [CmdletBinding()]
+    param()
+    $loader = @'
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+try {
+    $bootstrapLine = [Console]::In.ReadLine()
+    $bootstrapMarker = 'MQL5CHMBOOT1:'
+    $bootstrapMarkerIndex = if ($null -eq $bootstrapLine) { -1 } else { $bootstrapLine.IndexOf($bootstrapMarker, [StringComparison]::Ordinal) }
+    if ($bootstrapMarkerIndex -lt 0) { throw 'The native bootstrap loader did not receive a valid script payload.' }
+    $bootstrapBase64 = $bootstrapLine.Substring($bootstrapMarkerIndex + $bootstrapMarker.Length)
+    $strictUtf8 = New-Object Text.UTF8Encoding($false,$true)
+    $bootstrapText = $strictUtf8.GetString([Convert]::FromBase64String($bootstrapBase64))
+    & ([ScriptBlock]::Create($bootstrapText))
+} catch {
+    [Console]::Error.WriteLine('Native bootstrap loader failed: ' + $_.Exception.Message)
+    exit 255
+}
+'@
+    return [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($loader))
+}
+
 function Invoke-NativeProcessWithTimeout {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$FilePath,
         [string[]]$Arguments = @(),
-        [ValidateRange(1,1800)][int]$TimeoutSeconds,
-        [string]$FailureMessage = 'Native process failed.'
+        [ValidateRange(1,1800)][int]$TimeoutSeconds = 300,
+        [string]$FailureMessage = 'Native process failed.',
+        [switch]$AllowNonZeroExit
     )
     $executable = Resolve-FullPath -Path $FilePath -MustExist -PathType Leaf
+    $systemDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::System)
+    if ([string]::IsNullOrWhiteSpace($systemDirectory)) {
+        throw 'Cannot locate the trusted Windows system directory for native process containment.'
+    }
+    $bootstrapExecutable = Resolve-FullPath -Path (Join-Path $systemDirectory 'WindowsPowerShell\v1.0\powershell.exe') -MustExist -PathType Leaf
+    $expectedBootstrap = [IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetFullPath($systemDirectory)) 'WindowsPowerShell\v1.0\powershell.exe'))
+    if (-not $bootstrapExecutable.Equals($expectedBootstrap, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "The native process bootstrap did not resolve to the trusted Windows system path: $bootstrapExecutable"
+    }
+    $workingDirectory = Resolve-FullPath -Path (Get-Location -PSProvider FileSystem).ProviderPath -MustExist -PathType Container
+    $argumentLine = (@($Arguments | ForEach-Object { ConvertTo-WindowsNativeArgument -Value ([string]$_) }) -join ' ')
+    $extension = [IO.Path]::GetExtension($executable)
+    if (-not $extension.Equals('.exe', [StringComparison]::OrdinalIgnoreCase) -and
+        -not $extension.Equals('.com', [StringComparison]::OrdinalIgnoreCase) -and
+        -not $extension.Equals('.cmd', [StringComparison]::OrdinalIgnoreCase) -and
+        -not $extension.Equals('.bat', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Native process execution supports only .exe, .com, .cmd, and .bat targets: $executable"
+    }
+    $payloadJson = [pscustomobject]@{
+        file_path = $executable
+        argument_line = $argumentLine
+        argument_values = [string[]]@($Arguments | ForEach-Object { [string]$_ })
+        working_directory = $workingDirectory
+    } | ConvertTo-Json -Compress -Depth 3
+    $payload = [Convert]::ToBase64String((New-Object Text.UTF8Encoding($false,$true)).GetBytes($payloadJson))
+    $bootstrapPayload = [Convert]::ToBase64String((New-Object Text.UTF8Encoding($false,$true)).GetBytes((Get-NativeBootstrapScript)))
     $startInfo = New-Object Diagnostics.ProcessStartInfo
-    $startInfo.FileName = $executable
-    $startInfo.Arguments = (@($Arguments | ForEach-Object { ConvertTo-WindowsNativeArgument -Value ([string]$_) }) -join ' ')
+    $startInfo.FileName = $bootstrapExecutable
+    $startInfo.Arguments = (@(
+        '-NoLogo',
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-EncodedCommand',
+        (Get-NativeBootstrapEncodedCommand)
+    ) | ForEach-Object { ConvertTo-WindowsNativeArgument -Value ([string]$_) }) -join ' '
+    $startInfo.WorkingDirectory = $workingDirectory
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardInput = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     $process = New-Object Diagnostics.Process
     $process.StartInfo = $startInfo
     $stdoutTask = $null
     $stderrTask = $null
+    $job = $null
+    $processStarted = $false
+    $assignedToJob = $false
+    $deadline = [Diagnostics.Stopwatch]::StartNew()
     try {
+        $job = New-NativeProcessJob
         if (-not $process.Start()) { throw "Could not start native process: $executable" }
+        $processStarted = $true
+        $job.Assign($process)
+        $assignedToJob = $true
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+
+        $handoffTask = $process.StandardInput.WriteLineAsync(
+            'MQL5CHMBOOT1:' + $bootstrapPayload + "`n" +
+            'MQL5CHMMCP1:' + $payload
+        )
+        $remainingMilliseconds = [Math]::Max(
+            [int64]0,
+            ([int64]$TimeoutSeconds * 1000) - $deadline.ElapsedMilliseconds
+        )
+        if ($remainingMilliseconds -le 0 -or -not $handoffTask.Wait([int]$remainingMilliseconds)) {
             try {
-                if (-not $process.HasExited) { $process.Kill() }
+                $job.Terminate(1)
+            } catch {
+                throw [TimeoutException]::new("Native process exceeded its $TimeoutSeconds-second deadline during launch and could not be terminated: $executable", $_.Exception)
+            }
+            throw [TimeoutException]::new("Native process exceeded its $TimeoutSeconds-second deadline during launch: $executable")
+        }
+        [void]$handoffTask.GetAwaiter().GetResult()
+        $process.StandardInput.Close()
+
+        $remainingMilliseconds = [Math]::Max(
+            [int64]0,
+            ([int64]$TimeoutSeconds * 1000) - $deadline.ElapsedMilliseconds
+        )
+        if ($remainingMilliseconds -le 0 -or -not $process.WaitForExit([int]$remainingMilliseconds)) {
+            try {
+                $job.Terminate(1)
             } catch {
                 throw [TimeoutException]::new("Native process exceeded its $TimeoutSeconds-second deadline and could not be terminated: $executable", $_.Exception)
             }
             if (-not $process.WaitForExit(5000)) {
-                throw [TimeoutException]::new("Native process exceeded its $TimeoutSeconds-second deadline and did not terminate: $executable")
+                throw [TimeoutException]::new("Native process exceeded its $TimeoutSeconds-second deadline and its bootstrap did not terminate: $executable")
             }
             throw [TimeoutException]::new("Native process exceeded its $TimeoutSeconds-second deadline: $executable")
         }
         $process.WaitForExit()
+        $exitCode = [int]$process.ExitCode
+        # Closing the outer kill-on-close job after the bootstrap exits terminates
+        # any batch descendants before they can keep the redirected pipes open.
+        $job.Dispose()
+        $job = $null
+        $drainTask = [Threading.Tasks.Task]::WhenAll(
+            [Threading.Tasks.Task[]]@($stdoutTask, $stderrTask)
+        )
+        $remainingMilliseconds = [Math]::Max(
+            [int64]0,
+            ([int64]$TimeoutSeconds * 1000) - $deadline.ElapsedMilliseconds
+        )
+        $drained = $drainTask.IsCompleted
+        if (-not $drained -and $remainingMilliseconds -gt 0) {
+            $completedTask = [Threading.Tasks.Task]::WhenAny(
+                [Threading.Tasks.Task[]]@(
+                    $drainTask,
+                    [Threading.Tasks.Task]::Delay([int]$remainingMilliseconds)
+                )
+            ).GetAwaiter().GetResult()
+            $drained = [object]::ReferenceEquals($completedTask, $drainTask)
+        }
+        if (-not $drained) {
+            throw [TimeoutException]::new("Native process output exceeded its $TimeoutSeconds-second deadline: $executable")
+        }
         $stdout = [string]$stdoutTask.GetAwaiter().GetResult()
         $stderr = [string]$stderrTask.GetAwaiter().GetResult()
-        $diagnostic = Get-NativeDiagnosticTail -Text (($stdout,$stderr | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join [Environment]::NewLine)
-        if ($process.ExitCode -ne 0) {
+        $text = (($stdout,$stderr | Where-Object { -not [string]::IsNullOrEmpty($_) }) -join [Environment]::NewLine).TrimEnd("`r","`n")
+        $lines = if ([string]::IsNullOrEmpty($text)) { @() } else { @($text -split '\r?\n') }
+        $diagnostic = Get-NativeDiagnosticTail -Text $text
+        if ($exitCode -ne 0 -and -not $AllowNonZeroExit) {
             $suffix = if ([string]::IsNullOrWhiteSpace($diagnostic)) { '' } else { " $diagnostic" }
-            throw "$FailureMessage Exit code: $($process.ExitCode).$suffix"
+            throw "$FailureMessage Exit code: $exitCode.$suffix"
         }
-        return [pscustomobject]@{ExitCode=[int]$process.ExitCode;Text=$diagnostic}
+        return [pscustomobject]@{
+            ExitCode = $exitCode
+            Lines = $lines
+            Text = $text
+            DiagnosticTail = $diagnostic
+        }
     } finally {
+        if ($null -ne $job) {
+            try { $job.Dispose() } catch {}
+        }
+        if ($processStarted -and -not $process.HasExited) {
+            try {
+                if (-not $assignedToJob) { $process.Kill() }
+                if (-not $process.WaitForExit(5000)) { $process.Kill() }
+            } catch {}
+        }
+        try { $process.StandardInput.Dispose() } catch {}
+        try { $process.StandardOutput.Dispose() } catch {}
+        try { $process.StandardError.Dispose() } catch {}
         $process.Dispose()
     }
 }
@@ -731,13 +1489,88 @@ function Resolve-CodexExecutable {
     [CmdletBinding()]
     param()
 
-    # Prefer the npm command shim. Windows App Execution Aliases can expose an
-    # inaccessible codex.exe that resolves but fails when executed.
-    $command = Get-Command codex.cmd -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -eq $command) { $command = Get-Command codex -ErrorAction SilentlyContinue | Select-Object -First 1 }
-    if ($null -eq $command) { $command = Get-Command codex.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1 }
-    if ($null -eq $command) { throw 'Codex CLI was not found on PATH.' }
-    return Resolve-FullPath -Path $command.Source -MustExist -PathType Leaf
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $pathDirectories = New-Object System.Collections.Generic.List[string]
+    foreach ($rawDirectory in ([string]$env:Path).Split([IO.Path]::PathSeparator)) {
+        $directory = [Environment]::ExpandEnvironmentVariables(([string]$rawDirectory).Trim().Trim('"'))
+        if ([string]::IsNullOrWhiteSpace($directory)) { continue }
+        try {
+            $directory = [IO.Path]::GetFullPath($directory)
+        } catch {
+            continue
+        }
+        $pathDirectories.Add($directory)
+    }
+
+    # Preserve PATH directory precedence. Within each directory, prefer npm's
+    # command shim before real executable files.
+    # Do not use Get-Command here: Windows App Execution Aliases can resolve as
+    # applications even when the current process cannot execute them.
+    foreach ($directory in $pathDirectories) {
+        foreach ($candidateName in @('codex.cmd','codex.exe','codex.com')) {
+            try {
+                $candidate = Join-Path $directory $candidateName
+                if (-not (Test-Path -LiteralPath $candidate -PathType Leaf -ErrorAction Stop)) { continue }
+                $candidate = Resolve-FullPath -Path $candidate -MustExist -PathType Leaf
+                if ($seen.Add($candidate)) { $candidates.Add($candidate) }
+            } catch {
+                continue
+            }
+        }
+    }
+
+    # Codex Desktop keeps runnable CLI builds outside PATH. Prefer the most
+    # recently installed cache entry, with a full-path tie-break for stability.
+    if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        $desktopBin = Join-Path $env:LOCALAPPDATA 'OpenAI\Codex\bin'
+        try {
+            $desktopDirectories = @(Get-ChildItem -LiteralPath $desktopBin -Directory -ErrorAction Stop)
+        } catch {
+            $desktopDirectories = @()
+        }
+        $desktopCandidates = @(
+            foreach ($directory in $desktopDirectories) {
+                $candidate = Join-Path $directory.FullName 'codex.exe'
+                try {
+                    if (Test-Path -LiteralPath $candidate -PathType Leaf -ErrorAction Stop) {
+                        Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+                    }
+                } catch {}
+            }
+        ) | Sort-Object -Property `
+            @{Expression={$_.LastWriteTimeUtc.Ticks};Descending=$true}, `
+            @{Expression={$_.FullName};Descending=$false}
+        foreach ($candidateFile in $desktopCandidates) {
+            try {
+                $candidate = Resolve-FullPath -Path $candidateFile.FullName -MustExist -PathType Leaf
+                if ($seen.Add($candidate)) { $candidates.Add($candidate) }
+            } catch {
+                continue
+            }
+        }
+    }
+
+    if ($candidates.Count -eq 0) {
+        throw 'Codex CLI was not found in PATH or the Codex Desktop executable cache.'
+    }
+
+    foreach ($candidate in $candidates) {
+        try {
+            $probe = Invoke-NativeCapture -FilePath $candidate -Arguments @('--version') -TimeoutSeconds 5
+            $version = ([string]$probe.Text).Trim()
+            if (
+                $probe.ExitCode -eq 0 -and
+                $version -match '^codex-cli\s+\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$'
+            ) {
+                return $candidate
+            }
+        } catch {
+            continue
+        }
+    }
+
+    throw "Codex CLI candidates were found, but none passed a bounded '--version' capability probe: $($candidates -join ', ')"
 }
 
 function Enter-CodexRegistrationMutex {

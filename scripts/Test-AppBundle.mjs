@@ -49,7 +49,10 @@ runChecked(
   "Final app MCP suite",
   ["--test", "--test-concurrency=1", "tests/mcp.test.mjs"],
   {
-    env: { MQL5_CHM_TEST_SERVER: serverPath },
+    env: {
+      MQL5_CHM_TEST_DIRECT_SERVER: "1",
+      MQL5_CHM_TEST_SERVER: serverPath,
+    },
     timeout: 300_000,
   },
 );

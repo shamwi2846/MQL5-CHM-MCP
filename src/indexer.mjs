@@ -3737,7 +3737,9 @@ export async function buildIndex(projectRootInput, options = {}) {
     : projectRoot;
   await assertRealDirectory(workspaceRoot, "Maintenance workspace root");
 
-  const sourceDirectory = options.sourceDirectory ? path.resolve(workspaceRoot, options.sourceDirectory) : workspaceRoot;
+  const sourceDirectory = options.sourceDirectory
+    ? path.resolve(workspaceRoot, options.sourceDirectory)
+    : path.join(workspaceRoot, "sources");
   const extractedRoot = options.extractedDirectory
     ? path.resolve(workspaceRoot, options.extractedDirectory)
     : path.join(workspaceRoot, "build", "extracted");
