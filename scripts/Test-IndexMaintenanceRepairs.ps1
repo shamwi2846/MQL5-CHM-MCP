@@ -208,7 +208,9 @@ if ($Mode -ceq 'arguments') {
     $escapedInheritedHandleChildScript = ConvertTo-Json -InputObject $inheritedHandleChildScript -Compress
     $inheritedHandleScript = "const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e',$escapedInheritedHandleChildScript],{detached:true,stdio:['ignore',1,2]});child.unref();"
     $inheritedHandleTimer = [Diagnostics.Stopwatch]::StartNew()
-    $inheritedHandleResult = Invoke-NativeCapture -FilePath $nativeNode -Arguments @('--input-type=commonjs','-e',$inheritedHandleScript) -TimeoutSeconds 1
+    # Hosted Windows PowerShell 5.1 can spend more than one second starting the
+    # trusted bootstrap. The elapsed assertion below still requires prompt exit.
+    $inheritedHandleResult = Invoke-NativeCapture -FilePath $nativeNode -Arguments @('--input-type=commonjs','-e',$inheritedHandleScript) -TimeoutSeconds 5
     Assert-RepairFixture -Condition (
         $inheritedHandleResult.ExitCode -eq 0 -and $inheritedHandleTimer.Elapsed.TotalSeconds -lt 4
     ) -Message 'A parent-exited native descendant retained inherited output handles after contained cleanup.'
