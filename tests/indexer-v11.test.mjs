@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -55,6 +56,44 @@ async function createDefaultCliCorpus(root) {
   }));
 }
 
+function getWindowsShortPath(candidate) {
+  const systemRoot = process.env.SystemRoot;
+  if (process.platform !== "win32" || !systemRoot || !path.win32.isAbsolute(systemRoot)) return "";
+  const command = path.win32.join(
+    systemRoot,
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "powershell.exe",
+  );
+  const script = [
+    "$ErrorActionPreference='Stop'",
+    "$signature='[DllImport(\"kernel32.dll\", CharSet=CharSet.Unicode, SetLastError=true)] public static extern uint GetShortPathName(string longPath, System.Text.StringBuilder shortPath, uint bufferLength);'",
+    "Add-Type -MemberDefinition $signature -Name NativePath -Namespace Mql5ChmTest",
+    "$buffer=New-Object System.Text.StringBuilder 32768",
+    "$length=[Mql5ChmTest.NativePath]::GetShortPathName($env:MQL5_CHM_TEST_PATH,$buffer,[uint32]$buffer.Capacity)",
+    "if($length -eq 0 -or $length -ge $buffer.Capacity){exit 4}",
+    "[Console]::Out.Write($buffer.ToString())",
+  ].join(";");
+  const result = spawnSync(
+    command,
+    [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-EncodedCommand",
+      Buffer.from(script, "utf16le").toString("base64"),
+    ],
+    {
+      encoding: "utf8",
+      env: { ...process.env, MQL5_CHM_TEST_PATH: candidate },
+      timeout: 10_000,
+      windowsHide: true,
+    },
+  );
+  return result.status === 0 && !result.error ? result.stdout.trim() : "";
+}
+
 function hasUnpairedSurrogate(value) {
   for (let index = 0; index < value.length; index += 1) {
     const codeUnit = value.charCodeAt(index);
@@ -76,6 +115,40 @@ test("direct indexer defaults keep sources and output in separate directories", 
     await createDefaultCliCorpus(root);
     const result = await buildIndex(root);
     assert.equal(path.dirname(result.databasePath), path.join(root, "build", "index-candidate"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("direct indexer rejects a future output reached through a DOS path alias before creating it", async (context) => {
+  if (process.platform !== "win32") {
+    context.skip("DOS 8.3 aliases are a Windows filesystem boundary.");
+    return;
+  }
+
+  const root = await mkdtemp(path.join(tmpdir(), "mql5-index-physical-alias-"));
+  try {
+    await createDefaultCliCorpus(root);
+    const sourceDirectory = path.join(root, "source directory with a deliberately long name");
+    await rename(path.join(root, "sources"), sourceDirectory);
+    const shortSource = getWindowsShortPath(sourceDirectory);
+    const shortLeaf = path.win32.basename(shortSource);
+    if (!shortSource || shortLeaf.toLowerCase() === path.basename(sourceDirectory).toLowerCase()) {
+      context.skip("The test volume does not expose a DOS 8.3 alias for the fixture.");
+      return;
+    }
+
+    const aliasedSource = path.join(root, shortLeaf);
+    assert.equal(
+      await readFile(path.join(aliasedSource, SOURCE_DEFINITIONS[0].filename), "utf8"),
+      await readFile(path.join(sourceDirectory, SOURCE_DEFINITIONS[0].filename), "utf8"),
+    );
+    const futureOutput = path.join(aliasedSource, "future-index-output");
+    await assert.rejects(
+      buildIndex(root, { sourceDirectory, outputDirectory: futureOutput }),
+      /output directory.*overlap.*source directory/i,
+    );
+    await assert.rejects(stat(futureOutput), (error) => error?.code === "ENOENT");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

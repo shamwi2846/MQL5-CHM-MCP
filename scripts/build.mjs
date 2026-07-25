@@ -204,12 +204,38 @@ async function validateBuildPlan(outdirArgument, metafileArgument) {
     await assertNoReparseAncestors(target, label);
   }
 
+  await assertNotNestedInsideExistingBundleOutput(appDir, "--outdir");
+  await assertNotNestedInsideExistingBundleOutput(metaPath, "--metafile");
+
   const metadataEntry = await lstatIfPresent(metaPath);
   if (metadataEntry && !metadataEntry.isFile()) {
     throw new Error("--metafile must not replace a directory or special filesystem entry.");
   }
   await validateExistingBundleDirectory(appDir);
   return { appDir, metaPath };
+}
+
+async function containsOwnedBundlePair(target) {
+  const entry = await lstatIfPresent(target);
+  if (!entry?.isDirectory()) return false;
+  const children = await readdir(target, { withFileTypes: true });
+  const ownedFiles = new Set(
+    children
+      .filter((child) => child.isFile() && expectedBundleNames.has(child.name))
+      .map((child) => child.name),
+  );
+  return ownedFiles.size === expectedBundleNames.size;
+}
+
+async function assertNotNestedInsideExistingBundleOutput(target, label) {
+  let ancestor = path.dirname(target);
+  while (isSamePath(ancestor, buildRoot) || isStrictDescendant(buildRoot, ancestor)) {
+    if (await containsOwnedBundlePair(ancestor)) {
+      throw new Error(`${label} must not be nested inside an existing bundle output: ${ancestor}`);
+    }
+    if (isSamePath(ancestor, buildRoot)) return;
+    ancestor = path.dirname(ancestor);
+  }
 }
 
 async function validateExistingBundleDirectory(appDir) {

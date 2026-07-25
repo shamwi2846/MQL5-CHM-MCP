@@ -21,6 +21,76 @@ $ErrorActionPreference = 'Stop'
 
 . (Join-Path $PSScriptRoot 'IndexMaintenance.ps1')
 
+function Copy-PortablePackageFileSets {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ProjectRoot,
+        [Parameter(Mandatory)][string]$StageRoot,
+        [string]$ApplicationSource
+    )
+
+    $projectRootFull = Resolve-FullPath -Path $ProjectRoot -MustExist -PathType Container
+    $stageRootFull = Resolve-FullPath -Path $StageRoot -MustExist -PathType Container
+    Assert-NoReparsePoint -Root $projectRootFull -Path $projectRootFull
+    Assert-NoReparsePoint -Root $stageRootFull -Path $stageRootFull
+    if ([string]::IsNullOrWhiteSpace($ApplicationSource)) {
+        $ApplicationSource = Join-Path $projectRootFull 'app'
+    }
+    $applicationSourceFull = Assert-PathWithin -Root $projectRootFull -Path $ApplicationSource
+    $applicationSourceFull = Resolve-FullPath -Path $applicationSourceFull -MustExist -PathType Container
+    Assert-NoReparsePoint -Root $projectRootFull -Path $applicationSourceFull
+
+    $fileSets = Get-PortablePackageFileSets
+    foreach ($setName in @('root', 'runtime', 'app', 'scripts', 'licenses', 'config', 'tools')) {
+        if ($setName -ceq 'root') {
+            $sourceDirectory = $projectRootFull
+            $destinationDirectory = $stageRootFull
+            $listedFiles = @($fileSets[$setName] | Where-Object { [string]$_ -cne '.mql5-chm-package-root' })
+        } else {
+            $sourceDirectory = if ($setName -ceq 'app') {
+                $applicationSourceFull
+            } else {
+                Resolve-FullPath -Path (Join-Path $projectRootFull $setName) -MustExist -PathType Container
+            }
+            Assert-NoReparsePoint -Root $projectRootFull -Path $sourceDirectory
+
+            $destinationDirectory = Assert-PathWithin -Root $stageRootFull -Path (Join-Path $stageRootFull $setName)
+            Assert-NoReparsePoint -Root $stageRootFull -Path $destinationDirectory
+            if (-not (Test-Path -LiteralPath $destinationDirectory)) {
+                New-Item -ItemType Directory -Path $destinationDirectory -ErrorAction Stop | Out-Null
+            }
+            $destinationDirectory = Resolve-FullPath -Path $destinationDirectory -MustExist -PathType Container
+            Assert-NoReparsePoint -Root $stageRootFull -Path $destinationDirectory
+            $listedFiles = @($fileSets[$setName])
+        }
+
+        $seen = @{}
+        foreach ($listedFile in $listedFiles) {
+            $relativeFile = [string]$listedFile
+            if ([string]::IsNullOrWhiteSpace($relativeFile) -or [IO.Path]::IsPathRooted($relativeFile)) {
+                throw "Portable $setName allowlist contains an invalid relative file path: '$relativeFile'"
+            }
+            if ($seen.ContainsKey($relativeFile)) {
+                throw "Portable $setName allowlist contains a duplicate file path: '$relativeFile'"
+            }
+            $seen[$relativeFile] = $true
+
+            $sourcePath = Assert-PathWithin -Root $sourceDirectory -Path (Join-Path $sourceDirectory $relativeFile)
+            $sourcePath = Resolve-FullPath -Path $sourcePath -MustExist -PathType Leaf
+            Assert-NoReparsePoint -Root $sourceDirectory -Path $sourcePath
+
+            $destinationPath = Assert-PathWithin -Root $destinationDirectory -Path (Join-Path $destinationDirectory $relativeFile)
+            $destinationParent = Split-Path -Parent $destinationPath
+            Assert-NoReparsePoint -Root $destinationDirectory -Path $destinationParent
+            if (-not (Test-Path -LiteralPath $destinationParent)) {
+                New-Item -ItemType Directory -Path $destinationParent -Force -ErrorAction Stop | Out-Null
+            }
+            Assert-NoReparsePoint -Root $destinationDirectory -Path $destinationParent
+            Copy-Item -LiteralPath $sourcePath -Destination $destinationPath -ErrorAction Stop
+        }
+    }
+}
+
 function Copy-DirectorySafe {
     [CmdletBinding()]
     param(
@@ -916,15 +986,7 @@ $zipPath = $outputPlan.ZipPath
 $manifestPath = $outputPlan.ManifestPath
 Assert-NoReparsePoint -Root $releaseRoot -Path $zipPath
 
-foreach ($directoryName in @('runtime', 'scripts', 'licenses', 'config')) {
-    Copy-DirectorySafe -Root $root -Source (Join-Path $root $directoryName) -Destination (Join-Path $stageRoot $directoryName)
-}
-Copy-DirectorySafe -Root $root -Source $applicationSource -Destination (Join-Path $stageRoot 'app')
-New-Item -ItemType Directory -Path (Join-Path $stageRoot 'tools') | Out-Null
-foreach ($toolName in @($sevenZipPair.ExeName, $sevenZipPair.DllName, '7zip.provenance.json')) {
-    $toolPath = Resolve-FullPath -Path (Join-Path $root "tools\$toolName") -MustExist -PathType Leaf
-    Copy-Item -LiteralPath $toolPath -Destination (Join-Path $stageRoot "tools\$toolName")
-}
+Copy-PortablePackageFileSets -ProjectRoot $root -StageRoot $stageRoot -ApplicationSource $applicationSource
 New-Item -ItemType Directory -Path (Join-Path $stageRoot 'data') | Out-Null
 Write-CanonicalPortableActivePointer `
     -Path (Join-Path $stageRoot 'data\active.json') `
@@ -935,23 +997,6 @@ Copy-DirectorySafe -Root $root -Source $selected.Root -Destination (Join-Path $s
 $portableMaintenanceRoot = Join-Path $stageRoot 'maintenance'
 New-Item -ItemType Directory -Path $portableMaintenanceRoot -Force | Out-Null
 [IO.File]::WriteAllBytes((Join-Path $portableMaintenanceRoot '.update.lock'), (New-Object byte[] 0))
-
-$rootFiles = @(
-    'Install-Codex.ps1',
-    'Rebuild-Index.ps1',
-    'Uninstall-Codex.ps1',
-    'Package-Portable.ps1',
-    'Check-DocumentationUpdates.ps1',
-    'Update-Documentation.ps1',
-    'Rollback-Documentation.ps1',
-    'package.json',
-    'README.md',
-    'SPEC.md'
-)
-foreach ($fileName in $rootFiles) {
-    $sourcePath = Resolve-FullPath -Path (Join-Path $root $fileName) -MustExist -PathType Leaf
-    Copy-Item -LiteralPath $sourcePath -Destination (Join-Path $stageRoot $fileName)
-}
 
 $stageFull = [System.IO.Path]::GetFullPath($stageRoot).TrimEnd('\', '/')
 $checksumEntries = [Collections.Generic.SortedDictionary[string,string]]::new([StringComparer]::Ordinal)

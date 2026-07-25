@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { hostname as systemHostname, tmpdir } from "node:os";
@@ -113,17 +114,405 @@ async function writeCurrentLock(lockPath, ownerToken, overrides = {}) {
   return lock;
 }
 
+async function writeIdentityLock(lockPath, ownerToken, processStartIdentity, overrides = {}) {
+  const lock = {
+    schema_version: 2,
+    pid: 2_147_483_647,
+    hostname: systemHostname(),
+    owner_token: ownerToken,
+    process_start_identity: processStartIdentity,
+    started_at: "2026-01-01T00:00:00.000Z",
+    ...overrides,
+  };
+  await writeFile(lockPath, `${JSON.stringify(lock)}\n`);
+  return lock;
+}
+
+test("simultaneous index-lock acquirers never observe an incomplete canonical lock", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "mql5-index-lock-atomic-publication-"));
+  const processStartIdentity = "test-process-start:atomic-publication";
+  try {
+    for (let iteration = 0; iteration < 128; iteration += 1) {
+      const lockPath = path.join(root, `.index-build-${iteration}.lock`);
+      const options = {
+        probeProcess: () => "live",
+        probeProcessStartIdentity: () => processStartIdentity,
+      };
+      const outcomes = await Promise.allSettled([
+        acquireBuildLock(lockPath, options),
+        acquireBuildLock(lockPath, options),
+      ]);
+      const leases = outcomes
+        .filter((outcome) => outcome.status === "fulfilled")
+        .map((outcome) => outcome.value);
+      const failures = outcomes.filter((outcome) => outcome.status === "rejected");
+      assert.equal(leases.length, 1, `iteration ${iteration} must have exactly one lock owner`);
+      assert.equal(failures.length, 1, `iteration ${iteration} must have exactly one fenced contender`);
+      assert.match(
+        failures[0].reason?.message ?? "",
+        /active/i,
+        `iteration ${iteration} exposed an incomplete canonical lock`,
+      );
+      await releaseBuildLock(leases[0]);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a zero-byte preparation owned by a live process stays fenced until atomic publication", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "mql5-index-lock-live-preparation-"));
+  const lockPath = path.join(root, ".index-build.lock");
+  const processStartIdentity = "test-process-start:live-preparation";
+  let signalOpened;
+  let resumePreparation;
+  const opened = new Promise((resolve) => {
+    signalOpened = resolve;
+  });
+  const resume = new Promise((resolve) => {
+    resumePreparation = resolve;
+  });
+  let ownerLease = null;
+  let ownerOutcomePromise = null;
+  try {
+    ownerOutcomePromise = acquireBuildLock(lockPath, {
+      probeProcess: () => "live",
+      probeProcessStartIdentity: () => processStartIdentity,
+      async onCleanupCutPoint(name) {
+        if (name !== "lock-preparation:opened") return;
+        signalOpened();
+        await resume;
+      },
+    }).then(
+      (lease) => ({ lease, error: null }),
+      (error) => ({ lease: null, error }),
+    );
+    await opened;
+
+    assert.equal(await exists(lockPath), false);
+    const preparationNames = (await readdir(root))
+      .filter((name) => name.startsWith(".index-build.lock.prepare-"));
+    assert.equal(preparationNames.length, 1);
+    assert.equal((await stat(path.join(root, preparationNames[0]))).size, 0);
+
+    await assert.rejects(
+      acquireBuildLock(lockPath, {
+        probeProcess: () => "live",
+        probeProcessStartIdentity: () => processStartIdentity,
+      }),
+      /preparation owner.*active/i,
+    );
+    await assert.rejects(
+      acquireBuildLock(lockPath, {
+        probeProcess: () => "live",
+        probeProcessStartIdentity() {
+          throw new Error("synthetic process identity query failure");
+        },
+      }),
+      /preparation owner.*inaccessible/i,
+    );
+    assert.equal(await exists(path.join(root, preparationNames[0])), true);
+
+    resumePreparation();
+    const ownerOutcome = await ownerOutcomePromise;
+    assert.equal(ownerOutcome.error, null);
+    ownerLease = ownerOutcome.lease;
+    const canonicalRaw = await readFile(lockPath, "utf8");
+    assert.doesNotThrow(() => JSON.parse(canonicalRaw));
+    assert.deepEqual(
+      (await readdir(root)).filter((name) => name.includes(".prepare-")),
+      [],
+    );
+    await releaseBuildLock(ownerLease);
+    ownerLease = null;
+    ownerOutcomePromise = null;
+  } finally {
+    resumePreparation?.();
+    const ownerOutcome = ownerOutcomePromise ? await ownerOutcomePromise : null;
+    if (ownerOutcome?.lease && ownerOutcome.lease !== ownerLease) {
+      await releaseBuildLock(ownerOutcome.lease).catch(() => {});
+    }
+    if (ownerLease) await releaseBuildLock(ownerLease).catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("hard-killed lock preparations are recovered at every atomic publication boundary", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "mql5-index-lock-killed-preparation-"));
+  const lockPath = path.join(root, ".index-build.lock");
+  const indexerUrl = new URL("../src/indexer.mjs", import.meta.url).href;
+  try {
+    for (const cutPoint of [
+      "lock-preparation:opened",
+      "lock-preparation:prepared",
+      "lock-preparation:published",
+    ]) {
+      const childScript = `
+        import { acquireBuildLock } from ${JSON.stringify(indexerUrl)};
+        await acquireBuildLock(process.env.MQL5_CHM_TEST_LOCK_PATH, {
+          onCleanupCutPoint(name) {
+            if (name === process.env.MQL5_CHM_TEST_LOCK_CUT_POINT) process.exit(86);
+          },
+        });
+        process.exit(87);
+      `;
+      const interrupted = spawnSync(
+        process.execPath,
+        ["--input-type=module", "-e", childScript],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            MQL5_CHM_TEST_LOCK_PATH: lockPath,
+            MQL5_CHM_TEST_LOCK_CUT_POINT: cutPoint,
+          },
+          timeout: 30_000,
+          windowsHide: true,
+        },
+      );
+      assert.equal(
+        interrupted.status,
+        86,
+        `${cutPoint} did not stop at the intended boundary\n${interrupted.stdout}\n${interrupted.stderr}`,
+      );
+
+      const preparationNames = (await readdir(root))
+        .filter((name) => name.startsWith(".index-build.lock.prepare-"));
+      assert.equal(preparationNames.length, 1, `${cutPoint} must retain one strict preparation`);
+      const preparationPath = path.join(root, preparationNames[0]);
+      if (cutPoint === "lock-preparation:opened") {
+        assert.equal((await stat(preparationPath)).size, 0);
+        assert.equal(await exists(lockPath), false);
+        await assert.rejects(
+          acquireBuildLock(lockPath, { hostname: `foreign-${systemHostname()}` }),
+          /preparation belongs to a foreign host/i,
+        );
+        assert.equal(await exists(preparationPath), true);
+      } else {
+        const preparationRaw = await readFile(preparationPath, "utf8");
+        assert.doesNotThrow(() => JSON.parse(preparationRaw));
+        assert.equal(
+          await exists(lockPath),
+          cutPoint === "lock-preparation:published",
+        );
+        if (await exists(lockPath)) {
+          assert.equal(await readFile(lockPath, "utf8"), await readFile(preparationPath, "utf8"));
+        }
+      }
+
+      const recovered = await acquireBuildLock(
+        lockPath,
+        cutPoint === "lock-preparation:published"
+          ? {
+            probeProcess: () => "live",
+            probeProcessStartIdentity: () => "test-process-start:reused-pid",
+          }
+          : {},
+      );
+      assert.deepEqual(
+        (await readdir(root)).filter((name) => name.includes(".prepare-")),
+        [],
+      );
+      await releaseBuildLock(recovered);
+    }
+
+    const malformedPath = `${lockPath}.prepare-v999-malformed`;
+    await writeFile(malformedPath, "untrusted preparation\n", "utf8");
+    await assert.rejects(acquireBuildLock(lockPath), /malformed index lock preparation/i);
+    assert.equal(await readFile(malformedPath, "utf8"), "untrusted preparation\n");
+    await rm(malformedPath, { force: true });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("index lock stays absent until current process identity resolves and a contender remains fenced", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "mql5-index-lock-pending-identity-"));
+  const lockPath = path.join(root, ".index-build.lock");
+  const processStartIdentity = "test-process-start:pending";
+  let signalProbeStarted;
+  let resolveProcessStartIdentity;
+  let probeResolved = false;
+  const probeStarted = new Promise((resolve) => {
+    signalProbeStarted = resolve;
+  });
+  const pendingIdentity = new Promise((resolve) => {
+    resolveProcessStartIdentity = resolve;
+  });
+  let contenderLease = null;
+  let delayedOutcomePromise = null;
+  try {
+    const delayedAcquisition = acquireBuildLock(lockPath, {
+      probeProcessStartIdentity(pid) {
+        assert.equal(pid, process.pid);
+        signalProbeStarted();
+        return pendingIdentity;
+      },
+    });
+    delayedOutcomePromise = delayedAcquisition.then(
+      (lease) => ({ lease, error: null }),
+      (error) => ({ lease: null, error }),
+    );
+
+    await probeStarted;
+    assert.equal(
+      await exists(lockPath),
+      false,
+      "The canonical lock must not exist while its owner identity is unresolved.",
+    );
+
+    contenderLease = await acquireBuildLock(lockPath, {
+      probeProcessStartIdentity: () => processStartIdentity,
+    });
+    const contenderRaw = await readFile(lockPath, "utf8");
+    resolveProcessStartIdentity(processStartIdentity);
+    probeResolved = true;
+
+    const delayedOutcome = await delayedOutcomePromise;
+    assert.equal(delayedOutcome.lease, null);
+    assert.match(delayedOutcome.error?.message ?? "", /active/i);
+    assert.equal(await readFile(lockPath, "utf8"), contenderRaw);
+
+    await releaseBuildLock(contenderLease);
+    contenderLease = null;
+    assert.equal(await exists(lockPath), false);
+  } finally {
+    if (!probeResolved) resolveProcessStartIdentity(processStartIdentity);
+    const delayedOutcome = delayedOutcomePromise ? await delayedOutcomePromise : null;
+    if (delayedOutcome?.lease) await releaseBuildLock(delayedOutcome.lease).catch(() => {});
+    if (contenderLease) await releaseBuildLock(contenderLease).catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("schema-v2 index locks distinguish a live owner from a reused PID across recovery paths", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "mql5-index-lock-identity-"));
+  const lockPath = path.join(root, ".index-build.lock");
+  const originalIdentity = "test-process-start:original";
+  const replacementIdentity = "test-process-start:replacement";
+  const replacementOptions = {
+    probeProcess: () => "live",
+    probeProcessStartIdentity: () => replacementIdentity,
+  };
+  try {
+    const lease = await acquireBuildLock(lockPath, {
+      probeProcessStartIdentity(pid) {
+        assert.equal(pid, process.pid);
+        return replacementIdentity;
+      },
+    });
+    const created = JSON.parse(await readFile(lockPath, "utf8"));
+    assert.deepEqual(
+      Object.keys(created).sort(),
+      ["hostname", "owner_token", "pid", "process_start_identity", "schema_version", "started_at"],
+    );
+    assert.equal(created.schema_version, 2);
+    assert.equal(created.process_start_identity, replacementIdentity);
+    await releaseBuildLock(lease);
+
+    const staleToken = randomUUID();
+    await writeIdentityLock(lockPath, staleToken, originalIdentity);
+    const reclaimed = await acquireBuildLock(lockPath, replacementOptions);
+    assert.notEqual(JSON.parse(await readFile(lockPath, "utf8")).owner_token, staleToken);
+    await releaseBuildLock(reclaimed);
+
+    const activeToken = randomUUID();
+    const active = await writeIdentityLock(lockPath, activeToken, replacementIdentity);
+    await assert.rejects(acquireBuildLock(lockPath, replacementOptions), /active/i);
+    assert.equal(await readFile(lockPath, "utf8"), `${JSON.stringify(active)}\n`);
+    await rm(lockPath, { force: true });
+
+    const inaccessibleToken = randomUUID();
+    const inaccessible = await writeIdentityLock(lockPath, inaccessibleToken, originalIdentity);
+    await assert.rejects(
+      acquireBuildLock(lockPath, {
+        probeProcess: () => "live",
+        probeProcessStartIdentity() {
+          throw new Error("synthetic identity query failure");
+        },
+      }),
+      /identity|inaccessible|cannot prove/i,
+    );
+    assert.equal(await readFile(lockPath, "utf8"), `${JSON.stringify(inaccessible)}\n`);
+    await rm(lockPath, { force: true });
+
+    const legacyToken = randomUUID();
+    const legacy = await writeCurrentLock(lockPath, legacyToken);
+    let currentIdentityQueries = 0;
+    let legacyOwnerIdentityQueries = 0;
+    await assert.rejects(
+      acquireBuildLock(lockPath, {
+        probeProcess: () => "live",
+        probeProcessStartIdentity(pid) {
+          if (pid === process.pid) currentIdentityQueries += 1;
+          if (pid === legacy.pid) legacyOwnerIdentityQueries += 1;
+          return replacementIdentity;
+        },
+      }),
+      /active/i,
+    );
+    assert.equal(currentIdentityQueries, 1);
+    assert.equal(legacyOwnerIdentityQueries, 0);
+    assert.equal(await readFile(lockPath, "utf8"), `${JSON.stringify(legacy)}\n`);
+    await rm(lockPath, { force: true });
+
+    const releaseToken = randomUUID();
+    const releasePath = `${lockPath}.release-${releaseToken}`;
+    await writeIdentityLock(releasePath, releaseToken, originalIdentity);
+    const recoveredRelease = await acquireBuildLock(lockPath, replacementOptions);
+    assert.equal(await exists(releasePath), false);
+    await releaseBuildLock(recoveredRelease);
+
+    const activeReleaseToken = randomUUID();
+    const activeReleasePath = `${lockPath}.release-${activeReleaseToken}`;
+    await writeIdentityLock(activeReleasePath, activeReleaseToken, replacementIdentity);
+    await assert.rejects(acquireBuildLock(lockPath, replacementOptions), /release owner.*active/i);
+    assert.equal(await exists(activeReleasePath), true);
+    await rm(activeReleasePath, { force: true });
+
+    const reclaimToken = randomUUID();
+    const reclaimPath = `${lockPath}.reclaim-${reclaimToken}`;
+    await writeIdentityLock(reclaimPath, reclaimToken, originalIdentity);
+    const recoveredReclaim = await acquireBuildLock(lockPath, replacementOptions);
+    assert.equal(await exists(reclaimPath), false);
+    await releaseBuildLock(recoveredReclaim);
+
+    const activeReclaimToken = randomUUID();
+    const activeReclaimPath = `${lockPath}.reclaim-${activeReclaimToken}`;
+    await writeIdentityLock(activeReclaimPath, activeReclaimToken, replacementIdentity);
+    await assert.rejects(acquireBuildLock(lockPath, replacementOptions), /reclaim owner.*active/i);
+    assert.equal(await exists(activeReclaimPath), true);
+    await rm(activeReclaimPath, { force: true });
+
+    await assert.rejects(
+      acquireBuildLock(lockPath, {
+        probeProcessStartIdentity() {
+          throw new Error("synthetic own-identity query failure");
+        },
+      }),
+      /process start identity/i,
+    );
+    assert.equal(await exists(lockPath), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("direct indexer lock is strict JSON and only reclaims definitely-dead same-host owners", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "mql5-index-lock-"));
   const lockPath = path.join(root, ".index-build.lock");
   try {
     const lease = await acquireBuildLock(lockPath);
     const lock = JSON.parse(await readFile(lockPath, "utf8"));
-    assert.deepEqual(Object.keys(lock).sort(), ["hostname", "owner_token", "pid", "schema_version", "started_at"]);
-    assert.equal(lock.schema_version, 1);
+    assert.deepEqual(
+      Object.keys(lock).sort(),
+      ["hostname", "owner_token", "pid", "process_start_identity", "schema_version", "started_at"],
+    );
+    assert.equal(lock.schema_version, 2);
     assert.equal(lock.pid, process.pid);
     assert.equal(lock.hostname, systemHostname());
     assert.match(lock.owner_token, /^[0-9a-f-]{36}$/u);
+    assert.match(lock.process_start_identity, /^[a-z][a-z0-9-]*:[A-Za-z0-9._-]+$/u);
     await assert.rejects(acquireBuildLock(lockPath), /active|lock exists/i);
     await releaseBuildLock(lease);
 

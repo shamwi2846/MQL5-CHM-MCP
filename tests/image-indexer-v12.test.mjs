@@ -675,7 +675,8 @@ test("finalizer cleanup failure retains strict owner evidence for retry", async 
     );
     assert.equal(injected, true);
     const lock = JSON.parse(await readFile(path.join(outputDirectory, ".index-build.lock"), "utf8"));
-    assert.equal(lock.schema_version, 1);
+    assert.equal(lock.schema_version, 2);
+    assert.match(lock.process_start_identity, /^[a-z][a-z0-9-]*:[A-Za-z0-9._-]+$/u);
     assert.equal(await readFile(path.join(outputDirectory, `.manifest.json.candidate-${lock.owner_token}`), "utf8"), "stranded candidate manifest\n");
 
     const recovered = await buildIndex(root, miniCorpusBuildOptions({

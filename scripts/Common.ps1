@@ -555,12 +555,53 @@ try {
         }).Count -gt 0) {
             throw 'Batch command arguments must not contain NUL, CR, or LF characters.'
         }
+        if (@($argumentValues | Where-Object { $_.IndexOf('"') -ge 0 }).Count -gt 0) {
+            throw 'Batch command arguments containing quotes cannot be transported safely.'
+        }
+        $systemDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::System)
+        if ([string]::IsNullOrWhiteSpace($systemDirectory)) {
+            throw 'Cannot locate the trusted Windows system directory for batch process execution.'
+        }
+        $commandProcessor = [IO.Path]::GetFullPath((Join-Path $systemDirectory 'cmd.exe'))
+        $expectedCommandProcessor = [IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetFullPath($systemDirectory)) 'cmd.exe'))
+        if (-not $commandProcessor.Equals($expectedCommandProcessor, [StringComparison]::OrdinalIgnoreCase) -or
+            -not (Test-Path -LiteralPath $commandProcessor -PathType Leaf)) {
+            throw 'The batch command processor did not resolve to the trusted Windows system path.'
+        }
+        $variablePrefix = 'MQL5CHM_BATCH_' + [Guid]::NewGuid().ToString('N').ToUpperInvariant()
+        $environmentNames = New-Object 'System.Collections.Generic.List[string]'
+        $targetVariable = $variablePrefix + '_TARGET'
+        $environmentNames.Add($targetVariable)
+        [Environment]::SetEnvironmentVariable($targetVariable, $filePath, [EnvironmentVariableTarget]::Process)
+        $commandParts = New-Object 'System.Collections.Generic.List[string]'
+        $commandParts.Add('"%'+ $targetVariable + '%"')
+        for ($argumentIndex = 0; $argumentIndex -lt $argumentValues.Count; $argumentIndex++) {
+            if ($argumentValues[$argumentIndex].Length -eq 0) {
+                $commandParts.Add('""')
+                continue
+            }
+            $argumentVariable = $variablePrefix + '_ARG_' + $argumentIndex.ToString([Globalization.CultureInfo]::InvariantCulture)
+            $environmentNames.Add($argumentVariable)
+            [Environment]::SetEnvironmentVariable($argumentVariable, $argumentValues[$argumentIndex], [EnvironmentVariableTarget]::Process)
+            $commandParts.Add('"%' + $argumentVariable + '%"')
+        }
+        # Each private variable reference is already inside literal quote
+        # context. cmd.exe does not recursively expand percent sequences that
+        # occur inside a variable value, and delayed expansion stays disabled.
+        $commandText = '"' + ($commandParts -join ' ') + '"'
         $nativePreference = Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue
         if ($null -ne $nativePreference) { $PSNativeCommandUseErrorActionPreference = $false }
         $ErrorActionPreference = 'Continue'
         $global:LASTEXITCODE = 0
-        & $filePath @argumentValues
-        exit ([int]$LASTEXITCODE)
+        try {
+            & $commandProcessor '/d' '/v:off' '/s' '/c' $commandText
+            $batchExitCode = [int]$LASTEXITCODE
+        } finally {
+            foreach ($environmentName in $environmentNames) {
+                [Environment]::SetEnvironmentVariable($environmentName, $null, [EnvironmentVariableTarget]::Process)
+            }
+        }
+        exit $batchExitCode
     }
     if (-not $extension.Equals('.exe', [StringComparison]::OrdinalIgnoreCase) -and
         -not $extension.Equals('.com', [StringComparison]::OrdinalIgnoreCase)) {
@@ -1034,11 +1075,24 @@ function Invoke-NativeProcessWithTimeout {
     $workingDirectory = Resolve-FullPath -Path (Get-Location -PSProvider FileSystem).ProviderPath -MustExist -PathType Container
     $argumentLine = (@($Arguments | ForEach-Object { ConvertTo-WindowsNativeArgument -Value ([string]$_) }) -join ' ')
     $extension = [IO.Path]::GetExtension($executable)
+    $isBatchTarget = (
+        $extension.Equals('.cmd', [StringComparison]::OrdinalIgnoreCase) -or
+        $extension.Equals('.bat', [StringComparison]::OrdinalIgnoreCase)
+    )
     if (-not $extension.Equals('.exe', [StringComparison]::OrdinalIgnoreCase) -and
         -not $extension.Equals('.com', [StringComparison]::OrdinalIgnoreCase) -and
-        -not $extension.Equals('.cmd', [StringComparison]::OrdinalIgnoreCase) -and
-        -not $extension.Equals('.bat', [StringComparison]::OrdinalIgnoreCase)) {
+        -not $isBatchTarget) {
         throw "Native process execution supports only .exe, .com, .cmd, and .bat targets: $executable"
+    }
+    if ($isBatchTarget) {
+        foreach ($argumentValue in @($Arguments | ForEach-Object { [string]$_ })) {
+            if ($argumentValue.IndexOf([char]0) -ge 0 -or $argumentValue.IndexOfAny([char[]]"`r`n") -ge 0) {
+                throw 'Batch command arguments must not contain NUL, CR, or LF characters.'
+            }
+            if ($argumentValue.IndexOf('"') -ge 0) {
+                throw 'Batch command arguments containing quotes cannot be transported safely.'
+            }
+        }
     }
     $payloadJson = [pscustomobject]@{
         file_path = $executable
@@ -4595,6 +4649,116 @@ function Test-InterruptedLegacyPointerChecksumMigration {
     }
 }
 
+function Get-PortablePackageFileSets {
+    [CmdletBinding()]
+    param()
+
+    return [ordered]@{
+        root = @(
+            '.mql5-chm-package-root'
+            'Install-Codex.ps1'
+            'Rebuild-Index.ps1'
+            'Uninstall-Codex.ps1'
+            'Package-Portable.ps1'
+            'Check-DocumentationUpdates.ps1'
+            'Update-Documentation.ps1'
+            'Rollback-Documentation.ps1'
+            'package.json'
+            'README.md'
+            'SPEC.md'
+        )
+        runtime = @(
+            'LICENSE'
+            'node.exe'
+        )
+        app = @(
+            'server.mjs'
+            'indexer.mjs'
+        )
+        config = @(
+            'mql5-image-policy.json'
+            'mql5-query-expansions.json'
+        )
+        data = @(
+            'active.json'
+        )
+        maintenance = @(
+            '.update.lock'
+        )
+        scripts = @(
+            'Check-DocumentationUpdates.ps1'
+            'Common.ps1'
+            'Compare-OfficialDocumentationHashes.ps1'
+            'IndexMaintenance.ps1'
+            'Install-Codex.ps1'
+            'Package-Portable.ps1'
+            'Rebuild-Index.ps1'
+            'Rollback-Documentation.ps1'
+            'SevenZipRuntime.ps1'
+            'Smoke-Test-McpServer.mjs'
+            'StageInstallRecovery.ps1'
+            'Uninstall-Codex.ps1'
+            'Update-Documentation.ps1'
+            'inspect-database.mjs'
+        )
+        tools = @(
+            '7z.exe'
+            '7z.dll'
+            '7zip.provenance.json'
+        )
+        licenses = @(
+            '7ZIP-LICENSE.txt'
+            'BUNDLED-NODE-NOTICES.txt'
+            'CHEERIO-LICENSE.txt'
+            'ESBUILD-LICENSE.txt'
+            'ICONV-LITE-LICENSE.txt'
+            'JPEG-JS-LICENSE.txt'
+            'MCP-SDK-LICENSE.txt'
+            'NODE-LICENSE.txt'
+            'THIRD-PARTY-NOTICES.md'
+            'ZOD-LICENSE.txt'
+            'bundled-node-dependencies.json'
+            'bundled-node-notice-overrides.json'
+            'overrides\boolbase-1.0.0.txt'
+        )
+    }
+}
+
+function Get-PortablePackageRequiredStaticPaths {
+    [CmdletBinding()]
+    param()
+
+    $fileSets = Get-PortablePackageFileSets
+    $expectedSetNames = @('root', 'runtime', 'app', 'config', 'data', 'maintenance', 'scripts', 'tools', 'licenses')
+    $actualSetNames = @($fileSets.Keys)
+    if ($actualSetNames.Count -ne $expectedSetNames.Count -or
+        @(Compare-Object -ReferenceObject $expectedSetNames -DifferenceObject $actualSetNames -CaseSensitive).Count -ne 0) {
+        throw 'Portable package file sets do not contain the exact required directory contract.'
+    }
+
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $result = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($setName in $expectedSetNames) {
+        foreach ($listedFile in @($fileSets[$setName])) {
+            $relativeFile = [string]$listedFile
+            if ([string]::IsNullOrWhiteSpace($relativeFile) -or [IO.Path]::IsPathRooted($relativeFile) -or
+                $relativeFile -match '(^|[\\/])\.\.?([\\/]|$)') {
+                throw "Portable $setName allowlist contains an invalid relative file path: '$relativeFile'"
+            }
+            $portableRelative = if ($setName -ceq 'root') {
+                $relativeFile.Replace('\', '/')
+            } else {
+                "$setName/$($relativeFile.Replace('\', '/'))"
+            }
+            if (-not $seen.Add($portableRelative)) {
+                throw "Portable package allowlist contains a duplicate path: '$portableRelative'"
+            }
+            $result.Add($portableRelative)
+        }
+    }
+    return @($result)
+}
+
 function Assert-PackageChecksums {
     [CmdletBinding()]
     param(
@@ -4697,64 +4861,7 @@ function Assert-PackageChecksums {
             throw 'The active pointer differs from checksums.sha256 outside a validated pending transition.'
         }
     }
-    $required = @(
-        '.mql5-chm-package-root',
-        'runtime\node.exe',
-        'runtime\LICENSE',
-        'app\server.mjs',
-        'app\indexer.mjs',
-        'config\mql5-image-policy.json',
-        'config\mql5-query-expansions.json',
-        'data\active.json',
-        'maintenance\.update.lock',
-        'Install-Codex.ps1',
-        'Rebuild-Index.ps1',
-        'Uninstall-Codex.ps1',
-        'Package-Portable.ps1',
-        'Check-DocumentationUpdates.ps1',
-        'Update-Documentation.ps1',
-        'Rollback-Documentation.ps1',
-        'package.json',
-        'README.md',
-        'SPEC.md',
-        'scripts\build.mjs',
-        'scripts\Generate-BundledNotices.mjs',
-        'scripts\inspect-database.mjs',
-        'scripts\Common.ps1',
-        'scripts\IndexMaintenance.ps1',
-        'scripts\SevenZipRuntime.ps1',
-        'scripts\StageInstallRecovery.ps1',
-        'scripts\Smoke-Test-McpServer.mjs',
-        'scripts\Compare-OfficialDocumentationHashes.ps1',
-        'scripts\Test-DocumentationFreshness.ps1',
-        'scripts\Test-PowerShellSyntax.ps1',
-        'scripts\Invoke-PowerShellTestSuite.ps1',
-        'scripts\Install-Codex.ps1',
-        'scripts\Rebuild-Index.ps1',
-        'scripts\Uninstall-Codex.ps1',
-        'scripts\Package-Portable.ps1',
-        'scripts\Check-DocumentationUpdates.ps1',
-        'scripts\Update-Documentation.ps1',
-        'scripts\Rollback-Documentation.ps1',
-        'scripts\Test-Maintenance.ps1',
-        'scripts\Test-StageInstallRecovery.ps1',
-        'tools\7z.exe',
-        'tools\7z.dll',
-        'tools\7zip.provenance.json',
-        'licenses\7ZIP-LICENSE.txt',
-        'licenses\BUNDLED-NODE-NOTICES.txt',
-        'licenses\bundled-node-dependencies.json',
-        'licenses\bundled-node-notice-overrides.json',
-        'licenses\overrides\boolbase-1.0.0.txt',
-        'licenses\CHEERIO-LICENSE.txt',
-        'licenses\ESBUILD-LICENSE.txt',
-        'licenses\ICONV-LITE-LICENSE.txt',
-        'licenses\JPEG-JS-LICENSE.txt',
-        'licenses\MCP-SDK-LICENSE.txt',
-        'licenses\NODE-LICENSE.txt',
-        'licenses\THIRD-PARTY-NOTICES.md',
-        'licenses\ZOD-LICENSE.txt'
-    )
+    $required = @(Get-PortablePackageRequiredStaticPaths | ForEach-Object { $_.Replace('/', '\') })
     foreach ($name in @('manifest.json','mql5-docs.sqlite','mql5.chm','mql5book.chm','neuronetworksbook.chm')) { $required += "revisions\$($pointer.active_revision)\$name" }
     foreach ($relative in $required) {
         $portableRelative = $relative.Replace('\','/')

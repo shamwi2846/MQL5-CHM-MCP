@@ -68,6 +68,26 @@ test("source filters and typo recovery work", () => {
   assert.equal(bookTypo.results[0].title, "1.8 Data input");
 });
 
+test("search tie-breakers are independent of the host's default locale", () => {
+  const input = { query: "custom indicatr", source: "all", limit: 8, expand: false };
+  const baseline = service.search(input).results.map((entry) => entry.topic_id);
+  const localeCompareDescriptor = Object.getOwnPropertyDescriptor(String.prototype, "localeCompare");
+  try {
+    Object.defineProperty(String.prototype, "localeCompare", {
+      ...localeCompareDescriptor,
+      value(other) {
+        const left = String(this);
+        const right = String(other);
+        return left < right ? 1 : left > right ? -1 : 0;
+      },
+    });
+    const hostileLocale = service.search(input).results.map((entry) => entry.topic_id);
+    assert.deepEqual(hostileLocale, baseline);
+  } finally {
+    Object.defineProperty(String.prototype, "localeCompare", localeCompareDescriptor);
+  }
+});
+
 test("v1.1 expansions, citations, and official-check guidance are bounded", () => {
   for (const [query, expectedTitle] of [
     ["trade opening", "OrderSend"],

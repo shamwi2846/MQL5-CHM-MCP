@@ -1835,8 +1835,8 @@ var Mql5ChmSearchService = class {
         left.termIndex - right.termIndex ||
         left.row.rank - right.row.rank ||
         sourcePreference(left.row.source) - sourcePreference(right.row.source) ||
-        left.row.title.localeCompare(right.row.title) ||
-        left.row.topic_id.localeCompare(right.row.topic_id)
+        compareOrdinal(left.row.title, right.row.title) ||
+        compareOrdinal(left.row.topic_id, right.row.topic_id)
       );
     }
 
@@ -1883,7 +1883,7 @@ var Mql5ChmSearchService = class {
         left.kindPriority - right.kindPriority ||
         left.index - right.index ||
         sourcePreference(left.row.source) - sourcePreference(right.row.source) ||
-        left.row.topic_id.localeCompare(right.row.topic_id)
+        compareOrdinal(left.row.topic_id, right.row.topic_id)
       );
       for (const candidate of weightedCandidates) {
         addRows([candidate.row], candidate.matchKind, candidate.matchedTerms, "matched_text");
@@ -1910,8 +1910,8 @@ var Mql5ChmSearchService = class {
         (left, right) =>
           right.score - left.score ||
           sourcePreference(left.row.source) - sourcePreference(right.row.source) ||
-          left.row.title.localeCompare(right.row.title) ||
-          left.row.topic_id.localeCompare(right.row.topic_id)
+          compareOrdinal(left.row.title, right.row.title) ||
+          compareOrdinal(left.row.topic_id, right.row.topic_id)
       );
       const contentStatement = this.database.prepare("SELECT content FROM topics WHERE topic_id=?");
       for (const candidate of ranked) {

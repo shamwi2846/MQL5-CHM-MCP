@@ -213,13 +213,7 @@ try {
         prior_stage_report_file_sha256=$boundaryOldReportFileSha
         stage_report_file_sha256=(Get-StagedRevisionReportFileSha256 -StageReport $boundaryNewReport)
     }
-    $boundaryRequired = @(
-        '.mql5-chm-package-root','runtime/node.exe','runtime/LICENSE','app/server.mjs','app/indexer.mjs',
-        'config/mql5-image-policy.json','config/mql5-query-expansions.json','maintenance/.update.lock',
-        'Install-Codex.ps1','Rebuild-Index.ps1','Uninstall-Codex.ps1','Package-Portable.ps1','Check-DocumentationUpdates.ps1','Update-Documentation.ps1','Rollback-Documentation.ps1','package.json','README.md','SPEC.md',
-        'scripts/build.mjs','scripts/Generate-BundledNotices.mjs','scripts/inspect-database.mjs','scripts/Common.ps1','scripts/IndexMaintenance.ps1','scripts/SevenZipRuntime.ps1','scripts/StageInstallRecovery.ps1','scripts/Smoke-Test-McpServer.mjs','scripts/Compare-OfficialDocumentationHashes.ps1','scripts/Test-DocumentationFreshness.ps1','scripts/Test-PowerShellSyntax.ps1','scripts/Invoke-PowerShellTestSuite.ps1','scripts/Install-Codex.ps1','scripts/Rebuild-Index.ps1','scripts/Uninstall-Codex.ps1','scripts/Package-Portable.ps1','scripts/Check-DocumentationUpdates.ps1','scripts/Update-Documentation.ps1','scripts/Rollback-Documentation.ps1','scripts\Test-Maintenance.ps1','scripts\Test-StageInstallRecovery.ps1',
-        'licenses/7ZIP-LICENSE.txt','licenses/BUNDLED-NODE-NOTICES.txt','licenses/bundled-node-dependencies.json','licenses/bundled-node-notice-overrides.json','licenses/overrides/boolbase-1.0.0.txt','licenses/CHEERIO-LICENSE.txt','licenses/ESBUILD-LICENSE.txt','licenses/ICONV-LITE-LICENSE.txt','licenses/JPEG-JS-LICENSE.txt','licenses/MCP-SDK-LICENSE.txt','licenses/NODE-LICENSE.txt','licenses/THIRD-PARTY-NOTICES.md','licenses/ZOD-LICENSE.txt','tools/7z.exe','tools/7z.dll','tools/7zip.provenance.json'
-    )
+    $boundaryRequired = @(Get-PortablePackageRequiredStaticPaths | Where-Object { [string]$_ -cne 'data/active.json' })
     foreach ($relative in $boundaryRequired) {
         $path = Join-Path $boundaryFixture $relative.Replace('/','\'); $parent = Split-Path -Parent $path
         if (-not (Test-Path -LiteralPath $parent -PathType Container)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
@@ -236,6 +230,19 @@ try {
         function Get-ValidatedRevisionChecksumFiles { param([string]$ProjectRoot,[string]$Revision,[string]$IdentityMode='Index',[switch]$AllowLegacy) return @() }
         Assert-RevisionStageRecoveryChecksumBoundary -ProjectRoot $boundaryFixture -Journal $boundaryJournal | Out-Null
     } finally { Set-Item Function:\Get-ValidatedRevisionChecksumFiles -Value $originalValidatedRevisionFiles }
+    foreach ($omittedDevelopmentRelative in @('scripts/build.mjs','scripts/Test-StageInstallRecovery.ps1')) {
+        $omittedDevelopmentPath = Join-Path $boundaryFixture $omittedDevelopmentRelative.Replace('/','\')
+        [IO.File]::WriteAllText($omittedDevelopmentPath, 'development-only and intentionally unchecksummed')
+        $omittedDevelopmentRejected = $false
+        try {
+            function Get-ValidatedRevisionChecksumFiles { param([string]$ProjectRoot,[string]$Revision,[string]$IdentityMode='Index',[switch]$AllowLegacy) return @() }
+            Assert-RevisionStageRecoveryChecksumBoundary -ProjectRoot $boundaryFixture -Journal $boundaryJournal | Out-Null
+        } catch { $omittedDevelopmentRejected = $true } finally {
+            Set-Item Function:\Get-ValidatedRevisionChecksumFiles -Value $originalValidatedRevisionFiles
+        }
+        Assert-StageFixture -Condition $omittedDevelopmentRejected -Message "Stage recovery accepted omitted development file '$omittedDevelopmentRelative'."
+        Remove-Item -LiteralPath $omittedDevelopmentPath -Force
+    }
     $boundaryPackageManifest = Join-Path $boundaryFixture 'package.json'
     $boundaryPackageManifestBytes = [IO.File]::ReadAllBytes($boundaryPackageManifest)
     Remove-Item -LiteralPath $boundaryPackageManifest -Force

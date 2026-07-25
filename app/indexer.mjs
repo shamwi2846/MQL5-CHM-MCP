@@ -6562,6 +6562,7 @@ import {
   open,
   readFile,
   readdir,
+  realpath,
   rename,
   rm,
   stat,
@@ -13945,14 +13946,47 @@ function isSamePathOrDescendant(root2, candidate) {
 function pathsOverlap(left, right) {
   return isSamePathOrDescendant(left, right) || isSamePathOrDescendant(right, left);
 }
-function assertSafeOutputLocation(projectRoot, sourceDirectory, extractedRoot, outputDirectory) {
-  if (path.resolve(outputDirectory).toLowerCase() === path.resolve(projectRoot).toLowerCase()) {
+async function resolvePhysicalPathIdentity(candidate, label) {
+  const suffix = [];
+  let cursor = path.resolve(candidate);
+  for (; ; ) {
+    try {
+      const physicalAncestor = await realpath(cursor);
+      return path.resolve(physicalAncestor, ...suffix.reverse());
+    } catch (error) {
+      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") {
+        throw new Error(`Could not resolve the physical identity of ${label}: ${candidate}`, {
+          cause: error
+        });
+      }
+    }
+    const parent2 = path.dirname(cursor);
+    if (parent2 === cursor) {
+      throw new Error(`Could not find an existing ancestor for ${label}: ${candidate}`);
+    }
+    suffix.push(path.basename(cursor));
+    cursor = parent2;
+  }
+}
+async function assertSafeOutputLocation(projectRoot, sourceDirectory, extractedRoot, outputDirectory) {
+  const [
+    physicalProjectRoot,
+    physicalSourceDirectory,
+    physicalExtractedRoot,
+    physicalOutputDirectory
+  ] = await Promise.all([
+    resolvePhysicalPathIdentity(projectRoot, "project root"),
+    resolvePhysicalPathIdentity(sourceDirectory, "source directory"),
+    resolvePhysicalPathIdentity(extractedRoot, "extracted documentation tree"),
+    resolvePhysicalPathIdentity(outputDirectory, "output directory")
+  ]);
+  if (path.relative(physicalProjectRoot, physicalOutputDirectory) === "") {
     throw new Error(`Output directory must not overlap the project/source root: ${outputDirectory}`);
   }
-  if (pathsOverlap(outputDirectory, sourceDirectory)) {
+  if (pathsOverlap(physicalOutputDirectory, physicalSourceDirectory)) {
     throw new Error(`Output directory must not overlap the source directory: ${outputDirectory}`);
   }
-  if (pathsOverlap(outputDirectory, extractedRoot)) {
+  if (pathsOverlap(physicalOutputDirectory, physicalExtractedRoot)) {
     throw new Error(`Output directory must not overlap the extracted documentation tree: ${outputDirectory}`);
   }
   for (const protectedName of [
@@ -13970,7 +14004,11 @@ function assertSafeOutputLocation(projectRoot, sourceDirectory, extractedRoot, o
     "tools"
   ]) {
     const protectedPath = path.join(projectRoot, protectedName);
-    if (pathsOverlap(outputDirectory, protectedPath)) {
+    const physicalProtectedPath = await resolvePhysicalPathIdentity(
+      protectedPath,
+      `protected project path '${protectedName}'`
+    );
+    if (pathsOverlap(physicalOutputDirectory, physicalProtectedPath)) {
       throw new Error(
         `Output directory overlaps protected or immutable project path '${protectedName}': ${outputDirectory}`
       );
@@ -14468,13 +14506,15 @@ function validateDatabase(database, {
   }
   database.exec("INSERT INTO search_fts(search_fts) VALUES('integrity-check')");
 }
-var BUILD_LOCK_SCHEMA_VERSION = 1;
+var BUILD_LOCK_SCHEMA_VERSION = 2;
+var BUILD_LOCK_PREPARATION_VERSION = 1;
 var BUILD_TRANSACTION_SCHEMA_VERSION = 1;
 var BUILD_TRANSACTION_KIND = "mql5-chm-index-publication-v1";
 var BUILD_TRANSACTION_FILENAME = ".index-build-transaction.json";
 var ASSET_DISPOSAL_ROLES = ["target", "candidate", "backup"];
 var UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 var SHA256_PATTERN = /^[0-9a-f]{64}$/u;
+var PROCESS_START_IDENTITY_PATTERN = /^[a-z][a-z0-9-]{0,31}:[A-Za-z0-9._-]{1,96}$/u;
 function exactObjectKeys(value, expected) {
   if (!value || Array.isArray(value) || typeof value !== "object") return false;
   const actual = Object.keys(value).sort();
@@ -14490,6 +14530,159 @@ function defaultProbeProcess(pid) {
     if (error?.code === "EPERM" || error?.code === "EACCES") return "inaccessible";
     return "inaccessible";
   }
+}
+async function defaultProbeProcessStartIdentity(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    throw new Error("Process ID is invalid.");
+  }
+  if (process.platform === "win32") {
+    const systemRoot = process.env.SystemRoot;
+    if (!systemRoot || !path.win32.isAbsolute(systemRoot)) {
+      throw new Error("SystemRoot is unavailable.");
+    }
+    const powershell = path.win32.join(
+      systemRoot,
+      "System32",
+      "WindowsPowerShell",
+      "v1.0",
+      "powershell.exe"
+    );
+    const script = [
+      "$ErrorActionPreference='Stop'",
+      "$targetProcessId=0",
+      "if(-not [int]::TryParse($env:MQL5_CHM_LOCK_PROCESS_ID,[Globalization.NumberStyles]::None,[Globalization.CultureInfo]::InvariantCulture,[ref]$targetProcessId)){exit 4}",
+      "try{$targetProcess=[Diagnostics.Process]::GetProcessById($targetProcessId);$started=$targetProcess.StartTime.ToFileTimeUtc().ToString([Globalization.CultureInfo]::InvariantCulture)}catch{exit 5}",
+      "[Console]::Out.Write($started)"
+    ].join(";");
+    const encoded = Buffer.from(script, "utf16le").toString("base64");
+    const result = spawnSync(
+      powershell,
+      ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+      {
+        env: { ...process.env, MQL5_CHM_LOCK_PROCESS_ID: String(pid) },
+        encoding: "utf8",
+        windowsHide: true,
+        timeout: 1e4,
+        maxBuffer: 16384
+      }
+    );
+    const fileTime = result.stdout?.trim();
+    if (result.error || result.signal !== null || result.status !== 0 || !/^[0-9]{1,20}$/u.test(fileTime)) {
+      throw new Error("Windows process start time could not be queried.");
+    }
+    return `windows-filetime:${fileTime}`;
+  }
+  if (process.platform === "linux") {
+    const raw = await readFile(`/proc/${pid}/stat`, "utf8");
+    const commandEnd = raw.lastIndexOf(")");
+    const fieldsAfterCommand = commandEnd >= 0 ? raw.slice(commandEnd + 1).trim().split(/\s+/u) : [];
+    const startTicks = fieldsAfterCommand[19];
+    if (!/^[0-9]+$/u.test(startTicks ?? "")) {
+      throw new Error("Linux process start time could not be parsed.");
+    }
+    return `linux-startticks:${startTicks}`;
+  }
+  if (pid === process.pid) {
+    return `node-time-origin:${Math.trunc(performance.timeOrigin * 1e3)}`;
+  }
+  throw new Error(`Process start identity is unsupported on ${process.platform}.`);
+}
+async function readProcessStartIdentity(pid, options = {}) {
+  const probe = options.probeProcessStartIdentity ?? defaultProbeProcessStartIdentity;
+  const identity = await probe(pid);
+  if (typeof identity !== "string" || !PROCESS_START_IDENTITY_PATTERN.test(identity)) {
+    throw new Error("Process start identity has an invalid format.");
+  }
+  return identity;
+}
+var cachedCurrentProcessStartIdentity = null;
+async function readCurrentProcessStartIdentity(options = {}) {
+  if (typeof options.probeProcessStartIdentity === "function") {
+    return readProcessStartIdentity(process.pid, options);
+  }
+  if (cachedCurrentProcessStartIdentity !== null) return cachedCurrentProcessStartIdentity;
+  const identity = await readProcessStartIdentity(process.pid);
+  cachedCurrentProcessStartIdentity = identity;
+  return identity;
+}
+async function classifyBuildLockOwner(parsed, options = {}) {
+  const probeProcess = options.probeProcess ?? defaultProbeProcess;
+  let processState;
+  try {
+    processState = await probeProcess(parsed.value.pid);
+  } catch {
+    return { state: "inaccessible", reason: "process-probe-failed" };
+  }
+  if (processState === "dead") return { state: "dead", reason: "process-dead" };
+  if (processState !== "live") return { state: "inaccessible", reason: "process-inaccessible" };
+  if (parsed.kind !== "current" || parsed.value.schema_version !== BUILD_LOCK_SCHEMA_VERSION) {
+    return { state: "live", reason: "legacy-live-pid" };
+  }
+  let observedIdentity;
+  try {
+    observedIdentity = await readProcessStartIdentity(parsed.value.pid, options);
+  } catch {
+    return { state: "inaccessible", reason: "process-identity-unavailable" };
+  }
+  if (observedIdentity === parsed.value.process_start_identity) {
+    return { state: "live", reason: "matching-process-identity" };
+  }
+  return { state: "dead", reason: "pid-reused" };
+}
+function buildLockOwnerDigest(value) {
+  return createHash("sha256").update(String(value), "utf8").digest("hex");
+}
+function buildLockPreparationPrefix(lockPath) {
+  return `${path.basename(lockPath)}.prepare-`;
+}
+function buildLockPreparationPath(lockPath, ownerToken, localHostname, processStartIdentity) {
+  const hostnameDigest = buildLockOwnerDigest(localHostname.toLowerCase());
+  const processStartDigest = buildLockOwnerDigest(processStartIdentity);
+  return path.join(
+    path.dirname(lockPath),
+    `${buildLockPreparationPrefix(lockPath)}v${BUILD_LOCK_PREPARATION_VERSION}-${process.pid}-${hostnameDigest}-${processStartDigest}-${ownerToken}`
+  );
+}
+function parseBuildLockPreparationName(lockPath, name) {
+  const prefix = `${buildLockPreparationPrefix(lockPath)}v${BUILD_LOCK_PREPARATION_VERSION}-`;
+  if (!name.startsWith(prefix)) return null;
+  const match = /^([1-9][0-9]{0,9})-([a-f0-9]{64})-([a-f0-9]{64})-(.+)$/u.exec(
+    name.slice(prefix.length)
+  );
+  if (!match || !UUID_PATTERN.test(match[4])) return null;
+  const pid = Number(match[1]);
+  if (!Number.isSafeInteger(pid) || pid <= 0 || pid > 2147483647) return null;
+  return {
+    name,
+    pid,
+    hostnameDigest: match[2],
+    processStartDigest: match[3],
+    ownerToken: match[4].toLowerCase()
+  };
+}
+async function classifyBuildLockPreparationOwner(preparation, localHostname, options = {}) {
+  if (preparation.hostnameDigest !== buildLockOwnerDigest(localHostname.toLowerCase())) {
+    return { state: "foreign", reason: "foreign-hostname-digest" };
+  }
+  const probeProcess = options.probeProcess ?? defaultProbeProcess;
+  let processState;
+  try {
+    processState = await probeProcess(preparation.pid);
+  } catch {
+    return { state: "inaccessible", reason: "process-probe-failed" };
+  }
+  if (processState === "dead") return { state: "dead", reason: "process-dead" };
+  if (processState !== "live") return { state: "inaccessible", reason: "process-inaccessible" };
+  let observedIdentity;
+  try {
+    observedIdentity = await readProcessStartIdentity(preparation.pid, options);
+  } catch {
+    return { state: "inaccessible", reason: "process-identity-unavailable" };
+  }
+  if (buildLockOwnerDigest(observedIdentity) === preparation.processStartDigest) {
+    return { state: "live", reason: "matching-process-identity" };
+  }
+  return { state: "dead", reason: "pid-reused" };
 }
 async function readBoundedRegularFile(filePath, label, maximumBytes = 16384) {
   const info = await lstat(filePath);
@@ -14567,15 +14760,61 @@ function tokenBoundBuildLeafNames(token) {
 }
 async function listLockSwapDebris(lockPath, { legacy = false } = {}) {
   const directory = path.dirname(lockPath);
+  const lockLeaf = path.basename(lockPath);
   const entries = await readdir(directory).catch((error) => {
     if (error?.code === "ENOENT") return [];
     throw error;
   });
   return entries.filter((name) => {
-    if (/^\.index-build\.lock\.(?:reclaim|release)-/u.test(name)) return true;
+    if (name.startsWith(`${lockLeaf}.prepare-`) || name.startsWith(`${lockLeaf}.reclaim-`) || name.startsWith(`${lockLeaf}.release-`)) return true;
     if (!legacy) return false;
     return name === BUILD_TRANSACTION_FILENAME || name.startsWith(`${BUILD_TRANSACTION_FILENAME}.tmp-`) || /^\.(?:mql5-docs\.sqlite|manifest\.json|assets)\.(?:candidate|backup)-/u.test(name) || /^\.assets\.disposal-/u.test(name) || /^\.(?:mql5-docs\.sqlite|manifest\.json|assets)\.tmp-/u.test(name);
   });
+}
+async function recoverDeadBuildLockPreparations(lockPath, claimNames, options = {}) {
+  const preparationPrefix = buildLockPreparationPrefix(lockPath);
+  const preparationNames = claimNames.filter((name) => name.startsWith(preparationPrefix)).sort(compareOrdinal);
+  if (!preparationNames.length) return;
+  const localHostname = String(options.hostname ?? systemHostname());
+  const recoverable = [];
+  for (const name of preparationNames) {
+    const preparation = parseBuildLockPreparationName(lockPath, name);
+    if (!preparation) {
+      throw new Error(`Malformed index lock preparation exists; state was preserved: ${name}`);
+    }
+    const preparationPath = path.join(path.dirname(lockPath), name);
+    const info = await lstat(preparationPath).catch((error) => {
+      if (error?.code === "ENOENT") return null;
+      throw error;
+    });
+    if (!info) continue;
+    if (!info.isFile() || info.isSymbolicLink()) {
+      throw new Error(`Index lock preparation must be a regular non-link file: ${preparationPath}`);
+    }
+    const owner = await classifyBuildLockPreparationOwner(
+      preparation,
+      localHostname,
+      options
+    );
+    if (owner.state === "live") {
+      throw new Error(`Index lock preparation owner is still active (PID ${preparation.pid}).`);
+    }
+    if (owner.state === "foreign") {
+      throw new Error("Index lock preparation belongs to a foreign host; state was preserved.");
+    }
+    if (owner.state !== "dead") {
+      throw new Error(
+        `Index lock preparation owner is inaccessible; cannot prove PID ${preparation.pid} is dead.`
+      );
+    }
+    recoverable.push(preparationPath);
+  }
+  for (const preparationPath of recoverable) {
+    await unlink(preparationPath).catch((error) => {
+      if (error?.code !== "ENOENT") throw error;
+    });
+    await options.onCleanupCutPoint?.("dead-lock-preparation:removed");
+  }
 }
 function parseTokenBoundBuildDebris(name) {
   const patterns = [
@@ -14696,8 +14935,21 @@ function parseExistingBuildLock(raw, localHostname) {
   } catch (error) {
     throw new Error(`Existing index build lock contains malformed JSON: ${error.message}`);
   }
+  if (exactObjectKeys(
+    value,
+    ["schema_version", "pid", "hostname", "owner_token", "process_start_identity", "started_at"]
+  )) {
+    if (value.schema_version !== BUILD_LOCK_SCHEMA_VERSION || !Number.isSafeInteger(value.pid) || value.pid <= 0 || typeof value.hostname !== "string" || !value.hostname || value.hostname.length > 255 || /[\u0000-\u001f\u007f]/u.test(value.hostname) || typeof value.owner_token !== "string" || !UUID_PATTERN.test(value.owner_token) || typeof value.process_start_identity !== "string" || !PROCESS_START_IDENTITY_PATTERN.test(value.process_start_identity)) {
+      throw new Error("Existing index build lock is malformed or has an unsupported schema.");
+    }
+    requireUtcLockTimestamp(value.started_at, "Existing index build lock started_at");
+    if (value.hostname.toLowerCase() !== localHostname.toLowerCase()) {
+      throw new Error(`Existing index build lock belongs to foreign host '${value.hostname}'.`);
+    }
+    return { kind: "current", value };
+  }
   if (exactObjectKeys(value, ["schema_version", "pid", "hostname", "owner_token", "started_at"])) {
-    if (value.schema_version !== BUILD_LOCK_SCHEMA_VERSION || !Number.isSafeInteger(value.pid) || value.pid <= 0 || typeof value.hostname !== "string" || !value.hostname || value.hostname.length > 255 || /[\u0000-\u001f\u007f]/u.test(value.hostname) || typeof value.owner_token !== "string" || !UUID_PATTERN.test(value.owner_token)) {
+    if (value.schema_version !== 1 || !Number.isSafeInteger(value.pid) || value.pid <= 0 || typeof value.hostname !== "string" || !value.hostname || value.hostname.length > 255 || /[\u0000-\u001f\u007f]/u.test(value.hostname) || typeof value.owner_token !== "string" || !UUID_PATTERN.test(value.owner_token)) {
       throw new Error("Existing index build lock is malformed or has an unsupported schema.");
     }
     requireUtcLockTimestamp(value.started_at, "Existing index build lock started_at");
@@ -14745,12 +14997,11 @@ async function recoverDeadReleaseClaim(lockPath, claimNames, options = {}) {
   if (parsed.kind !== "current" || parsed.value.owner_token.toLowerCase() !== claimToken) {
     throw new Error("Index lock release claim is not bound to its strict lock owner; state was preserved.");
   }
-  const probeProcess = options.probeProcess ?? defaultProbeProcess;
-  const state = await probeProcess(parsed.value.pid);
-  if (state === "live") {
+  const owner = await classifyBuildLockOwner(parsed, options);
+  if (owner.state === "live") {
     throw new Error(`Index lock release owner is still active (PID ${parsed.value.pid}).`);
   }
-  if (state !== "dead") {
+  if (owner.state !== "dead") {
     throw new Error(`Index lock release owner is inaccessible; cannot prove PID ${parsed.value.pid} is dead.`);
   }
   await unlink(claimPath).catch((error) => {
@@ -14791,12 +15042,11 @@ async function recoverDeadReclaimClaim(lockPath, suppliedLockPath, claimNames, o
       throw new Error(`Cannot recover legacy index build reclaim claim while ambiguous swap debris exists: ${legacyDebris.sort().join(", ")}.`);
     }
   }
-  const probeProcess = options.probeProcess ?? defaultProbeProcess;
-  const claimedOwnerState = await probeProcess(parsed.value.pid);
-  if (claimedOwnerState === "live") {
+  const claimedOwner = await classifyBuildLockOwner(parsed, options);
+  if (claimedOwner.state === "live") {
     throw new Error(`Index lock reclaim owner is still active (PID ${parsed.value.pid}).`);
   }
-  if (claimedOwnerState !== "dead") {
+  if (claimedOwner.state !== "dead") {
     throw new Error(`Index lock reclaim owner is inaccessible; cannot prove PID ${parsed.value.pid} is dead.`);
   }
   if (await pathExists(lockPath)) {
@@ -14805,11 +15055,11 @@ async function recoverDeadReclaimClaim(lockPath, suppliedLockPath, claimNames, o
     if (canonical.kind !== "current" || canonical.value.owner_token.toLowerCase() !== recoveryToken) {
       throw new Error("A canonical index lock and reclaim claim are not bound to the same recovery owner; state was preserved.");
     }
-    const canonicalOwnerState = await probeProcess(canonical.value.pid);
-    if (canonicalOwnerState === "live") {
+    const canonicalOwner = await classifyBuildLockOwner(canonical, options);
+    if (canonicalOwner.state === "live") {
       throw new Error(`The canonical reclaim recovery owner is still active (PID ${canonical.value.pid}).`);
     }
-    if (canonicalOwnerState !== "dead") {
+    if (canonicalOwner.state !== "dead") {
       throw new Error(`The canonical reclaim recovery owner is inaccessible; cannot prove PID ${canonical.value.pid} is dead.`);
     }
     await unlink(claimPath).catch((error) => {
@@ -14832,26 +15082,60 @@ async function recoverDeadReclaimClaim(lockPath, suppliedLockPath, claimNames, o
   }
   await options.onCleanupCutPoint?.("dead-reclaim-claim:restored");
 }
-async function createOwnedBuildLock(lockPath, ownerToken, localHostname) {
-  const handle = await open(lockPath, "wx", 384);
+async function createOwnedBuildLock(lockPath, ownerToken, localHostname, processStartIdentity, options = {}) {
   const value = {
     schema_version: BUILD_LOCK_SCHEMA_VERSION,
     pid: process.pid,
     hostname: localHostname,
     owner_token: ownerToken,
+    process_start_identity: processStartIdentity,
     started_at: (/* @__PURE__ */ new Date()).toISOString()
   };
+  const raw = `${JSON.stringify(value)}
+`;
+  const preparationPath = buildLockPreparationPath(
+    lockPath,
+    ownerToken,
+    localHostname,
+    processStartIdentity
+  );
+  const handle = await open(preparationPath, "wx", 384);
+  let published = false;
+  let preservePreparation = false;
   try {
-    await handle.writeFile(`${JSON.stringify(value)}
-`);
+    try {
+      await options.onCleanupCutPoint?.("lock-preparation:opened");
+    } catch (error) {
+      preservePreparation = true;
+      throw error;
+    }
+    await handle.writeFile(raw);
     await handle.sync();
-    return { handle, lockPath, ownerToken, raw: `${JSON.stringify(value)}
-` };
+    try {
+      await options.onCleanupCutPoint?.("lock-preparation:prepared");
+    } catch (error) {
+      preservePreparation = true;
+      throw error;
+    }
+    await link(preparationPath, lockPath);
+    published = true;
+    try {
+      await options.onCleanupCutPoint?.("lock-preparation:published");
+    } catch (error) {
+      throw error;
+    }
+    await unlink(preparationPath).catch((error) => {
+      if (error?.code !== "ENOENT") throw error;
+    });
+    await options.onCleanupCutPoint?.("lock-preparation:removed");
+    return { handle, lockPath, ownerToken, raw };
   } catch (error) {
     await handle.close().catch(() => {
     });
-    await unlink(lockPath).catch(() => {
-    });
+    if (!published && !preservePreparation) {
+      await unlink(preparationPath).catch(() => {
+      });
+    }
     throw error;
   }
 }
@@ -14859,18 +15143,37 @@ async function acquireBuildLock(lockPath, options = {}) {
   const suppliedLockPath = String(lockPath);
   const resolvedLockPath = path.resolve(lockPath);
   const localHostname = String(options.hostname ?? systemHostname());
-  const probeProcess = options.probeProcess ?? defaultProbeProcess;
   const ownerToken = randomUUID();
   const strandedClaims = await listLockSwapDebris(resolvedLockPath);
-  await recoverDeadReleaseClaim(resolvedLockPath, strandedClaims, options);
+  await recoverDeadBuildLockPreparations(resolvedLockPath, strandedClaims, options);
+  const claimsAfterPreparationRecovery = await listLockSwapDebris(resolvedLockPath);
+  await recoverDeadReleaseClaim(resolvedLockPath, claimsAfterPreparationRecovery, options);
   const claimsAfterReleaseRecovery = await listLockSwapDebris(resolvedLockPath);
   await recoverDeadReclaimClaim(resolvedLockPath, suppliedLockPath, claimsAfterReleaseRecovery, options);
   const remainingClaims = await listLockSwapDebris(resolvedLockPath);
-  if (remainingClaims.length) {
-    throw new Error(`Ambiguous index lock recovery debris exists: ${remainingClaims.sort().join(", ")}.`);
+  await recoverDeadBuildLockPreparations(resolvedLockPath, remainingClaims, options);
+  const unhandledClaims = remainingClaims.filter(
+    (name) => !name.startsWith(buildLockPreparationPrefix(resolvedLockPath))
+  );
+  if (unhandledClaims.length) {
+    throw new Error(`Ambiguous index lock recovery debris exists: ${unhandledClaims.sort().join(", ")}.`);
+  }
+  let processStartIdentity;
+  try {
+    processStartIdentity = await readCurrentProcessStartIdentity(options);
+  } catch (error) {
+    throw new Error(`Could not determine the current process start identity: ${error.message}`, {
+      cause: error
+    });
   }
   try {
-    return await createOwnedBuildLock(resolvedLockPath, ownerToken, localHostname);
+    return await createOwnedBuildLock(
+      resolvedLockPath,
+      ownerToken,
+      localHostname,
+      processStartIdentity,
+      options
+    );
   } catch (error) {
     if (error?.code !== "EEXIST") throw error;
   }
@@ -14885,11 +15188,11 @@ async function acquireBuildLock(lockPath, options = {}) {
       throw new Error(`Cannot reclaim legacy index build lock while ambiguous swap debris exists: ${debris.sort().join(", ")}.`);
     }
   }
-  const state = await probeProcess(parsed.value.pid);
-  if (state === "live") {
+  const owner = await classifyBuildLockOwner(parsed, options);
+  if (owner.state === "live") {
     throw new Error(`Another index build is active (PID ${parsed.value.pid}): ${resolvedLockPath}`);
   }
-  if (state !== "dead") {
+  if (owner.state !== "dead") {
     throw new Error(`Existing index build owner is inaccessible; cannot prove PID ${parsed.value.pid} is dead.`);
   }
   const claimPath = `${resolvedLockPath}.reclaim-${ownerToken}`;
@@ -14914,7 +15217,13 @@ async function acquireBuildLock(lockPath, options = {}) {
   }
   let lease;
   try {
-    lease = await createOwnedBuildLock(resolvedLockPath, ownerToken, localHostname);
+    lease = await createOwnedBuildLock(
+      resolvedLockPath,
+      ownerToken,
+      localHostname,
+      processStartIdentity,
+      options
+    );
   } catch (error) {
     if (error?.code === "EEXIST") {
       await rm(claimPath, { force: true }).catch(() => {
@@ -15970,7 +16279,7 @@ async function buildIndex(projectRootInput, options = {}) {
   assertPathWithin(workspaceRoot, databasePath, "Database path", "maintenance workspace root");
   assertPathWithin(workspaceRoot, manifestPath, "Manifest path", "maintenance workspace root");
   assertPathWithin(workspaceRoot, assetsPath, "Assets path", "maintenance workspace root");
-  assertSafeOutputLocation(projectRoot, sourceDirectory, extractedRoot, outputDirectory);
+  await assertSafeOutputLocation(projectRoot, sourceDirectory, extractedRoot, outputDirectory);
   await assertNoLinkTraversal(workspaceRoot, sourceDirectory, "Source directory", "maintenance workspace root");
   await assertNoLinkTraversal(workspaceRoot, extractedRoot, "Extracted directory", "maintenance workspace root");
   await assertNoLinkTraversal(workspaceRoot, outputDirectory, "Output directory", "maintenance workspace root");

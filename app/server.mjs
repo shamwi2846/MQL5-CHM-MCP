@@ -34813,7 +34813,7 @@ var Mql5ChmSearchService = class {
         expandedCandidates.push(...rows.map((row) => ({ row, term, priority: 1, termIndex })));
       }
       expandedCandidates.sort(
-        (left, right) => left.priority - right.priority || left.termIndex - right.termIndex || left.row.rank - right.row.rank || sourcePreference(left.row.source) - sourcePreference(right.row.source) || left.row.title.localeCompare(right.row.title) || left.row.topic_id.localeCompare(right.row.topic_id)
+        (left, right) => left.priority - right.priority || left.termIndex - right.termIndex || left.row.rank - right.row.rank || sourcePreference(left.row.source) - sourcePreference(right.row.source) || compareOrdinal(left.row.title, right.row.title) || compareOrdinal(left.row.topic_id, right.row.topic_id)
       );
     }
     if (results.length < limit) {
@@ -34855,7 +34855,7 @@ var Mql5ChmSearchService = class {
         if (!existing || expanded.weight > existing.weight) weightedByTopic.set(candidate.row.topic_id, expanded);
       }
       const weightedCandidates = [...weightedByTopic.values()].sort(
-        (left, right) => right.weight - left.weight || left.kindPriority - right.kindPriority || left.index - right.index || sourcePreference(left.row.source) - sourcePreference(right.row.source) || left.row.topic_id.localeCompare(right.row.topic_id)
+        (left, right) => right.weight - left.weight || left.kindPriority - right.kindPriority || left.index - right.index || sourcePreference(left.row.source) - sourcePreference(right.row.source) || compareOrdinal(left.row.topic_id, right.row.topic_id)
       );
       for (const candidate of weightedCandidates) {
         addRows([candidate.row], candidate.matchKind, candidate.matchedTerms, "matched_text");
@@ -34874,7 +34874,7 @@ var Mql5ChmSearchService = class {
         }
         return { row, score };
       }).filter(({ score }) => score >= threshold).sort(
-        (left, right) => right.score - left.score || sourcePreference(left.row.source) - sourcePreference(right.row.source) || left.row.title.localeCompare(right.row.title) || left.row.topic_id.localeCompare(right.row.topic_id)
+        (left, right) => right.score - left.score || sourcePreference(left.row.source) - sourcePreference(right.row.source) || compareOrdinal(left.row.title, right.row.title) || compareOrdinal(left.row.topic_id, right.row.topic_id)
       );
       const contentStatement = this.database.prepare("SELECT content FROM topics WHERE topic_id=?");
       for (const candidate of ranked) {

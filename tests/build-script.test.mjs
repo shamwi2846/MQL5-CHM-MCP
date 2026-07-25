@@ -449,6 +449,80 @@ test("build refuses to replace an output directory containing an unowned file", 
   }
 });
 
+test("build rejects an outdir nested inside an existing owned bundle tree", () => {
+  const ownedBundle = path.join(testRoot, "owned-parent-app");
+  const nestedOutput = path.join(ownedBundle, "nested-app");
+  const metadata = path.join(testRoot, "nested-owned-parent-meta.json");
+  removeGenerated(testRoot);
+  mkdirSync(ownedBundle, { recursive: true });
+  writeFileSync(path.join(ownedBundle, "server.mjs"), "owned-server\n", "utf8");
+  writeFileSync(path.join(ownedBundle, "indexer.mjs"), "owned-indexer\n", "utf8");
+  try {
+    const result = runBuild(
+      "--outdir", path.relative(projectRoot, nestedOutput),
+      "--metafile", path.relative(projectRoot, metadata),
+    );
+    assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stderr, /nested inside an existing bundle output/u);
+    assert.equal(readFileSync(path.join(ownedBundle, "server.mjs"), "utf8"), "owned-server\n");
+    assert.equal(readFileSync(path.join(ownedBundle, "indexer.mjs"), "utf8"), "owned-indexer\n");
+    assert.equal(existsSync(nestedOutput), false);
+    assert.equal(existsSync(metadata), false);
+  } finally {
+    removeGenerated(testRoot);
+  }
+});
+
+test("build rejects a metafile nested inside an existing owned bundle tree", () => {
+  const ownedBundle = path.join(testRoot, "owned-metadata-parent-app");
+  const output = path.join(testRoot, "metadata-nesting-output");
+  const nestedMetadata = path.join(ownedBundle, "nested-meta.json");
+  removeGenerated(testRoot);
+  mkdirSync(ownedBundle, { recursive: true });
+  writeFileSync(path.join(ownedBundle, "server.mjs"), "owned-server\n", "utf8");
+  writeFileSync(path.join(ownedBundle, "indexer.mjs"), "owned-indexer\n", "utf8");
+  try {
+    const result = runBuild(
+      "--outdir", path.relative(projectRoot, output),
+      "--metafile", path.relative(projectRoot, nestedMetadata),
+    );
+    assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stderr, /nested inside an existing bundle output/u);
+    assert.equal(readFileSync(path.join(ownedBundle, "server.mjs"), "utf8"), "owned-server\n");
+    assert.equal(readFileSync(path.join(ownedBundle, "indexer.mjs"), "utf8"), "owned-indexer\n");
+    assert.equal(existsSync(output), false);
+    assert.equal(existsSync(nestedMetadata), false);
+  } finally {
+    removeGenerated(testRoot);
+  }
+});
+
+test("build rejects nesting beneath a bundle pair that also has an unowned entry", () => {
+  const ownedBundle = path.join(testRoot, "owned-parent-with-extra");
+  const nestedOutput = path.join(ownedBundle, "nested-app");
+  const metadata = path.join(testRoot, "nested-owned-parent-with-extra-meta.json");
+  removeGenerated(testRoot);
+  mkdirSync(ownedBundle, { recursive: true });
+  writeFileSync(path.join(ownedBundle, "server.mjs"), "owned-server\n", "utf8");
+  writeFileSync(path.join(ownedBundle, "indexer.mjs"), "owned-indexer\n", "utf8");
+  writeFileSync(path.join(ownedBundle, "keep-me.txt"), "unowned\n", "utf8");
+  try {
+    const result = runBuild(
+      "--outdir", path.relative(projectRoot, nestedOutput),
+      "--metafile", path.relative(projectRoot, metadata),
+    );
+    assert.notEqual(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stderr, /nested inside an existing bundle output/u);
+    assert.equal(readFileSync(path.join(ownedBundle, "server.mjs"), "utf8"), "owned-server\n");
+    assert.equal(readFileSync(path.join(ownedBundle, "indexer.mjs"), "utf8"), "owned-indexer\n");
+    assert.equal(readFileSync(path.join(ownedBundle, "keep-me.txt"), "utf8"), "unowned\n");
+    assert.equal(existsSync(nestedOutput), false);
+    assert.equal(existsSync(metadata), false);
+  } finally {
+    removeGenerated(testRoot);
+  }
+});
+
 test("build rejects a nested junction before writing outside the project", (context) => {
   if (process.platform !== "win32") {
     context.skip("Windows junction behavior is the supported deployment boundary.");

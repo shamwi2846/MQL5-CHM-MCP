@@ -183,8 +183,9 @@ switch ($arguments[1]) {
         $env:Path = $originalPath
         $env:LOCALAPPDATA = $originalLocalAppData
     }
-    $nodePath = Join-Path $fixtureRoot 'package\runtime\node.exe'
-    $serverPath = Join-Path $fixtureRoot 'package\app\server.mjs'
+    $legalMetacharacterPackage = Join-Path $fixtureRoot 'package (copy) & draft! %safe% ^'
+    $nodePath = Join-Path $legalMetacharacterPackage 'runtime\node.exe'
+    $serverPath = Join-Path $legalMetacharacterPackage 'app\server.mjs'
     $otherNode = 'C:\other-package\runtime\node.exe'
     $otherServer = 'C:\other-package\app\server.mjs'
     $oldStateVariable = $env:MQL5_FAKE_CODEX_STATE

@@ -266,6 +266,181 @@ try {
     )
     Assert-Test ($metadataProbe.ExitCode -eq 0) 'Package version or exact Node engine metadata is inconsistent.'
 
+    $portableFileSets = Get-PortablePackageFileSets
+    $expectedPortableSetNames = @('root','runtime','app','config','data','maintenance','scripts','tools','licenses')
+    $expectedPortableRoot = @(
+        '.mql5-chm-package-root',
+        'Install-Codex.ps1',
+        'Rebuild-Index.ps1',
+        'Uninstall-Codex.ps1',
+        'Package-Portable.ps1',
+        'Check-DocumentationUpdates.ps1',
+        'Update-Documentation.ps1',
+        'Rollback-Documentation.ps1',
+        'package.json',
+        'README.md',
+        'SPEC.md'
+    )
+    $expectedPortableScripts = @(
+        'Check-DocumentationUpdates.ps1',
+        'Common.ps1',
+        'Compare-OfficialDocumentationHashes.ps1',
+        'IndexMaintenance.ps1',
+        'Install-Codex.ps1',
+        'Package-Portable.ps1',
+        'Rebuild-Index.ps1',
+        'Rollback-Documentation.ps1',
+        'SevenZipRuntime.ps1',
+        'Smoke-Test-McpServer.mjs',
+        'StageInstallRecovery.ps1',
+        'Uninstall-Codex.ps1',
+        'Update-Documentation.ps1',
+        'inspect-database.mjs'
+    )
+    $expectedPortableRuntime = @('LICENSE','node.exe')
+    $expectedPortableApp = @('server.mjs','indexer.mjs')
+    $expectedPortableConfig = @('mql5-image-policy.json','mql5-query-expansions.json')
+    $expectedPortableData = @('active.json')
+    $expectedPortableMaintenance = @('.update.lock')
+    $expectedPortableTools = @('7z.exe','7z.dll','7zip.provenance.json')
+    $expectedPortableLicenses = @(
+        '7ZIP-LICENSE.txt',
+        'BUNDLED-NODE-NOTICES.txt',
+        'CHEERIO-LICENSE.txt',
+        'ESBUILD-LICENSE.txt',
+        'ICONV-LITE-LICENSE.txt',
+        'JPEG-JS-LICENSE.txt',
+        'MCP-SDK-LICENSE.txt',
+        'NODE-LICENSE.txt',
+        'THIRD-PARTY-NOTICES.md',
+        'ZOD-LICENSE.txt',
+        'bundled-node-dependencies.json',
+        'bundled-node-notice-overrides.json',
+        'overrides\boolbase-1.0.0.txt'
+    )
+    $portableExpectations = @(
+        [pscustomobject]@{Name='root';Files=$expectedPortableRoot},
+        [pscustomobject]@{Name='runtime';Files=$expectedPortableRuntime},
+        [pscustomobject]@{Name='app';Files=$expectedPortableApp},
+        [pscustomobject]@{Name='config';Files=$expectedPortableConfig},
+        [pscustomobject]@{Name='data';Files=$expectedPortableData},
+        [pscustomobject]@{Name='maintenance';Files=$expectedPortableMaintenance},
+        [pscustomobject]@{Name='scripts';Files=$expectedPortableScripts},
+        [pscustomobject]@{Name='tools';Files=$expectedPortableTools},
+        [pscustomobject]@{Name='licenses';Files=$expectedPortableLicenses}
+    )
+    $setNameDifference = @(Compare-Object -ReferenceObject $expectedPortableSetNames -DifferenceObject @($portableFileSets.Keys) -CaseSensitive)
+    Assert-Test ($setNameDifference.Count -eq 0) 'Portable allowlist does not expose the exact required file-set names.'
+    foreach ($expectation in $portableExpectations) {
+        $actual = @($portableFileSets[$expectation.Name])
+        $difference = @(Compare-Object -ReferenceObject @($expectation.Files) -DifferenceObject $actual -CaseSensitive)
+        Assert-Test ($difference.Count -eq 0) "Portable $($expectation.Name) allowlist does not match the required runtime files."
+    }
+    $expectedStaticPaths = @($portableExpectations | ForEach-Object {
+        $setName = [string]$_.Name
+        @($_.Files | ForEach-Object {
+            if ($setName -ceq 'root') { [string]$_ } else { "$setName/$(([string]$_).Replace('\','/'))" }
+        })
+    })
+    $staticPathDifference = @(
+        Compare-Object -ReferenceObject $expectedStaticPaths -DifferenceObject @(Get-PortablePackageRequiredStaticPaths) -CaseSensitive
+    )
+    Assert-Test ($staticPathDifference.Count -eq 0) 'Flattened portable checksum contract drifted from the exact file sets.'
+    Assert-Test (
+        @($portableFileSets['scripts'] | Where-Object {
+            [IO.Path]::GetFileName([string]$_).StartsWith('Test-', [StringComparison]::OrdinalIgnoreCase)
+        }).Count -eq 0
+    ) 'Portable script allowlist includes development tests despite the documented omission.'
+    Assert-Test (@($portableFileSets['runtime'] | Where-Object { [string]$_ -ceq '.gitkeep' }).Count -eq 0) 'Portable runtime allowlist includes .gitkeep.'
+
+    $portableAllowlistSource = Join-Path $testRoot 'portable-allowlist-source'
+    $portableAllowlistStage = Join-Path $testRoot 'portable-allowlist-stage'
+    New-Item -ItemType Directory -Path $portableAllowlistSource,$portableAllowlistStage | Out-Null
+    [IO.File]::WriteAllText(
+        (Join-Path $portableAllowlistStage '.mql5-chm-package-root'),
+        "mql5-chm-portable-package-v1`n",
+        $utf8
+    )
+    $portableSourceSetNames = @('root','runtime','app','scripts','licenses','config','tools')
+    foreach ($setName in $portableSourceSetNames) {
+        foreach ($relativeFile in @($portableFileSets[$setName])) {
+            if ($setName -ceq 'root' -and [string]$relativeFile -ceq '.mql5-chm-package-root') { continue }
+            $fixtureFile = if ($setName -ceq 'root') {
+                Join-Path $portableAllowlistSource $relativeFile
+            } else {
+                Join-Path (Join-Path $portableAllowlistSource $setName) $relativeFile
+            }
+            New-Item -ItemType Directory -Path (Split-Path -Parent $fixtureFile) -Force | Out-Null
+            [IO.File]::WriteAllText($fixtureFile, "$setName/$relativeFile", $utf8)
+        }
+    }
+    $excludedPortableFiles = @(
+        'local-root-secret.txt',
+        'runtime\.gitkeep',
+        'app\local-debug-bundle.mjs',
+        'scripts\Test-Local-Only.ps1',
+        'scripts\private-helper.txt',
+        'licenses\local-secret.txt',
+        'config\local-override.json',
+        'tools\local-tool.exe'
+    )
+    foreach ($relativeFile in $excludedPortableFiles) {
+        $fixtureFile = Join-Path $portableAllowlistSource $relativeFile
+        New-Item -ItemType Directory -Path (Split-Path -Parent $fixtureFile) -Force | Out-Null
+        [IO.File]::WriteAllText($fixtureFile, 'must-not-ship', $utf8)
+    }
+    Copy-PortablePackageFileSets -ProjectRoot $portableAllowlistSource -StageRoot $portableAllowlistStage
+    foreach ($setName in $portableSourceSetNames) {
+        foreach ($relativeFile in @($portableFileSets[$setName])) {
+            $stageFile = if ($setName -ceq 'root') {
+                Join-Path $portableAllowlistStage $relativeFile
+            } else {
+                Join-Path (Join-Path $portableAllowlistStage $setName) $relativeFile
+            }
+            Assert-Test (
+                Test-Path -LiteralPath $stageFile -PathType Leaf
+            ) "Portable allowlist copy omitted required file '$setName/$relativeFile'."
+        }
+    }
+    foreach ($relativeFile in $excludedPortableFiles) {
+        Assert-Test (
+            -not (Test-Path -LiteralPath (Join-Path $portableAllowlistStage $relativeFile))
+        ) "Portable allowlist copy included local-only file '$relativeFile'."
+    }
+
+    $candidateApplicationSource = Join-Path $portableAllowlistSource 'build\candidate-app'
+    foreach ($relativeFile in @($portableFileSets['app'])) {
+        $candidateApplicationFile = Join-Path $candidateApplicationSource $relativeFile
+        New-Item -ItemType Directory -Path (Split-Path -Parent $candidateApplicationFile) -Force | Out-Null
+        [IO.File]::WriteAllText($candidateApplicationFile, "candidate/$relativeFile", $utf8)
+    }
+    [IO.File]::WriteAllText(
+        (Join-Path $candidateApplicationSource 'local-candidate-debug.mjs'),
+        'must-not-ship',
+        $utf8
+    )
+    $candidateAllowlistStage = Join-Path $testRoot 'candidate-app-allowlist-stage'
+    New-Item -ItemType Directory -Path $candidateAllowlistStage | Out-Null
+    [IO.File]::WriteAllText(
+        (Join-Path $candidateAllowlistStage '.mql5-chm-package-root'),
+        "mql5-chm-portable-package-v1`n",
+        $utf8
+    )
+    Copy-PortablePackageFileSets `
+        -ProjectRoot $portableAllowlistSource `
+        -StageRoot $candidateAllowlistStage `
+        -ApplicationSource $candidateApplicationSource
+    foreach ($relativeFile in @($portableFileSets['app'])) {
+        $candidateStageFile = Join-Path (Join-Path $candidateAllowlistStage 'app') $relativeFile
+        Assert-Test (
+            (Test-Path -LiteralPath $candidateStageFile -PathType Leaf) -and
+            (Get-Content -LiteralPath $candidateStageFile -Raw) -ceq "candidate/$relativeFile"
+        ) "Candidate application allowlist copy omitted or replaced '$relativeFile'."
+    }
+    Assert-Test (
+        -not (Test-Path -LiteralPath (Join-Path $candidateAllowlistStage 'app\local-candidate-debug.mjs'))
+    ) 'Candidate application allowlist copy included a local-only file.'
+
     Assert-Test (Test-PinnedNodeRuntimePair -NodePath $nodeFixtureSource -LicensePath $nodeFixtureLicense) 'Available Node runtime fixture is not the pinned distribution.'
 
     $nodeSelectionRoot = Join-Path $testRoot 'multi-install-node-selection'

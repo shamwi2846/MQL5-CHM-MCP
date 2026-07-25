@@ -203,10 +203,12 @@ if ($Mode -ceq 'arguments') {
     } -Pattern 'deadline' -Message 'Invoke-NativeChecked did not enforce its requested deadline.'
     $nativeNode = Resolve-NodeExecutable -ProjectRoot (Split-Path -Parent $PSScriptRoot)
     $inheritedHandleOutput = Join-Path $fixtureRoot 'inherited-handle-descendant.txt'
+    $inheritedHandleReady = Join-Path $fixtureRoot 'inherited-handle-descendant.ready'
     $escapedInheritedHandleOutput = ConvertTo-Json -InputObject $inheritedHandleOutput -Compress
-    $inheritedHandleChildScript = "setTimeout(()=>require('node:fs').writeFileSync($escapedInheritedHandleOutput,'descendant-survived'),2000);setTimeout(()=>{},5000)"
+    $escapedInheritedHandleReady = ConvertTo-Json -InputObject $inheritedHandleReady -Compress
+    $inheritedHandleChildScript = "const fs=require('node:fs');fs.writeFileSync($escapedInheritedHandleReady,'ready');setTimeout(()=>fs.writeFileSync($escapedInheritedHandleOutput,'descendant-survived'),2000);setTimeout(()=>{},5000)"
     $escapedInheritedHandleChildScript = ConvertTo-Json -InputObject $inheritedHandleChildScript -Compress
-    $inheritedHandleScript = "const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e',$escapedInheritedHandleChildScript],{detached:true,stdio:['ignore',1,2]});child.unref();"
+    $inheritedHandleScript = "const fs=require('node:fs');const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e',$escapedInheritedHandleChildScript],{detached:true,stdio:['ignore',1,2]});child.unref();const wait=new Int32Array(new SharedArrayBuffer(4));const deadline=Date.now()+2000;while(!fs.existsSync($escapedInheritedHandleReady)&&Date.now()<deadline){Atomics.wait(wait,0,0,10)}if(!fs.existsSync($escapedInheritedHandleReady)){try{process.kill(child.pid)}catch{};throw new Error('detached inherited-handle child did not become ready')}"
     $inheritedHandleTimer = [Diagnostics.Stopwatch]::StartNew()
     # Hosted Windows PowerShell 5.1 can spend more than one second starting the
     # trusted bootstrap. The elapsed assertion below still requires prompt exit.
@@ -214,16 +216,26 @@ if ($Mode -ceq 'arguments') {
     Assert-RepairFixture -Condition (
         $inheritedHandleResult.ExitCode -eq 0 -and $inheritedHandleTimer.Elapsed.TotalSeconds -lt 4
     ) -Message 'A parent-exited native descendant retained inherited output handles after contained cleanup.'
+    Assert-RepairFixture -Condition (
+        (Test-Path -LiteralPath $inheritedHandleReady -PathType Leaf) -and
+        (Get-Content -LiteralPath $inheritedHandleReady -Raw) -ceq 'ready'
+    ) -Message 'The inherited-handle containment probe did not prove its detached child reached readiness.'
     Start-Sleep -Milliseconds 2500
     Assert-RepairFixture -Condition (-not (Test-Path -LiteralPath $inheritedHandleOutput)) -Message 'A parent-exited native descendant survived its containment deadline.'
 
     $successfulDetachedOutput = Join-Path $fixtureRoot 'successful-detached-descendant.txt'
+    $successfulDetachedReady = Join-Path $fixtureRoot 'successful-detached-descendant.ready'
     $escapedSuccessfulDetachedOutput = ConvertTo-Json -InputObject $successfulDetachedOutput -Compress
-    $successfulDetachedChildScript = "setTimeout(()=>require('node:fs').writeFileSync($escapedSuccessfulDetachedOutput,'descendant-survived'),2000);setTimeout(()=>{},5000)"
+    $escapedSuccessfulDetachedReady = ConvertTo-Json -InputObject $successfulDetachedReady -Compress
+    $successfulDetachedChildScript = "const fs=require('node:fs');fs.writeFileSync($escapedSuccessfulDetachedReady,'ready');setTimeout(()=>fs.writeFileSync($escapedSuccessfulDetachedOutput,'descendant-survived'),2000);setTimeout(()=>{},5000)"
     $escapedSuccessfulDetachedChildScript = ConvertTo-Json -InputObject $successfulDetachedChildScript -Compress
-    $successfulDetachedParentScript = "const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e',$escapedSuccessfulDetachedChildScript],{detached:true,stdio:'ignore'});child.unref();"
+    $successfulDetachedParentScript = "const fs=require('node:fs');const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e',$escapedSuccessfulDetachedChildScript],{detached:true,stdio:'ignore'});child.unref();const wait=new Int32Array(new SharedArrayBuffer(4));const deadline=Date.now()+2000;while(!fs.existsSync($escapedSuccessfulDetachedReady)&&Date.now()<deadline){Atomics.wait(wait,0,0,10)}if(!fs.existsSync($escapedSuccessfulDetachedReady)){try{process.kill(child.pid)}catch{};throw new Error('detached no-pipe child did not become ready')}"
     $successfulDetached = Invoke-NativeCapture -FilePath $nativeNode -Arguments @('--input-type=commonjs','-e',$successfulDetachedParentScript) -TimeoutSeconds 10
     Assert-RepairFixture -Condition ($successfulDetached.ExitCode -eq 0) -Message 'A successful native parent with a detached descendant did not preserve its exit code.'
+    Assert-RepairFixture -Condition (
+        (Test-Path -LiteralPath $successfulDetachedReady -PathType Leaf) -and
+        (Get-Content -LiteralPath $successfulDetachedReady -Raw) -ceq 'ready'
+    ) -Message 'The no-pipe containment probe did not prove its detached child reached readiness.'
     Start-Sleep -Milliseconds 2500
     Assert-RepairFixture -Condition (-not (Test-Path -LiteralPath $successfulDetachedOutput)) -Message 'A detached no-pipe descendant survived successful native invocation cleanup.'
 
@@ -242,7 +254,10 @@ if "%~1"=="sleep" (
   exit /b 0
 )
 if "%~1"=="spawn-child" (
+  set "MQL5_CHM_BATCH_READY=%~3"
   start "" /b "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -EncodedCommand "%~2"
+  "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -Command "$deadline=[DateTime]::UtcNow.AddSeconds(3); while ((-not (Test-Path -LiteralPath $env:MQL5_CHM_BATCH_READY)) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 25 }; if (-not (Test-Path -LiteralPath $env:MQL5_CHM_BATCH_READY)) { exit 9 }"
+  if errorlevel 1 exit /b 9
   exit /b 0
 )
 echo [%~1]
@@ -255,20 +270,107 @@ exit /b 7
         $batchCapture.Text -match '(?m)^\[contains spaces\]\r?$' -and
         $batchCapture.Text -match '(?m)^\[\]\r?$'
     ) -Message 'Bounded native capture did not preserve synchronous .cmd output, empty arguments, spaces, and exit code.'
+    $literalBatchHelper = Join-Path $fixtureRoot 'literal batch argument helper.cmd'
+    [IO.File]::WriteAllText($literalBatchHelper, @'
+@echo off
+setlocal DisableDelayedExpansion
+set "arg1=%~1"
+set "arg2=%~2"
+setlocal EnableDelayedExpansion
+echo [!arg1!]
+echo [!arg2!]
+exit /b 7
+'@.Replace("`r`n","`n").Replace("`r","`n").Replace("`n","`r`n"), [Text.Encoding]::ASCII)
+    $literalBatchArguments = [ordered]@{
+        ampersand = 'unsafe&ver'
+        pipe = 'unsafe|ver'
+        output_redirection = 'unsafe>nul'
+        input_redirection = 'unsafe<nul'
+        percent_expansion = 'unsafe%PATH%'
+        caret_escape = 'unsafe^value'
+        open_parenthesis = 'unsafe(value'
+        close_parenthesis = 'unsafe)value'
+        delayed_expansion = 'unsafe!PATH!'
+        legal_package_path = 'C:\Program Files (x86)\MQL5 & CHM! %draft% ^ caret\node.exe'
+    }
+    foreach ($literalBatchCase in $literalBatchArguments.GetEnumerator()) {
+        $literalBatchCapture = Invoke-NativeCapture -FilePath $literalBatchHelper -Arguments @([string]$literalBatchCase.Value,'') -TimeoutSeconds 10
+        $literalBatchLines = @($literalBatchCapture.Lines)
+        Assert-RepairFixture -Condition (
+            $literalBatchCapture.ExitCode -eq 7 -and
+            $literalBatchLines.Count -eq 2 -and
+            $literalBatchLines[0] -ceq "[$([string]$literalBatchCase.Value)]" -and
+            $literalBatchLines[1] -ceq '[]'
+        ) -Message "A .cmd argument containing $($literalBatchCase.Key) was corrupted or reinterpreted by cmd.exe. Exit=$($literalBatchCapture.ExitCode); output=$($literalBatchCapture.Text)"
+    }
+    Assert-RepairThrows -Action {
+        Invoke-NativeCapture -FilePath $literalBatchHelper -Arguments @('unsafe"value') -TimeoutSeconds 10 | Out-Null
+    } -Pattern 'cannot be transported safely' -Message 'A .cmd argument containing a quote was not rejected before command-processor reinterpretation.'
+    $bangBatchDirectory = New-Item -ItemType Directory -Path (Join-Path $fixtureRoot 'target!literal')
+    $bangBatchHelper = Join-Path $bangBatchDirectory.FullName 'inherits delayed expansion.cmd'
+    [IO.File]::WriteAllText($bangBatchHelper, @'
+@echo off
+echo [%~1]
+echo [%~dp0]
+exit /b 7
+'@.Replace("`r`n","`n").Replace("`r","`n").Replace("`n","`r`n"), [Text.Encoding]::ASCII)
+    $bangBatchCapture = Invoke-NativeCapture -FilePath $bangBatchHelper -Arguments @('left!PATH!right') -TimeoutSeconds 10
+    $bangBatchLines = @($bangBatchCapture.Lines)
+    Assert-RepairFixture -Condition (
+        $bangBatchCapture.ExitCode -eq 7 -and
+        $bangBatchLines.Count -eq 2 -and
+        $bangBatchLines[0] -ceq '[left!PATH!right]' -and
+        $bangBatchLines[1] -ceq "[$($bangBatchDirectory.FullName)\]"
+    ) -Message "A .cmd target inherited delayed expansion or corrupted a legal exclamation-mark path. Exit=$($bangBatchCapture.ExitCode); output=$($bangBatchCapture.Text)"
+    $metacharacterBatchDirectory = New-Item -ItemType Directory -Path (Join-Path $fixtureRoot 'batch target (copy) & ! %safe% ^')
+    $metacharacterBatchHelper = Join-Path $metacharacterBatchDirectory.FullName 'literal helper.cmd'
+    Copy-Item -LiteralPath $literalBatchHelper -Destination $metacharacterBatchHelper
+    $metacharacterTargetCapture = Invoke-NativeCapture -FilePath $metacharacterBatchHelper -Arguments @('target-path-preserved','') -TimeoutSeconds 10
+    $metacharacterTargetLines = @($metacharacterTargetCapture.Lines)
+    Assert-RepairFixture -Condition (
+        $metacharacterTargetCapture.ExitCode -eq 7 -and
+        $metacharacterTargetLines.Count -eq 2 -and
+        $metacharacterTargetLines[0] -ceq '[target-path-preserved]' -and
+        $metacharacterTargetLines[1] -ceq '[]'
+    ) -Message "A legal .cmd target path was corrupted or reinterpreted by cmd.exe. Exit=$($metacharacterTargetCapture.ExitCode); output=$($metacharacterTargetCapture.Text)"
+    $batchBatHelper = Join-Path $fixtureRoot 'native batch helper with spaces.bat'
+    Copy-Item -LiteralPath $batchHelper -Destination $batchBatHelper
+    $batchBatCapture = Invoke-NativeCapture -FilePath $batchBatHelper -Arguments @('contains spaces','') -TimeoutSeconds 10
+    Assert-RepairFixture -Condition (
+        $batchBatCapture.ExitCode -eq 7 -and
+        $batchBatCapture.Text -match '(?m)^\[contains spaces\]\r?$' -and
+        $batchBatCapture.Text -match '(?m)^\[\]\r?$'
+    ) -Message 'Bounded native capture did not preserve safe .bat arguments, output, and exit code.'
+    $literalBatchBatHelper = Join-Path $fixtureRoot 'literal batch argument helper.bat'
+    Copy-Item -LiteralPath $literalBatchHelper -Destination $literalBatchBatHelper
+    $literalBatCapture = Invoke-NativeCapture -FilePath $literalBatchBatHelper -Arguments @('C:\Program Files (x86)\MQL5 & CHM!\server.mjs','') -TimeoutSeconds 10
+    $literalBatLines = @($literalBatCapture.Lines)
+    Assert-RepairFixture -Condition (
+        $literalBatCapture.ExitCode -eq 7 -and
+        $literalBatLines.Count -eq 2 -and
+        $literalBatLines[0] -ceq '[C:\Program Files (x86)\MQL5 & CHM!\server.mjs]' -and
+        $literalBatLines[1] -ceq '[]'
+    ) -Message 'A .bat legal package path was corrupted or reinterpreted by cmd.exe.'
     $batchTimeoutTimer = [Diagnostics.Stopwatch]::StartNew()
     Assert-RepairThrows -Action {
         Invoke-NativeCapture -FilePath $batchHelper -Arguments @('sleep') -TimeoutSeconds 1 | Out-Null
     } -Pattern 'deadline' -Message 'A timed-out .cmd target was not contained.'
     Assert-RepairFixture -Condition ($batchTimeoutTimer.Elapsed.TotalSeconds -lt 8) -Message 'A timed-out .cmd target did not return promptly.'
     $batchDescendantOutput = Join-Path $fixtureRoot 'batch-inherited-handle-descendant.txt'
+    $batchDescendantReady = Join-Path $fixtureRoot 'batch-inherited-handle-descendant.ready'
     $escapedBatchDescendantOutput = $batchDescendantOutput.Replace("'","''")
-    $batchDescendantCommand = "Start-Sleep -Seconds 2; [IO.File]::WriteAllText('$escapedBatchDescendantOutput','batch-descendant-survived',[Text.Encoding]::UTF8); Start-Sleep -Seconds 30"
+    $escapedBatchDescendantReady = $batchDescendantReady.Replace("'","''")
+    $batchDescendantCommand = "[IO.File]::WriteAllText('$escapedBatchDescendantReady','ready',[Text.Encoding]::UTF8); Start-Sleep -Seconds 2; [IO.File]::WriteAllText('$escapedBatchDescendantOutput','batch-descendant-survived',[Text.Encoding]::UTF8); Start-Sleep -Seconds 30"
     $encodedBatchDescendant = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($batchDescendantCommand))
     $batchDescendantTimer = [Diagnostics.Stopwatch]::StartNew()
-    $batchDescendantResult = Invoke-NativeCapture -FilePath $batchHelper -Arguments @('spawn-child',$encodedBatchDescendant) -TimeoutSeconds 5
+    $batchDescendantResult = Invoke-NativeCapture -FilePath $batchHelper -Arguments @('spawn-child',$encodedBatchDescendant,$batchDescendantReady) -TimeoutSeconds 5
     Assert-RepairFixture -Condition (
         $batchDescendantResult.ExitCode -eq 0 -and $batchDescendantTimer.Elapsed.TotalSeconds -lt 4
     ) -Message 'A successful .cmd descendant retained inherited output handles after its parent exited.'
+    Assert-RepairFixture -Condition (
+        (Test-Path -LiteralPath $batchDescendantReady -PathType Leaf) -and
+        (Get-Content -LiteralPath $batchDescendantReady -Raw) -ceq 'ready'
+    ) -Message 'The .cmd containment probe did not prove its detached child reached readiness.'
     Start-Sleep -Milliseconds 2500
     Assert-RepairFixture -Condition (-not (Test-Path -LiteralPath $batchDescendantOutput)) -Message 'A successful .cmd descendant survived outer job cleanup.'
 

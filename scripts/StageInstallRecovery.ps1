@@ -315,16 +315,7 @@ function Assert-RevisionStageRecoveryChecksumBoundary {
     }
     if ($seen.Count -eq 0 -or -not $seen.ContainsKey('data/active.json')) { throw 'Portable checksum boundary is empty or does not bind the active pointer.' }
 
-    $required = @(
-        '.mql5-chm-package-root','runtime/node.exe','runtime/LICENSE','app/server.mjs','app/indexer.mjs',
-        'config/mql5-image-policy.json','config/mql5-query-expansions.json','data/active.json','maintenance/.update.lock',
-        'Install-Codex.ps1','Rebuild-Index.ps1','Uninstall-Codex.ps1','Package-Portable.ps1','Check-DocumentationUpdates.ps1','Update-Documentation.ps1','Rollback-Documentation.ps1','package.json','README.md','SPEC.md',
-        'scripts/build.mjs','scripts/Generate-BundledNotices.mjs','scripts/inspect-database.mjs','scripts/Common.ps1','scripts/IndexMaintenance.ps1','scripts/SevenZipRuntime.ps1','scripts/StageInstallRecovery.ps1',
-        'scripts/Smoke-Test-McpServer.mjs','scripts/Compare-OfficialDocumentationHashes.ps1','scripts/Test-DocumentationFreshness.ps1','scripts/Test-PowerShellSyntax.ps1','scripts/Invoke-PowerShellTestSuite.ps1',
-        'scripts/Install-Codex.ps1','scripts/Rebuild-Index.ps1','scripts/Uninstall-Codex.ps1','scripts/Package-Portable.ps1','scripts/Check-DocumentationUpdates.ps1','scripts/Update-Documentation.ps1','scripts/Rollback-Documentation.ps1','scripts/Test-Maintenance.ps1','scripts/Test-StageInstallRecovery.ps1',
-        'tools/7z.exe','tools/7z.dll','tools/7zip.provenance.json',
-        'licenses/7ZIP-LICENSE.txt','licenses/BUNDLED-NODE-NOTICES.txt','licenses/bundled-node-dependencies.json','licenses/bundled-node-notice-overrides.json','licenses/overrides/boolbase-1.0.0.txt','licenses/CHEERIO-LICENSE.txt','licenses/ESBUILD-LICENSE.txt','licenses/ICONV-LITE-LICENSE.txt','licenses/JPEG-JS-LICENSE.txt','licenses/MCP-SDK-LICENSE.txt','licenses/NODE-LICENSE.txt','licenses/THIRD-PARTY-NOTICES.md','licenses/ZOD-LICENSE.txt'
-    )
+    $required = @(Get-PortablePackageRequiredStaticPaths)
     foreach ($relative in $required) { if (-not $seen.ContainsKey($relative)) { throw "Portable checksum boundary is missing required stage-recovery entry '$relative'." } }
     $packageMarker = (Get-Content -LiteralPath (Join-Path $root '.mql5-chm-package-root') -Raw -Encoding UTF8).Trim()
     if ($packageMarker -cne 'mql5-chm-portable-package-v1') { throw 'Portable package ownership marker is invalid during stage recovery.' }

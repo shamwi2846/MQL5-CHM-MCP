@@ -263,8 +263,13 @@ test("Install-Codex runs the smoke gate before registration", async () => {
 test("portable packages carry checksum-bound version metadata for installation", async () => {
   const packager = await readFile(path.join(root, "scripts", "Package-Portable.ps1"), "utf8");
   const common = await readFile(path.join(root, "scripts", "Common.ps1"), "utf8");
-  const rootFiles = packager.match(/^\$rootFiles\s*=\s*@\([\s\S]*?^\)$/mu)?.[0];
-  const requiredFiles = common.match(/^\s*\$required\s*=\s*@\([\s\S]*?^\s*\)$/mu)?.[0];
-  assert.match(rootFiles ?? "", /^\s*'package\.json',?\s*$/mu);
-  assert.match(requiredFiles ?? "", /^\s*'package\.json',?\s*$/mu);
+  const portableFileSets = common.match(
+    /^function Get-PortablePackageFileSets \{[\s\S]*?^\}/mu,
+  )?.[0];
+  assert.match(portableFileSets ?? "", /^\s*'package\.json',?\s*$/mu);
+  assert.match(packager, /\bCopy-PortablePackageFileSets\b/u);
+  assert.match(
+    common,
+    /^function Assert-PackageChecksums \{[\s\S]*?\bGet-PortablePackageRequiredStaticPaths\b/mu,
+  );
 });
