@@ -474,7 +474,7 @@ function New-ReproduciblePackageZip {
                 'a','-tzip','-mm=Deflate','-mx=9','-mfb=258','-mpass=15','-mmt=off',
                 '-mtc=off','-mtm=off','-mta=off','-mcu=on','-sse','-spd','-scsUTF-8',
                 '-bb0','-bd',$zipFull,('@' + $listPath)
-            )
+            ) -TimeoutSeconds 900
         } finally {
             Pop-Location
         }

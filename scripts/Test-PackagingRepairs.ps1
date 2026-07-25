@@ -538,6 +538,9 @@ try {
         if($null -ne $outputMutexLease){$outputMutexLease.Dispose()}
     }
     $packageSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Package-Portable.ps1') -Raw
+    Assert-Test (
+        $packageSource -match '(?s)function New-ReproduciblePackageZip.*?Invoke-NativeCapture.*?-TimeoutSeconds\s+900'
+    ) 'Canonical portable compression is not given the required 900-second bounded deadline.'
     $projectMutexIndex = $packageSource.IndexOf('$updateLock = Enter-ExclusiveFileLock',[StringComparison]::Ordinal)
     $releaseRootCreationIndex = $packageSource.IndexOf('[IO.Directory]::CreateDirectory($releaseRoot)',[StringComparison]::Ordinal)
     $outputMutexIndex = $packageSource.IndexOf('$outputLock = Enter-PackageOutputMutex',[StringComparison]::Ordinal)
