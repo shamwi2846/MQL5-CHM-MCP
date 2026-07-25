@@ -8,6 +8,9 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1";
+const SETUP_NODE_ACTION = "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020";
+const UPLOAD_ARTIFACT_ACTION = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
 
 async function text(relativePath) {
   return readFile(path.join(root, relativePath), "utf8");
@@ -159,6 +162,36 @@ async function runReleaseVersionCheck({
   }
 }
 
+test("release version remains consistent across package, runtime, documentation, and download user agents", async () => {
+  const packageMetadata = JSON.parse(await text("package.json"));
+  const lockMetadata = JSON.parse(await text("package-lock.json"));
+  const version = packageMetadata.version;
+  assert.equal(lockMetadata.version, version);
+  assert.equal(lockMetadata.packages[""].version, version);
+
+  const identityFiles = [
+    ["src/server.mjs", `version: "${version}"`],
+    ["README.md", `# MQL5 CHM MCP ${version}`],
+    ["SPEC.md", `# Portable Read-Only MQL5 CHM MCP v${version}`],
+    ["SPEC.md", `Server/package version: ${version}`],
+    ["scripts/Common.ps1", `mql5-chm-mcp-packager/${version}`],
+    ["scripts/Common.ps1", `mql5-chm-mcp/${version}`],
+    ["scripts/SevenZipRuntime.ps1", `mql5-chm-mcp-packager/${version}`],
+  ];
+  for (const [relativePath, expected] of identityFiles) {
+    assert.ok((await text(relativePath)).includes(expected), `${relativePath} does not report release ${version}`);
+  }
+});
+
+test("lockfile resolves the patched Hono Node server release", async () => {
+  const lockMetadata = JSON.parse(await text("package-lock.json"));
+  assert.equal(
+    lockMetadata.packages["node_modules/@hono/node-server"]?.version,
+    "1.19.15",
+    "package-lock.json must not resolve GHSA-frvp-7c67-39w9-vulnerable @hono/node-server releases",
+  );
+});
+
 test("workflow action inspection covers concise and quoted YAML forms", () => {
   const workflow = `
 jobs:
@@ -226,7 +259,7 @@ test("Windows CI runs the fast suite on pull requests with the pinned toolchain"
   assert.match(workflow, /\bpull_request\s*:/u);
   assert.equal(setupNodeSteps.length, 1);
   const setupNodeInputs = actionStepInputs(setupNodeSteps[0]);
-  assert.equal(actionStepUses(setupNodeSteps[0]), "actions/setup-node@v7");
+  assert.equal(actionStepUses(setupNodeSteps[0]), SETUP_NODE_ACTION);
   assert.equal(setupNodeInputs.get("node-version"), "24.17.0");
   assert.equal(setupNodeInputs.get("cache"), "npm");
   assert.match(workflow, /npm run test:fast/u);
@@ -246,7 +279,7 @@ test("GitHub workflows never persist checkout credentials", async () => {
     const checkoutSteps = verifiedActionSteps(workflow, "actions/checkout@", relativePath);
     checkoutCount += checkoutSteps.length;
     for (const checkoutStep of checkoutSteps) {
-      assert.equal(actionStepUses(checkoutStep), "actions/checkout@v7");
+      assert.equal(actionStepUses(checkoutStep), CHECKOUT_ACTION);
       assert.equal(
         actionStepInputs(checkoutStep).get("persist-credentials"),
         "false",
@@ -263,7 +296,7 @@ test("release validation runs full suites under PowerShell 7 and Windows PowerSh
   assert.match(workflow, /tags:[\s\S]*v\*/u);
   assert.equal(setupNodeSteps.length, 1);
   const setupNodeInputs = actionStepInputs(setupNodeSteps[0]);
-  assert.equal(actionStepUses(setupNodeSteps[0]), "actions/setup-node@v7");
+  assert.equal(actionStepUses(setupNodeSteps[0]), SETUP_NODE_ACTION);
   assert.equal(setupNodeInputs.get("node-version"), "24.17.0");
   assert.equal(setupNodeInputs.get("package-manager-cache"), "false");
   assert.equal(setupNodeInputs.has("cache"), false);
@@ -300,7 +333,7 @@ test("release validation retains the exact verified ZIP and sidecar", async () =
 
   const uploadSteps = verifiedActionSteps(workflow, "actions/upload-artifact@", "release validation");
   assert.equal(uploadSteps.length, 1);
-  assert.equal(actionStepUses(uploadSteps[0]), "actions/upload-artifact@v7");
+  assert.equal(actionStepUses(uploadSteps[0]), UPLOAD_ARTIFACT_ACTION);
   const uploadInputs = actionStepInputs(uploadSteps[0]);
   assert.equal(uploadInputs.get("name"), "mql5-chm-mcp-release-${{ github.sha }}");
   assert.equal(uploadInputs.get("if-no-files-found"), "error");

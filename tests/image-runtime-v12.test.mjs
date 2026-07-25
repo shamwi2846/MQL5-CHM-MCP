@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import jpegCodec from "jpeg-js";
 import { deflateSync } from "node:zlib";
@@ -14,6 +15,7 @@ const png = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
   "base64",
 );
+const gif = Buffer.from("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==", "base64");
 
 function crc32(buffer) {
   let crc = 0xffffffff;
@@ -90,6 +92,7 @@ test("stable asset IDs case-fold normalized CHM paths", () => {
 
 test("runtime raster inspection accepts static PNG/JPEG and rejects unsafe payloads", () => {
   assert.deepEqual(inspectRasterImage(png), { mime: "image/png", width: 1, height: 1 });
+  assert.deepEqual(inspectRasterImage(gif), { mime: "image/gif", width: 1, height: 1 });
 
   const malformedJpeg = Buffer.from([
     0xff, 0xd8,
@@ -108,6 +111,19 @@ test("runtime raster inspection accepts static PNG/JPEG and rejects unsafe paylo
   assert.throws(() => inspectRasterImage(makeCustomPng({ extra: [pngChunk("ABCD")] })), /critical/i);
   assert.throws(() => inspectRasterImage(makeCustomPng({ extra: [pngChunk("abca")] })), /chunk type/i);
   assert.throws(() => inspectRasterImage(makeCustomPng({ width: 4_097, raw: Buffer.from([0]) })), /dimension|pixel/i);
+  for (const [width, height] of [[0, 1], [1, 0], [4_097, 1], [2_049, 2_048]]) {
+    const malformedGif = Buffer.from(gif);
+    malformedGif.writeUInt16LE(width, 6);
+    malformedGif.writeUInt16LE(height, 8);
+    assert.throws(() => inspectRasterImage(malformedGif), /bounds|dimension|pixel/i, `${width}x${height}`);
+  }
+  const imageDescriptor = gif.indexOf(0x2c);
+  const zeroDescriptor = Buffer.from(gif);
+  zeroDescriptor.writeUInt16LE(0, imageDescriptor + 5);
+  assert.throws(() => inspectRasterImage(zeroDescriptor), /GIF|bounds|dimension/i);
+  const outsideCanvas = Buffer.from(gif);
+  outsideCanvas.writeUInt16LE(1, imageDescriptor + 1);
+  assert.throws(() => inspectRasterImage(outsideCanvas), /GIF|bounds|dimension/i);
   assert.throws(() => inspectRasterImage(Buffer.concat([png, Buffer.from("trailing")])), /terminator|PNG/i);
   assert.throws(() => inspectRasterImage(apngFromPng(png)), /APNG/i);
   assert.throws(() => inspectRasterImage(Buffer.from("<svg><script/></svg>")), /Unsupported/i);
@@ -119,7 +135,20 @@ test("image cursors bind index, topic, section, and offset", () => {
   const sectionId = `${topicId}:s004`;
   const cursor = encodeImageCursor({ indexRevision, topicId, sectionId, offset: 8 });
   assert.deepEqual(decodeImageCursor(cursor), { indexRevision, topicId, sectionId, offset: 8 });
-  assert.throws(() => decodeImageCursor(`${cursor.slice(0, -1)}0`), /cursor/i);
+  const replacementNibble = cursor.endsWith("0") ? "1" : "0";
+  assert.throws(() => decodeImageCursor(`${cursor.slice(0, -1)}${replacementNibble}`), /cursor/i);
+
+  const unkeyedBody = Buffer.from(
+    JSON.stringify({ v: 1, i: indexRevision, t: topicId, s: sectionId, o: 0 }),
+    "utf8",
+  ).toString("base64url");
+  const unkeyedTag = createHash("sha256")
+    .update("mql5-chm-image-cursor-v1\0")
+    .update(unkeyedBody)
+    .digest("hex")
+    .slice(0, 24);
+  assert.throws(() => decodeImageCursor(`${unkeyedBody}.${unkeyedTag}`), /cursor/i);
+
   assert.throws(
     () => encodeImageCursor({ indexRevision, topicId: "../topic", sectionId: null, offset: 0 }),
     /invalid/i,

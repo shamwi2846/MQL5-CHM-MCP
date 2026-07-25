@@ -34,7 +34,7 @@ test("exact API names rank the MQL5 reference first", () => {
 });
 
 test("runtime accepts the current and rollback-compatible schema-3 index contracts", () => {
-  assert.equal(SUPPORTED_INDEX_CONTRACT, "mql5-chm-index-v3-assets-v2");
+  assert.equal(SUPPORTED_INDEX_CONTRACT, "mql5-chm-index-v3-assets-v3");
   assert.equal(searchServiceModule.isSupportedIndexContract("mql5-chm-index-v3-assets-v2"), true);
   assert.equal(searchServiceModule.isSupportedIndexContract("mql5-chm-index-v3-assets-v1"), true);
   assert.equal(searchServiceModule.isSupportedIndexContract("mql5-chm-index-v3-assets-v999"), false);
@@ -105,6 +105,12 @@ test("v1.1 expansions, citations, and official-check guidance are bounded", () =
   assert.equal(service.search({ query: "OnTick", require_current: true }).online_check.reason, "current-information-requested");
   assert.equal(service.search({ query: "OnTikk" }).online_check.reason, "fuzzy-only");
   assert.equal(service.search({ query: "zzzz-no-such-topic-7391" }).online_check.reason, "no-local-match");
+
+  const unicodeQuery = `${"A".repeat(15)}😀${"B".repeat(183)}`;
+  const officialSearchQuery = service.search({ query: unicodeQuery, require_current: true }).online_check.official_search_query;
+  const unpairedSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u;
+  assert.ok(officialSearchQuery.length <= 500);
+  assert.doesNotMatch(officialSearchQuery, unpairedSurrogate);
 });
 
 test("status and related topics expose the active verified revision", () => {
@@ -206,9 +212,37 @@ test("service handlers enforce bounds and stable IDs", () => {
   assert.throws(() => service.search({ query: "x".repeat(201), limit: 3 }), /query/i);
   assert.throws(() => service.search({ query: "OnTick", limit: 9 }), /limit/i);
   assert.throws(() => service.search({ query: "OnTick", limit: 10 }), /limit/i);
+  for (const input of [
+    { query: "OnTick", source: null },
+    { query: "OnTick", limit: null },
+    { query: "OnTick", expand: null },
+    { query: "OnTick", require_current: null },
+    { query: "OnTick", unexpected: true },
+  ]) {
+    assert.throws(
+      () => service.search(input),
+      (error) => error?.code === "INVALID_ARGUMENT",
+      JSON.stringify(input),
+    );
+  }
   const hit = service.search({ query: "OnTick", limit: 1 }).results[0];
   assert.throws(() => service.read({ topic_id: hit.topic_id, max_chars: 12_000 }), /max_chars/i);
+  assert.throws(() => service.read({ topic_id: hit.topic_id, cursor: "" }), /cursor/i);
   assert.throws(() => service.read({ topic_id: "..\\secret" }), /topic_id/i);
+  for (const input of [
+    { topic_id: hit.topic_id, max_chars: null },
+    { topic_id: hit.topic_id, include_related: null },
+    { topic_id: hit.topic_id, related_limit: null },
+    { topic_id: hit.topic_id, include_images: null },
+    { topic_id: hit.topic_id, image_limit: null },
+    { topic_id: hit.topic_id, unexpected: true },
+  ]) {
+    assert.throws(
+      () => service.read(input),
+      (error) => error?.code === "INVALID_ARGUMENT",
+      JSON.stringify(input),
+    );
+  }
 });
 
 test("database is read-only and unchanged by calls", async () => {

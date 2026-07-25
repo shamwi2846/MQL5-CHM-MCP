@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
@@ -26,6 +27,49 @@ const sectionIdSchema = z
 const assetIdSchema = z
   .string()
   .regex(/^(mql5|mql5book|neuronetworksbook):asset:[0-9a-f]{24}$/, "Invalid stable asset ID");
+
+function closedEmptyInputSchema() {
+  const schema = z.strictObject({}).default({});
+  const definition = schema?._zod?.def;
+  if (
+    !definition ||
+    definition.type !== "default" ||
+    !Reflect.defineProperty(definition, "shape", {
+      value: {},
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    })
+  ) {
+    throw new Error("The pinned MCP SDK/Zod empty-input schema compatibility guard failed.");
+  }
+  return schema;
+}
+
+const statusInputSchema = closedEmptyInputSchema();
+
+function installInvalidToolRequestMapping(server) {
+  const handlers = server?.server?._requestHandlers;
+  const original = handlers instanceof Map ? handlers.get("tools/call") : null;
+  if (typeof original !== "function") {
+    throw new Error("The pinned MCP SDK tools/call compatibility guard failed.");
+  }
+  handlers.set("tools/call", async (request, extra) => {
+    try {
+      return await original(request, extra);
+    } catch (error) {
+      if (
+        error instanceof z.ZodError ||
+        error?.name === "ZodError" ||
+        error?.name === "$ZodError"
+      ) {
+        throw new McpError(ErrorCode.InvalidParams, "Invalid tools/call parameters.");
+      }
+      throw error;
+    }
+  });
+}
+
 const citationSchema = z.object({
   source_file: z.string().min(1),
   title: z.string(),
@@ -138,7 +182,7 @@ function toolFailure(error) {
 
 export function createMcpServer(service) {
   const server = new McpServer(
-    { name: "mql5-chm", version: "1.2.4" },
+    { name: "mql5-chm", version: "1.2.5" },
     { capabilities: { tools: {} } },
   );
 
@@ -148,14 +192,14 @@ export function createMcpServer(service) {
       title: "Search local MQL5 CHM documentation",
       description:
         "Search the verified offline MQL5 reference, MQL5 book, and neural-networks book. Exact API names outrank bounded MQL5-aware expansions and typo fallback. The limit input must be an integer from 1 to 8 and must not exceed 8. In answers, name each exact returned title, include citation.topic_id, and state citation.corpus_revision or citation.index_revision once per answer when findings share that revision.",
-      inputSchema: {
+      inputSchema: z.strictObject({
         query: z.string().trim().min(1).max(200).describe("API name or documentation question"),
         source: sourceSchema.optional().default("all").describe("CHM corpus filter"),
         limit: z.number().int().min(1).max(8).optional().default(3)
           .describe("Number of ranked results; integer from 1 to 8 and must not exceed 8"),
         expand: z.boolean().optional().default(true).describe("Use bounded MQL5-aware query expansion"),
         require_current: z.boolean().optional().default(false).describe("Recommend an official-domain check"),
-      },
+      }),
       outputSchema: {
         query: z.string(),
         source: sourceSchema,
@@ -205,7 +249,7 @@ export function createMcpServer(service) {
       title: "Read local MQL5 CHM documentation",
       description:
         "Read a bounded passage from a stable topic ID. Optionally select a section or focus and include bounded related-topic metadata. The max_chars input must be an integer from 500 to 8000 and must not exceed 8000. In answers, name the exact returned section_heading when present (otherwise title), include citation.topic_id and citation.section_id when relevant, and state citation.corpus_revision or citation.index_revision once per answer when findings share that revision.",
-      inputSchema: {
+      inputSchema: z.strictObject({
         topic_id: topicIdSchema.describe("Stable topic ID returned by mql5_chm_search"),
         section_id: sectionIdSchema.optional().describe("Optional stable section ID from search"),
         focus: z.string().trim().min(1).max(200).optional().describe("Passage-selection query"),
@@ -217,7 +261,7 @@ export function createMcpServer(service) {
         include_images: z.boolean().optional().default(true).describe("Include bounded technical-image references when available"),
         image_limit: z.number().int().min(1).max(8).optional().default(5),
         image_cursor: z.string().min(10).max(2_048).optional().describe("Opaque next_image_cursor from an earlier read"),
-      },
+      }),
       outputSchema: {
         topic_id: topicIdSchema,
         section_id: sectionIdSchema.nullable(),
@@ -303,7 +347,10 @@ export function createMcpServer(service) {
       title: "Show local MQL5 CHM documentation status",
       description:
         "Report the active verified corpus and index revisions, source metadata, counts, and the last validated manual update check.",
-      inputSchema: {},
+      // SDK 1.29.0 otherwise replaces this default-wrapped strict object with
+      // an open empty schema in tools/list. The guarded shape marker preserves
+      // both omitted-argument defaulting and additionalProperties: false.
+      inputSchema: statusInputSchema,
       outputSchema: {
         schema_version: z.number().int().positive(),
         active_revision: sha256Schema,
@@ -393,6 +440,9 @@ export function createMcpServer(service) {
     },
   );
 
+  // SDK 1.29.0 otherwise maps outer tools/call schema failures to -32603.
+  // The pinned, guarded wrapper preserves the protocol's -32602 contract.
+  installInvalidToolRequestMapping(server);
   return server;
 }
 

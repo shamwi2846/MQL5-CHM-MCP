@@ -6,7 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 
-import { createSchema } from "../src/indexer.mjs";
+import { createSchema, makeTopicId } from "../src/indexer.mjs";
 import { createSearchService, encodeImageCursor, makeRuntimeAssetId } from "../src/search-service.mjs";
 
 const SOURCE_COUNTS = { mql5: 4_134, mql5book: 581, neuronetworksbook: 112 };
@@ -28,10 +28,15 @@ function corpusRevision(sources) {
   return hash.digest("hex");
 }
 
-async function buildFixture({ indexContract = "mql5-chm-index-v3-assets-v1" } = {}) {
+async function buildFixture({
+  schemaVersion = 3,
+  indexContract = "mql5-chm-index-v3-assets-v1",
+  invalidIdentity = null,
+  invalidIntegrity = null,
+} = {}) {
   const root = path.join(tmpdir(), `mql5-chm-v12-runtime-${process.pid}-${Date.now()}`);
   const candidate = path.join(root, "candidate");
-  await mkdir(path.join(candidate, "assets", "mql5"), { recursive: true });
+  await mkdir(schemaVersion === 3 ? path.join(candidate, "assets", "mql5") : candidate, { recursive: true });
   const sources = {};
   for (const [source, filename] of Object.entries(SOURCE_FILES)) {
     const bytes = Buffer.from(`fixture-${source}`, "utf8");
@@ -52,9 +57,29 @@ async function buildFixture({ indexContract = "mql5-chm-index-v3-assets-v1" } = 
   const databasePath = path.join(candidate, "mql5-docs.sqlite");
   const database = new DatabaseSync(databasePath);
   createSchema(database);
+  if (schemaVersion === 2) {
+    database.exec(`
+      PRAGMA foreign_keys = OFF;
+      DROP TABLE sources;
+      CREATE TABLE sources (
+        source TEXT PRIMARY KEY,
+        chm_filename TEXT NOT NULL,
+        chm_sha256 TEXT NOT NULL CHECK(length(chm_sha256) = 64),
+        chm_bytes INTEGER NOT NULL CHECK(chm_bytes > 0),
+        http_last_modified TEXT,
+        http_etag TEXT,
+        retrieved_at TEXT NOT NULL,
+        topic_count INTEGER NOT NULL CHECK(topic_count >= 0),
+        section_count INTEGER NOT NULL CHECK(section_count >= 0)
+      ) STRICT;
+      PRAGMA foreign_keys = ON;
+    `);
+  }
 
   const insertSource = database.prepare(
-    "INSERT INTO sources(source,chm_filename,chm_sha256,chm_bytes,topic_count,section_count) VALUES(?,?,?,?,?,?)",
+    schemaVersion === 3
+      ? "INSERT INTO sources(source,chm_filename,chm_sha256,chm_bytes,topic_count,section_count) VALUES(?,?,?,?,?,?)"
+      : "INSERT INTO sources(source,chm_filename,chm_sha256,chm_bytes,http_last_modified,http_etag,retrieved_at,topic_count,section_count) VALUES(?,?,?,?,?,?,?,?,?)",
   );
   const insertTopic = database.prepare(
     "INSERT INTO topics(topic_id,source,internal_path,title,normalized_title,breadcrumb,signature,content_sha256,content,content_length) VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -62,31 +87,74 @@ async function buildFixture({ indexContract = "mql5-chm-index-v3-assets-v1" } = 
   const insertSection = database.prepare(
     "INSERT INTO sections(section_id,topic_id,ordinal,heading,start_offset,end_offset,content) VALUES(?,?,?,?,?,?,?)",
   );
+  const insertAlias = database.prepare(
+    "INSERT INTO aliases(alias,normalized_alias,topic_id,source_kind) VALUES(?,?,?,?)",
+  );
   const insertFts = database.prepare(
     "INSERT INTO search_fts(topic_id,section_id,source,title,aliases,heading,breadcrumb,body) VALUES(?,?,?,?,?,?,?,?)",
   );
   const topicIds = [];
+  const firstTopicBySource = new Map();
+  let secondMql5TopicId = null;
   database.exec("BEGIN IMMEDIATE");
   try {
+    if (invalidIdentity === "topic-noncanonical" || invalidIntegrity === "topic-extension") {
+      database.exec("PRAGMA defer_foreign_keys = ON");
+    }
     for (const source of Object.keys(SOURCE_COUNTS)) {
-      insertSource.run(source, sources[source].filename, sources[source].sha256, sources[source].bytes, SOURCE_COUNTS[source], SOURCE_COUNTS[source]);
+      if (schemaVersion === 3) {
+        insertSource.run(source, sources[source].filename, sources[source].sha256, sources[source].bytes, SOURCE_COUNTS[source], SOURCE_COUNTS[source]);
+      } else {
+        insertSource.run(
+          source,
+          sources[source].filename,
+          sources[source].sha256,
+          sources[source].bytes,
+          null,
+          null,
+          NOW,
+          SOURCE_COUNTS[source],
+          SOURCE_COUNTS[source],
+        );
+      }
       for (let index = 0; index < SOURCE_COUNTS[source]; index += 1) {
-        const topicId = `${source}:${index.toString(16).padStart(24, "0")}`;
+        const internalPath = `topic-${index}.htm`;
+        const topicId = makeTopicId(source, internalPath);
         const title = index === 0 ? `${source} image fixture` : `${source} topic ${index}`;
         const content = `${title}\nVerified documentation text.`;
         const sectionId = `${topicId}:s000`;
-        insertTopic.run(topicId, source, `topic-${index}.htm`, title, title.toLowerCase(), title, "", sha256(content), content, content.length);
+        const aliasDefinitions = source === "mql5" && index === 0
+          ? [
+            { alias: title, normalized: title.toLowerCase(), sourceKind: "html-title" },
+            { alias: "\u{10000}", normalized: "\u{10000}", sourceKind: "html-keyword" },
+          ]
+          : [{ alias: title, normalized: title.toLowerCase(), sourceKind: "html-title" }];
+        insertTopic.run(topicId, source, internalPath, title, title.toLowerCase(), title, "", sha256(content), content, content.length);
+        for (const alias of aliasDefinitions) {
+          insertAlias.run(alias.alias, alias.normalized, topicId, alias.sourceKind);
+        }
         insertSection.run(sectionId, topicId, 0, title, 0, content.length, content);
-        insertFts.run(topicId, sectionId, source, title, "", title, title, content);
+        insertFts.run(
+          topicId,
+          sectionId,
+          source,
+          title,
+          aliasDefinitions.map((alias) => alias.alias).join(" | "),
+          title,
+          title,
+          content,
+        );
+        if (index === 0) firstTopicBySource.set(source, topicId);
         if (source === "mql5" && index === 0) topicIds.push(topicId, sectionId);
+        if (source === "mql5" && index === 1) secondMql5TopicId = topicId;
       }
     }
 
-    const assetDefinitions = [
+    const assetDefinitions = (schemaVersion === 3 ? [
       { internalPath: "images/diagram-a.png", bytes: PNG, mime: "image/png", exposure: "exposed", reason: "technical-in-help", caption: "Technical diagram A" },
       { internalPath: "images/icon-b.png", bytes: PNG, mime: "image/png", exposure: "exposed", reason: "technical-in-help", caption: "Technical icon B" },
       { internalPath: "copyright.gif", bytes: GIF, mime: "image/gif", exposure: "excluded", reason: "decorative-denylist", caption: "Copyright" },
-    ].map((asset) => {
+    ] : []).map((asset) => {
       const pathDigest = sha256(asset.internalPath.toLowerCase());
       return {
         ...asset,
@@ -106,11 +174,194 @@ async function buildFixture({ indexContract = "mql5-chm-index-v3-assets-v1" } = 
     const insertOccurrence = database.prepare(
       "INSERT INTO topic_assets(topic_id,occurrence_ordinal,asset_id,section_id,text_offset,figcaption_text,title_text,alt_text,nearby_text,contextual_caption,caption_source) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
     );
-    insertOccurrence.run(topicIds[0], 0, assetDefinitions[0].assetId, topicIds[1], 0, "", "", "Diagram A", "Nearby A", "Diagram A", "alt");
-    insertOccurrence.run(topicIds[0], 1, assetDefinitions[0].assetId, topicIds[1], 3, "", "", "Diagram A repeated", "Nearby A", "Diagram A repeated", "alt");
-    insertOccurrence.run(topicIds[0], 2, assetDefinitions[1].assetId, topicIds[1], 6, "", "Technical icon", "Icon B", "Nearby B", "Technical icon", "title");
-    insertOccurrence.run(topicIds[0], 3, assetDefinitions[2].assetId, topicIds[1], 9, "", "", "Copyright", "", "Copyright", "alt");
+    if (schemaVersion === 3) {
+      insertOccurrence.run(topicIds[0], 0, assetDefinitions[0].assetId, topicIds[1], 0, "", "", "Diagram A", "Nearby A", "Diagram A", "alt");
+      insertOccurrence.run(topicIds[0], 1, assetDefinitions[0].assetId, topicIds[1], 3, "", "", "Diagram A repeated", "Nearby A", "Diagram A repeated", "alt");
+      insertOccurrence.run(topicIds[0], 2, assetDefinitions[1].assetId, topicIds[1], 6, "", "Technical icon", "Icon B", "Nearby B", "Technical icon", "title");
+      insertOccurrence.run(topicIds[0], 3, assetDefinitions[2].assetId, topicIds[1], 9, "", "", "Copyright", "", "Copyright", "alt");
+    }
 
+    const hasLinkFixture = typeof invalidIntegrity === "string" && invalidIntegrity.startsWith("link-");
+    if (hasLinkFixture) {
+      database.prepare(
+        "INSERT INTO topic_links(source_topic_id,ordinal,target_topic_id,target_internal_path,target_fragment,label,relationship,resolution_status) VALUES(?,?,?,?,?,?,?,?)",
+      ).run(topicIds[0], 0, secondMql5TopicId, "topic-1.htm", "", "Related topic", "inline", "resolved");
+    }
+
+    if (invalidIdentity === "topic-path") {
+      database.prepare("UPDATE topics SET internal_path='tampered.htm' WHERE topic_id=?").run(topicIds[0]);
+    } else if (invalidIdentity === "topic-noncanonical") {
+      const noncanonicalPath = "/topic-0.htm";
+      const noncanonicalTopicId = `mql5:${sha256(noncanonicalPath.toLowerCase()).slice(0, 24)}`;
+      const noncanonicalSectionId = `${noncanonicalTopicId}:s000`;
+      database.prepare("UPDATE topic_assets SET topic_id=?, section_id=? WHERE topic_id=?").run(
+        noncanonicalTopicId,
+        noncanonicalSectionId,
+        topicIds[0],
+      );
+      database.prepare("UPDATE aliases SET topic_id=? WHERE topic_id=?").run(noncanonicalTopicId, topicIds[0]);
+      database.prepare("UPDATE sections SET topic_id=?, section_id=? WHERE topic_id=?").run(
+        noncanonicalTopicId,
+        noncanonicalSectionId,
+        topicIds[0],
+      );
+      database.prepare("UPDATE search_fts SET topic_id=?, section_id=? WHERE topic_id=?").run(
+        noncanonicalTopicId,
+        noncanonicalSectionId,
+        topicIds[0],
+      );
+      database.prepare("UPDATE topics SET topic_id=?, internal_path=? WHERE topic_id=?").run(
+        noncanonicalTopicId,
+        noncanonicalPath,
+        topicIds[0],
+      );
+      topicIds[0] = noncanonicalTopicId;
+      topicIds[1] = noncanonicalSectionId;
+    } else if (invalidIdentity === "section-ordinal") {
+      database.prepare("UPDATE sections SET ordinal=1000 WHERE section_id=?").run(topicIds[1]);
+    }
+
+    if (invalidIntegrity === "topic-extension") {
+      const textPath = "topic-0.txt";
+      const textTopicId = `mql5:${sha256(textPath.toLowerCase()).slice(0, 24)}`;
+      const textSectionId = `${textTopicId}:s000`;
+      database.prepare("UPDATE topic_assets SET topic_id=?, section_id=? WHERE topic_id=?").run(
+        textTopicId,
+        textSectionId,
+        topicIds[0],
+      );
+      database.prepare("UPDATE aliases SET topic_id=? WHERE topic_id=?").run(textTopicId, topicIds[0]);
+      database.prepare("UPDATE sections SET topic_id=?, section_id=? WHERE topic_id=?").run(
+        textTopicId,
+        textSectionId,
+        topicIds[0],
+      );
+      database.prepare("UPDATE search_fts SET topic_id=?, section_id=? WHERE topic_id=?").run(
+        textTopicId,
+        textSectionId,
+        topicIds[0],
+      );
+      database.prepare("UPDATE topics SET topic_id=?, internal_path=? WHERE topic_id=?").run(
+        textTopicId,
+        textPath,
+        topicIds[0],
+      );
+      topicIds[0] = textTopicId;
+      topicIds[1] = textSectionId;
+    } else if (invalidIntegrity === "topic-content-hash") {
+      database.prepare("UPDATE topics SET content_sha256=? WHERE topic_id=?").run("0".repeat(64), topicIds[0]);
+    } else if (invalidIntegrity === "missing-section") {
+      database.prepare(
+        "DELETE FROM sections WHERE section_id=(SELECT s.section_id FROM sections s WHERE s.topic_id<>? LIMIT 1)",
+      ).run(topicIds[0]);
+    } else if (invalidIntegrity === "orphan-fts") {
+      const orphanTopicId = `mql5:${"a".repeat(24)}`;
+      database.prepare(
+        "UPDATE search_fts SET topic_id=?, section_id=? WHERE rowid=(SELECT rowid FROM search_fts LIMIT 1)",
+      ).run(orphanTopicId, `${orphanTopicId}:s000`);
+    } else if (invalidIntegrity === "section-content") {
+      database.prepare("UPDATE sections SET content='tampered' WHERE section_id=?").run(topicIds[1]);
+    } else if (invalidIntegrity === "fts-body") {
+      database.prepare("UPDATE search_fts SET body='tampered' WHERE section_id=?").run(topicIds[1]);
+    } else if (invalidIntegrity === "alias-normalization") {
+      database.prepare(
+        "UPDATE aliases SET normalized_alias='tampered', source_kind='unknown' WHERE topic_id=? AND source_kind='html-title'",
+      ).run(
+        topicIds[0],
+      );
+    } else if (invalidIntegrity === "occurrence-outside-section") {
+      const topic = database.prepare(
+        "SELECT title, breadcrumb, content, content_length FROM topics WHERE topic_id=?",
+      ).get(topicIds[0]);
+      const splitOffset = 3;
+      const firstContent = topic.content.slice(0, splitOffset).trimEnd();
+      const secondContent = topic.content.slice(splitOffset).trimEnd();
+      const secondSectionId = `${topicIds[0]}:s001`;
+      database.prepare("UPDATE sections SET end_offset=?, content=? WHERE section_id=?").run(
+        splitOffset,
+        firstContent,
+        topicIds[1],
+      );
+      database.prepare("UPDATE search_fts SET body=? WHERE section_id=?").run(firstContent, topicIds[1]);
+      insertSection.run(
+        secondSectionId,
+        topicIds[0],
+        1,
+        topic.title,
+        splitOffset,
+        topic.content_length,
+        secondContent,
+      );
+      insertFts.run(
+        topicIds[0],
+        secondSectionId,
+        "mql5",
+        topic.title,
+        `${topic.title} | \u{10000}`,
+        topic.title,
+        topic.breadcrumb,
+        secondContent,
+      );
+      database.prepare(
+        "UPDATE topic_assets SET section_id=? WHERE topic_id=? AND occurrence_ordinal IN (1,3)",
+      ).run(secondSectionId, topicIds[0]);
+      database.prepare("UPDATE sources SET section_count=section_count+1 WHERE source='mql5'").run();
+      sources.mql5.section_count += 1;
+    } else if (invalidIntegrity === "asset-source") {
+      const bookTopicId = firstTopicBySource.get("mql5book");
+      database.prepare(
+        "UPDATE topic_assets SET topic_id=?, section_id=?, text_offset=0 WHERE topic_id=? AND occurrence_ordinal=0",
+      ).run(bookTopicId, `${bookTopicId}:s000`, topicIds[0]);
+    } else if (invalidIntegrity === "fts-options") {
+      const rows = database.prepare(
+        "SELECT topic_id,section_id,source,title,aliases,heading,breadcrumb,body FROM search_fts",
+      ).all();
+      database.exec(`
+        DROP TABLE search_fts;
+        CREATE VIRTUAL TABLE search_fts USING fts5(
+          topic_id UNINDEXED,
+          section_id UNINDEXED,
+          source UNINDEXED,
+          title,
+          aliases,
+          heading,
+          breadcrumb,
+          body,
+          tokenize = 'porter',
+          prefix = '2 3 4'
+        );
+      `);
+      const insertWrongFts = database.prepare(
+        "INSERT INTO search_fts(topic_id,section_id,source,title,aliases,heading,breadcrumb,body) VALUES(?,?,?,?,?,?,?,?)",
+      );
+      for (const row of rows) {
+        insertWrongFts.run(
+          row.topic_id,
+          row.section_id,
+          row.source,
+          row.title,
+          row.aliases,
+          row.heading,
+          row.breadcrumb,
+          row.body,
+        );
+      }
+    } else if (invalidIntegrity === "link-path") {
+      database.prepare("UPDATE topic_links SET target_internal_path='topic-2.htm'").run();
+    } else if (invalidIntegrity === "link-source") {
+      database.prepare("UPDATE topic_links SET target_topic_id=?").run(firstTopicBySource.get("mql5book"));
+    } else if (invalidIntegrity === "link-resolution-count") {
+      database.prepare(
+        "UPDATE topic_links SET target_topic_id=NULL, resolution_status='unresolved'",
+      ).run();
+    }
+
+    const declaredLinkCount = hasLinkFixture ? 1 : 0;
+    const declaredResolvedLinkCount = hasLinkFixture ? 1 : 0;
+    const declaredSectionCount = Object.values(sources).reduce(
+      (total, source) => total + source.section_count,
+      0,
+    );
     const catalogRows = assetDefinitions
       .map((asset) => [
         asset.assetId, "mql5", asset.internalPath, asset.pathDigest, asset.storageKey, asset.mime, asset.byteHash,
@@ -124,25 +375,37 @@ async function buildFixture({ indexContract = "mql5-chm-index-v3-assets-v1" } = 
     }
     const treeHash = treeHashState.digest("hex");
     const totalAssetBytes = assetDefinitions.reduce((sum, asset) => sum + asset.bytes.length, 0);
-    const metadata = {
-      schema_version: "3",
-      index_contract: indexContract,
-      corpus_sha256: corpus,
-      image_policy_sha256: policyHash,
-      asset_catalog_sha256: catalogHash,
-      asset_tree_sha256: treeHash,
-      total_topic_count: "4827",
-      total_section_count: "4827",
-      topic_link_count: "0",
-      resolved_topic_link_count: "0",
-      unresolved_topic_link_count: "0",
-      asset_count: "3",
-      exposed_asset_count: "2",
-      excluded_asset_count: "1",
-      topic_asset_count: "4",
-      exposed_topic_asset_count: "3",
-      asset_total_bytes: String(totalAssetBytes),
-    };
+    const metadata = schemaVersion === 3
+      ? {
+        schema_version: "3",
+        index_contract: indexContract,
+        corpus_sha256: corpus,
+        image_policy_sha256: policyHash,
+        asset_catalog_sha256: catalogHash,
+        asset_tree_sha256: treeHash,
+        total_topic_count: "4827",
+        total_section_count: String(declaredSectionCount),
+        topic_link_count: String(declaredLinkCount),
+        resolved_topic_link_count: String(declaredResolvedLinkCount),
+        unresolved_topic_link_count: "0",
+        asset_count: "3",
+        exposed_asset_count: "2",
+        excluded_asset_count: "1",
+        topic_asset_count: "4",
+        exposed_topic_asset_count: "3",
+        asset_total_bytes: String(totalAssetBytes),
+      }
+      : {
+        schema_version: "2",
+        build_timestamp: NOW,
+        indexed_at: NOW,
+        corpus_sha256: corpus,
+        total_topic_count: "4827",
+        total_section_count: String(declaredSectionCount),
+        topic_link_count: String(declaredLinkCount),
+        resolved_topic_link_count: String(declaredResolvedLinkCount),
+        unresolved_topic_link_count: "0",
+      };
     const insertMetadata = database.prepare("INSERT INTO metadata(key,value) VALUES(?,?)");
     for (const [key, value] of Object.entries(metadata)) insertMetadata.run(key, value);
     database.exec("COMMIT");
@@ -156,19 +419,23 @@ async function buildFixture({ indexContract = "mql5-chm-index-v3-assets-v1" } = 
     const emptyAssetSummary = { cataloged_count: 0, exposed_count: 0, excluded_count: 0, occurrence_count: 0, exposed_occurrence_count: 0, total_bytes: 0 };
     const totalAssetBytesValue = assetDefinitions.reduce((sum, asset) => sum + asset.bytes.length, 0);
     const manifest = {
-      schema_version: 3,
-      index_contract: indexContract,
-      index_revision: databaseHash,
+      schema_version: schemaVersion,
       corpus_sha256: corpus,
       corpus_revision: corpus,
       database: { filename: "mql5-docs.sqlite", sha256: databaseHash, bytes: databaseBytes },
       sources,
       total_topic_count: 4_827,
-      total_section_count: 4_827,
-      topic_link_count: 0,
-      resolved_topic_link_count: 0,
+      total_section_count: declaredSectionCount,
+      topic_link_count: declaredLinkCount,
+      resolved_topic_link_count: declaredResolvedLinkCount,
       unresolved_topic_link_count: 0,
-      assets: {
+      indexed_at: NOW,
+      build_timestamp: NOW,
+    };
+    if (schemaVersion === 3) {
+      manifest.index_contract = indexContract;
+      manifest.index_revision = databaseHash;
+      manifest.assets = {
         directory: "assets",
         cataloged_count: 3,
         exposed_count: 2,
@@ -184,10 +451,8 @@ async function buildFixture({ indexContract = "mql5-chm-index-v3-assets-v1" } = 
           mql5book: emptyAssetSummary,
           neuronetworksbook: emptyAssetSummary,
         },
-      },
-      indexed_at: NOW,
-      build_timestamp: NOW,
-    };
+      };
+    }
     await writeFile(path.join(revisionRoot, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
     await mkdir(path.join(root, "data"), { recursive: true });
     await writeFile(path.join(root, "data", "active.json"), `${JSON.stringify({ schema_version: 2, active_revision: databaseHash, previous_revision: null, activated_at: NOW }, null, 2)}\n`, "utf8");
@@ -270,6 +535,24 @@ test("schema-3 service validates assets and serves bounded metadata then one ver
   }
 });
 
+test("schema-2 rollback fixture passes the semantic startup verifier", async () => {
+  const fixture = await buildFixture({ schemaVersion: 2 });
+  let service;
+  try {
+    service = await createSearchService({ root: fixture.root });
+    const status = service.status();
+    assert.equal(status.schema_version, 2);
+    assert.equal(status.active_revision, fixture.databaseHash);
+    assert.equal(status.asset_support_available, false);
+    assert.equal(status.assets.available, false);
+    const result = service.search({ query: "mql5 image fixture", source: "mql5", limit: 1 });
+    assert.equal(result.results[0].topic_id, fixture.topicId);
+  } finally {
+    service?.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("schema-3 startup rejects files outside exact asset-tree closure", async () => {
   const fixture = await buildFixture();
   try {
@@ -330,5 +613,56 @@ test("schema-3 startup rejects an unknown self-consistent index contract", async
     );
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("schema-3 startup rejects topic and section identities outside the public ID contract", async () => {
+  for (const invalidIdentity of ["topic-path", "topic-noncanonical", "section-ordinal"]) {
+    const fixture = await buildFixture({ invalidIdentity });
+    try {
+      await assert.rejects(
+        async () => {
+          const opened = await createSearchService({ root: fixture.root });
+          opened.close();
+        },
+        (error) => error?.code === "INVALID_INDEX",
+        invalidIdentity,
+      );
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("schema-3 startup rejects semantic database integrity drift", async () => {
+  const invalidCases = [
+    "topic-extension",
+    "topic-content-hash",
+    "missing-section",
+    "orphan-fts",
+    "section-content",
+    "fts-body",
+    "alias-normalization",
+    "occurrence-outside-section",
+    "asset-source",
+    "fts-options",
+    "link-path",
+    "link-source",
+    "link-resolution-count",
+  ];
+  for (const invalidIntegrity of invalidCases) {
+    const fixture = await buildFixture({ invalidIntegrity });
+    try {
+      await assert.rejects(
+        async () => {
+          const opened = await createSearchService({ root: fixture.root });
+          opened.close();
+        },
+        (error) => error?.code === "INVALID_INDEX",
+        invalidIntegrity,
+      );
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
   }
 });

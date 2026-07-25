@@ -179,6 +179,17 @@ test("raster inspection validates static PNG/JPEG structure and bounds", () => {
   assert.throws(() => inspectRasterAsset(zeroWidthJpeg, "zero.jpg"), /zero dimensions|JPEG/);
   assert.throws(() => inspectRasterAsset(Buffer.concat([jpeg, Buffer.from([0])]), "trailing.jpg"), /trailing|JPEG/);
   assert.throws(() => inspectRasterAsset(jpeg.subarray(0, jpeg.length - 3), "truncated.jpg"), /JPEG/);
+  const gif = Buffer.from("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==", "base64");
+  assert.deepEqual(inspectRasterAsset(gif, "copyright.gif"), {
+    mimeType: "image/gif", width: 1, height: 1, byteCount: gif.length, pixelCount: 1,
+  });
+  const imageDescriptor = gif.indexOf(0x2c);
+  const zeroDescriptor = Buffer.from(gif);
+  zeroDescriptor.writeUInt16LE(0, imageDescriptor + 5);
+  assert.throws(() => inspectRasterAsset(zeroDescriptor, "copyright.gif"), /GIF|dimension/i);
+  const outsideCanvas = Buffer.from(gif);
+  outsideCanvas.writeUInt16LE(1, imageDescriptor + 1);
+  assert.throws(() => inspectRasterAsset(outsideCanvas, "copyright.gif"), /GIF|dimension/i);
   assert.throws(() => inspectRasterAsset(makePng(2_049, 2_048), "pixels.png", {
     max_bytes: 2_097_152, max_dimension: 4_096, max_pixels: 4_194_304,
   }), /decoded limit/);
@@ -232,6 +243,20 @@ test("caption precedence, normalization, and filename fallback are deterministic
   assert.equal(topic.imageReferences[2].contextualCaption, "fallback file name");
   assert.equal(topic.imageReferences[3].contextualCaption.length, 500);
   assert.doesNotMatch(topic.imageReferences[3].contextualCaption, /[\u0000-\u001f\u007f]/u);
+});
+
+test("bounded image captions never split a Unicode surrogate pair", () => {
+  const safePrefix = "a".repeat(499);
+  const topic = parseHtmlTopic(
+    `<div id="help"><h1>Caption</h1><img src="unicode.png" alt="${safePrefix}😀tail"></div>`,
+    {
+      source: "mql5",
+      internalPath: "reference/caption.htm",
+      imagePolicy: { limits: { max_caption_chars: 500 } },
+    },
+  );
+  assert.equal(topic.imageReferences[0].altText, safePrefix);
+  assert.equal(topic.imageReferences[0].contextualCaption, safePrefix);
 });
 
 test("versioned policy keeps the exact initial decorative denylist", async () => {
@@ -342,6 +367,30 @@ async function createMiniCorpus(root, { includePolicy = true } = {}) {
 function miniCorpusBuildOptions(options = {}) {
   return { sourceDirectory: "sources", extractedDirectory: "extracted", ...options };
 }
+
+test("index builds reject impossible ISO calendar timestamps instead of normalizing them", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "mql5-index-timestamp-"));
+  try {
+    await createMiniCorpus(root);
+    for (const [ordinal, retrievedAt] of [
+      ["calendar", "2026-02-31T00:00:00Z"],
+      ["clock", "2026-01-01T24:00:00Z"],
+      ["upper-year", "9999-12-31T23:59:59-14:00"],
+      ["lower-year", "0000-01-01T00:00:00+14:00"],
+    ]) {
+      await assert.rejects(
+        buildIndex(root, miniCorpusBuildOptions({
+          outputDirectory: `candidate-${ordinal}`,
+          sourceMetadata: { mql5: { retrieved_at: retrievedAt } },
+        })),
+        /must be an ISO-8601 timestamp with an explicit timezone/,
+        retrievedAt,
+      );
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("project policy stays separate from an external maintenance workspace", async () => {
   const container = await mkdtemp(path.join(tmpdir(), "mql5-index-workspace-"));

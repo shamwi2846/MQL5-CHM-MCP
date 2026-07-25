@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { CallToolResultSchema, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const packageRoot = path.resolve(process.env.MQL5_CHM_TEST_ROOT ?? root);
@@ -98,6 +99,7 @@ test("portable stdio MCP lists and calls the four v1.2 read-only tools", async (
     assert.equal(imageTool.inputSchema.additionalProperties, false);
     const statusTool = listed.tools.find((tool) => tool.name === "mql5_chm_status");
     assert.deepEqual(statusTool.inputSchema.required ?? [], []);
+    assert.equal(statusTool.inputSchema.additionalProperties, false);
 
     const search = await client.callTool({
       name: "mql5_chm_search",
@@ -240,6 +242,9 @@ test("portable stdio MCP lists and calls the four v1.2 read-only tools", async (
     });
     assert.equal(extraArgument.isError, true);
 
+    const statusWithoutArguments = await client.callTool({ name: "mql5_chm_status" });
+    assert.equal(statusWithoutArguments.isError, undefined);
+    assert.match(statusWithoutArguments.structuredContent.active_revision, /^[0-9a-f]{64}$/u);
     const status = await client.callTool({ name: "mql5_chm_status", arguments: {} });
     assert.equal(status.isError, undefined);
     assert.match(status.structuredContent.active_revision, /^[0-9a-f]{64}$/);
@@ -254,6 +259,18 @@ test("portable stdio MCP lists and calls the four v1.2 read-only tools", async (
     assert.equal(status.structuredContent.assets.occurrences, 828);
     assert.equal(status.structuredContent.assets.exposed_occurrences, 811);
     assert.equal(status.structuredContent.assets.bytes, 11_652_126);
+    for (const invalidArguments of [null, []]) {
+      await assert.rejects(
+        () => client.request(
+          {
+            method: "tools/call",
+            params: { name: "mql5_chm_status", arguments: invalidArguments },
+          },
+          CallToolResultSchema,
+        ),
+        (error) => error?.code === ErrorCode.InvalidParams,
+      );
+    }
 
     const concurrentCalls = await Promise.all(
       Array.from({ length: 4 }, (_, index) => [

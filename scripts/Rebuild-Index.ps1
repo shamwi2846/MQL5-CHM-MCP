@@ -53,8 +53,10 @@ try {
         if ([int]$pointer.schema_version -eq 1) { $pointer = Convert-ActiveRevisionPointerToSchema2 -ProjectRoot $root -AdditionalValidatedRevisions @($Revision) }
         $base = Assert-Revision -ProjectRoot $root -Revision ([string]$pointer.active_revision) -IdentityMode Index
         if ($Revision -ceq [string]$base.IndexRevision) {
-            Assert-Revision -ProjectRoot $root -Revision $Revision -IdentityMode Index -RequireCurrent | Out-Null
-            Write-Host "Index revision $Revision is already active."
+            $current = Assert-Revision -ProjectRoot $root -Revision $Revision -IdentityMode Index -RequireCurrent
+            Set-UpdateStatus -ProjectRoot $root -Status 'up-to-date' -ActiveRevision $Revision -ActiveCorpusRevision ([string]$current.CorpusRevision) -CandidateRevision $Revision -CandidateCorpusRevision ([string]$current.CorpusRevision) -Message 'The requested verified index revision is already active locally.' | Out-Null
+            Update-ManagedChecksumsIfPresent -ProjectRoot $root
+            Write-Host "Index revision $Revision is already active; status and managed checksums were reconciled."
             return
         }
         Assert-CandidateActivationAccepted -ProjectRoot $root -CandidateIndexRevision $Revision -BaseRevision $base -AcceptAssetReduction:$AcceptAssetReduction | Out-Null

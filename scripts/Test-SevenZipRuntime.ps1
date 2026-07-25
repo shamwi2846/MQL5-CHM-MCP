@@ -69,7 +69,8 @@ function New-SevenZipRepairHooks {
         [IO.File]::WriteAllText($destination,$downloadValue,(New-Object Text.UTF8Encoding($false)))
     }.GetNewClosure()
     $extract = {
-        param($artifact,$destination)
+        param($artifact,$destination,$timeoutSeconds)
+        $observationValue.ExtractionTimeoutSeconds = [int]$timeoutSeconds
         if ($extractMode -ceq 'throw') { throw 'synthetic msiexec failure' }
         $distribution = Join-Path $destination 'Files\7-Zip'
         New-Item -ItemType Directory -Path $distribution -Force | Out-Null
@@ -129,6 +130,7 @@ try {
     Assert-Test ([string]$result.ExeName -ceq '7z.exe') 'Successful 7-Zip repair returned the wrong executable.'
     Assert-Test ([string]$observed.Uri -ceq $script:PinnedSevenZipMsiUri) '7-Zip repair requested the wrong artifact URL.'
     Assert-Test ([int]$observed.TimeoutSeconds -eq 300) '7-Zip repair did not impose the 300-second deadline.'
+    Assert-Test ([int]$observed.ExtractionTimeoutSeconds -eq 300) '7-Zip MSI extraction did not impose the 300-second deadline.'
     Assert-Test ([int64]$observed.MaximumBytes -eq 16777216) '7-Zip repair did not impose the 16 MiB stream cap.'
     Assert-Test (Test-PinnedSevenZipRuntimePair -ExePath (Join-Path $fixture 'tools\7z.exe') -DllPath (Join-Path $fixture 'tools\7z.dll') -LicensePath (Join-Path $fixture 'licenses\7ZIP-LICENSE.txt')) 'Repaired 7-Zip pair failed final validation.'
     Assert-NoSevenZipTemporaryDebris -Fixture $fixture

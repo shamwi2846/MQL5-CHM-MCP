@@ -376,7 +376,7 @@ if ($Mode -ceq 'sleep') { Start-Sleep -Seconds 30; exit 0 }
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 $script:ManifestSchemaVersion=3
-$script:IndexContract='mql5-chm-index-v3-assets-v2'
+$script:IndexContract='mql5-chm-index-v3-assets-v3'
 function Resolve-FullPath { param([string]$Path,[switch]$MustExist,[string]$PathType) return [IO.Path]::GetFullPath($Path) }
 function Assert-NoReparsePoint { param([string]$Root,[string]$Path) }
 function Enter-ExclusiveFileLock { param([string]$Path,[string]$IdentityRoot,[int]$TimeoutSeconds) $lease=[pscustomobject]@{};$lease|Add-Member ScriptMethod Dispose {};return $lease }
@@ -387,9 +387,9 @@ function Get-RevisionTransition { param([string]$ProjectRoot,[switch]$AllowMissi
 function Assert-MaintenancePackageIntegrity { param([string]$ProjectRoot,[switch]$AllowPendingTransition) return $true }
 function Get-ActiveRevisionPointer { param([string]$ProjectRoot,[switch]$AllowMissing) return [pscustomobject]@{schema_version=2;active_revision=('a'*64)} }
 function Assert-NoPendingRevisionTransition { param([string]$ProjectRoot) }
-function Assert-ManifestAndCorpus { param([string]$ProjectRoot) return [pscustomobject]@{IndexRevision=('a'*64);CorpusRevision=('c'*64);ManifestSchemaVersion=3;Manifest=[pscustomobject]@{index_contract='mql5-chm-index-v3-assets-v2';assets=[pscustomobject]@{policy_sha256=('d'*64)}}} }
+function Assert-ManifestAndCorpus { param([string]$ProjectRoot) return [pscustomobject]@{IndexRevision=('a'*64);CorpusRevision=('c'*64);ManifestSchemaVersion=3;Manifest=[pscustomobject]@{index_contract='mql5-chm-index-v3-assets-v3';assets=[pscustomobject]@{policy_sha256=('d'*64)}}} }
 function Get-SourceRecordsFromActiveRevision { param([string]$ProjectRoot) return @([pscustomobject]@{Id='fixture'}) }
-function New-RevisionCandidate { param([string]$ProjectRoot,[object[]]$SourceRecords,[string]$WorkingRoot,[int]$ExtractionTimeoutSeconds,[int]$HhTimeoutSeconds) return [pscustomobject]@{IndexRevision=('b'*64);CorpusRevision=('c'*64);ManifestSchemaVersion=3;Manifest=[pscustomobject]@{index_contract='mql5-chm-index-v3-assets-v2';assets=[pscustomobject]@{policy_sha256=('d'*64)}};Inspection=[pscustomobject]@{}} }
+function New-RevisionCandidate { param([string]$ProjectRoot,[object[]]$SourceRecords,[string]$WorkingRoot,[int]$ExtractionTimeoutSeconds,[int]$HhTimeoutSeconds) return [pscustomobject]@{IndexRevision=('b'*64);CorpusRevision=('c'*64);ManifestSchemaVersion=3;Manifest=[pscustomobject]@{index_contract='mql5-chm-index-v3-assets-v3';assets=[pscustomobject]@{policy_sha256=('d'*64)}};Inspection=[pscustomobject]@{}} }
 function Resolve-NodeExecutable { param([string]$ProjectRoot) [IO.File]::AppendAllText((Join-Path $ProjectRoot 'maintenance\update-status.json'),'MUTATED');throw 'determinism gate was bypassed' }
 function Remove-SafeDirectory { param([string]$ConfinementRoot,[string]$Path) }
 '@
@@ -408,6 +408,55 @@ function Remove-SafeDirectory { param([string]$ConfinementRoot,[string]$Path) }
     )
     Assert-RepairFixture -Condition ($probeResult.ExitCode -ne 0 -and $probeResult.Text -match 'Deterministic rebuild failure') -Message "Executed rebuild path did not reject same-input index drift. $($probeResult.Text)"
     Assert-RepairFixture -Condition (($beforeProbe -join "`n") -ceq ($afterProbe -join "`n")) -Message 'Rejected deterministic drift changed protected revision/checksum/report/status/release state.'
+
+    # A retry after the initial pointer was activated must reconcile the
+    # advisory status and managed checksums without rewriting the pointer.
+    $reconciliationRoot = Join-Path $fixtureRoot 'already active reconciliation probe'
+    $reconciliationScripts = Join-Path $reconciliationRoot 'scripts'
+    $reconciliationProject = Join-Path $reconciliationRoot 'project'
+    foreach ($directory in @($reconciliationScripts,$reconciliationProject,(Join-Path $reconciliationProject 'data'),(Join-Path $reconciliationProject 'maintenance'))) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Rebuild-Index.ps1') -Destination (Join-Path $reconciliationScripts 'Rebuild-Index.ps1')
+    $reconciliationMaintenance = @'
+Set-StrictMode -Version Latest
+$ErrorActionPreference='Stop'
+function Resolve-FullPath { param([string]$Path,[switch]$MustExist,[string]$PathType) return [IO.Path]::GetFullPath($Path) }
+function Assert-NoReparsePoint { param([string]$Root,[string]$Path) }
+function Enter-ExclusiveFileLock { param([string]$Path,[string]$IdentityRoot,[int]$TimeoutSeconds) $lease=[pscustomobject]@{};$lease|Add-Member ScriptMethod Dispose {};return $lease }
+function Repair-InterruptedMaintenanceArtifacts { param([string]$ProjectRoot) }
+function Repair-InterruptedRevisionStageInstall { param([string]$ProjectRoot) return [pscustomobject]@{State='none'} }
+function Get-RevisionTransition { param([string]$ProjectRoot,[switch]$AllowMissing) return $null }
+function Assert-MaintenancePackageIntegrity { param([string]$ProjectRoot,[switch]$AllowPendingTransition) return $true }
+function Get-ActiveRevisionPointer { param([string]$ProjectRoot,[switch]$AllowMissing) return [pscustomobject]@{schema_version=2;active_revision=('b'*64)} }
+function Assert-Revision { param([string]$ProjectRoot,[string]$Revision,[string]$IdentityMode,[switch]$RequireCurrent) return [pscustomobject]@{IndexRevision=('b'*64);CorpusRevision=('c'*64)} }
+function Set-ActiveRevisionPointer { param([string]$ProjectRoot,[string]$ActiveRevision,[string]$PreviousRevision,[int]$SchemaVersion) [IO.File]::WriteAllText((Join-Path $ProjectRoot 'maintenance\pointer-set.txt'),'called');throw 'already-active retry rewrote the pointer' }
+function Set-UpdateStatus {
+    param([string]$ProjectRoot,[string]$Status,[string]$ActiveRevision,[string]$ActiveCorpusRevision,[string]$CandidateRevision,[string]$CandidateCorpusRevision,[string]$Message)
+    $capture=[ordered]@{status=$Status;active_revision=$ActiveRevision;active_corpus_revision=$ActiveCorpusRevision;candidate_revision=$CandidateRevision;candidate_corpus_revision=$CandidateCorpusRevision}
+    [IO.File]::WriteAllText((Join-Path $ProjectRoot 'maintenance\reconciliation-status.json'),($capture|ConvertTo-Json -Compress),(New-Object Text.UTF8Encoding($false)))
+}
+function Update-ManagedChecksumsIfPresent { param([string]$ProjectRoot) [IO.File]::WriteAllText((Join-Path $ProjectRoot 'maintenance\checksum-reconciled.txt'),'1') }
+function Remove-SafeDirectory { param([string]$ConfinementRoot,[string]$Path) }
+'@
+    [IO.File]::WriteAllText((Join-Path $reconciliationScripts 'IndexMaintenance.ps1'),$reconciliationMaintenance,(New-Object Text.UTF8Encoding($false)))
+    $reconciliationResult = Invoke-NativeCapture -FilePath (Get-Process -Id $PID).Path -Arguments @(
+        '-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $reconciliationScripts 'Rebuild-Index.ps1'),
+        '-Apply','-Revision',('b'*64),'-ProjectRoot',$reconciliationProject
+    )
+    $statusCapturePath = Join-Path $reconciliationProject 'maintenance\reconciliation-status.json'
+    Assert-RepairFixture -Condition ($reconciliationResult.ExitCode -eq 0) -Message "Already-active rebuild retry failed. $($reconciliationResult.Text)"
+    Assert-RepairFixture -Condition (Test-Path -LiteralPath $statusCapturePath -PathType Leaf) -Message 'Already-active rebuild retry did not reconcile update status.'
+    $statusCapture = Get-Content -LiteralPath $statusCapturePath -Raw | ConvertFrom-Json
+    Assert-RepairFixture -Condition (
+        [string]$statusCapture.status -ceq 'up-to-date' -and
+        [string]$statusCapture.active_revision -ceq ('b'*64) -and
+        [string]$statusCapture.active_corpus_revision -ceq ('c'*64) -and
+        [string]$statusCapture.candidate_revision -ceq ('b'*64) -and
+        [string]$statusCapture.candidate_corpus_revision -ceq ('c'*64)
+    ) -Message 'Already-active rebuild retry wrote incorrect reconciliation status.'
+    Assert-RepairFixture -Condition ((Get-Content -LiteralPath (Join-Path $reconciliationProject 'maintenance\checksum-reconciled.txt') -Raw) -ceq '1') -Message 'Already-active rebuild retry did not reconcile managed checksums exactly once.'
+    Assert-RepairFixture -Condition (-not (Test-Path -LiteralPath (Join-Path $reconciliationProject 'maintenance\pointer-set.txt'))) -Message 'Already-active rebuild retry rewrote the active pointer.'
 } finally {
     if (Test-Path -LiteralPath $fixtureRoot -PathType Container) { Remove-SafeDirectory -ConfinementRoot $tempBase -Path $fixtureRoot }
 }

@@ -12675,7 +12675,7 @@ var load = getLoad(getParse(parseDocument), esm_default);
 var import_iconv_lite = __toESM(require_lib(), 1);
 var import_jpeg_js = __toESM(require_jpeg_js(), 1);
 var SCHEMA_VERSION = 3;
-var INDEX_CONTRACT = "mql5-chm-index-v3-assets-v2";
+var INDEX_CONTRACT = "mql5-chm-index-v3-assets-v3";
 var ASSET_ID_PATTERN = /^(?:mql5|mql5book|neuronetworksbook):asset:[0-9a-f]{24}$/u;
 var DEFAULT_IMAGE_POLICY_RELATIVE_PATH = path.join("config", "mql5-image-policy.json");
 var SOURCE_DEFINITIONS = Object.freeze([
@@ -12753,6 +12753,7 @@ var CODE_CLASS_PATTERN = /(?:^|\s)(?:p_|f_)?(?:code|codeexample|syntax)(?:\s|$)/
 var SEE_ALSO_CLASS_PATTERN = /(?:^|[_\s-])see[_\s-]?also(?:$|[_\s-])/i;
 var INTERNAL_TOPIC_EXTENSION_PATTERN = /\.html?$/i;
 var SOURCE_IDS = Object.freeze(SOURCE_DEFINITIONS.map((definition) => definition.source));
+var TOPIC_ID_PATTERN = /^(?:mql5|mql5book|neuronetworksbook):[0-9a-f]{24}$/u;
 function compareOrdinal(left, right) {
   return left < right ? -1 : left > right ? 1 : 0;
 }
@@ -12784,8 +12785,22 @@ function decodeUriComponentSafely(value) {
     return value;
   }
 }
+function truncateUtf16Safely(value, maximumLength) {
+  const text3 = String(value ?? "");
+  if (text3.length <= maximumLength) return text3;
+  let end2 = maximumLength;
+  const lastIncluded = text3.charCodeAt(end2 - 1);
+  const firstExcluded = text3.charCodeAt(end2);
+  if (lastIncluded >= 55296 && lastIncluded <= 56319 && firstExcluded >= 56320 && firstExcluded <= 57343) {
+    end2 -= 1;
+  }
+  return text3.slice(0, end2);
+}
 function normalizeLinkFragment(value) {
-  return cleanInlineText(decodeUriComponentSafely(String(value ?? ""))).replace(/[\u0000-\u001f\u007f]/gu, "").slice(0, 300);
+  return truncateUtf16Safely(
+    cleanInlineText(decodeUriComponentSafely(String(value ?? ""))).replace(/[\u0000-\u001f\u007f]/gu, ""),
+    300
+  );
 }
 function resolveInternalLink(sourceInternalPath, href) {
   const rawHref = String(href ?? "").trim();
@@ -12815,7 +12830,9 @@ function resolveInternalLink(sourceInternalPath, href) {
   return { targetInternalPath, targetFragment };
 }
 function makeTopicId(source, internalPath) {
+  if (!SOURCE_IDS.includes(source)) throw new Error(`Unknown MQL5 CHM source: ${source}`);
   const normalizedPath = normalizeInternalPath(internalPath).toLowerCase();
+  if (!normalizedPath) throw new Error("Topic internal path must not be empty.");
   const digest = createHash("sha256").update(normalizedPath, "utf8").digest("hex");
   return `${source}:${digest.slice(0, 24)}`;
 }
@@ -12874,8 +12891,11 @@ function resolveInternalAssetPath(sourceInternalPath, reference) {
   return segments.length ? segments.join("/") : null;
 }
 function makeSectionId(topicId, ordinal) {
-  if (!Number.isSafeInteger(ordinal) || ordinal < 0 || ordinal > 999999) {
-    throw new TypeError("Section ordinal must be a non-negative safe integer.");
+  if (typeof topicId !== "string" || !TOPIC_ID_PATTERN.test(topicId)) {
+    throw new TypeError("Section topic ID must be a stable MQL5 CHM topic ID.");
+  }
+  if (!Number.isSafeInteger(ordinal) || ordinal < 0 || ordinal > 999) {
+    throw new TypeError("Section ordinal must be an integer from 0 to 999.");
   }
   return `${topicId}:s${String(ordinal).padStart(3, "0")}`;
 }
@@ -13142,8 +13162,52 @@ function inspectGif(bytes) {
   }
   const width = bytes.readUInt16LE(6);
   const height = bytes.readUInt16LE(8);
-  if (!width || !height || bytes.at(-1) !== 59) throw new Error("Malformed or incomplete GIF image.");
-  return { mimeType: "image/gif", width, height };
+  if (!width || !height) throw new Error("GIF logical dimensions must be non-zero.");
+  let offset = 13;
+  if (bytes[10] & 128) offset += 3 * 2 ** ((bytes[10] & 7) + 1);
+  if (offset > bytes.length) throw new Error("Truncated GIF global color table.");
+  const skipSubBlocks = () => {
+    let totalBytes = 0;
+    while (offset < bytes.length) {
+      const length = bytes[offset++];
+      if (length === 0) return totalBytes;
+      if (offset + length > bytes.length) throw new Error("Truncated GIF data block.");
+      offset += length;
+      totalBytes += length;
+    }
+    throw new Error("Unterminated GIF data block.");
+  };
+  let sawImage = false;
+  while (offset < bytes.length) {
+    const marker = bytes[offset++];
+    if (marker === 59) {
+      if (!sawImage || offset !== bytes.length) throw new Error("Invalid GIF terminator.");
+      return { mimeType: "image/gif", width, height };
+    }
+    if (marker === 33) {
+      if (offset >= bytes.length) throw new Error("Truncated GIF extension.");
+      offset += 1;
+      skipSubBlocks();
+      continue;
+    }
+    if (marker !== 44 || offset + 9 > bytes.length) throw new Error("Invalid GIF block.");
+    const left = bytes.readUInt16LE(offset);
+    const top = bytes.readUInt16LE(offset + 2);
+    const imageWidth = bytes.readUInt16LE(offset + 4);
+    const imageHeight = bytes.readUInt16LE(offset + 6);
+    if (!imageWidth || !imageHeight || left + imageWidth > width || top + imageHeight > height) {
+      throw new Error("GIF image descriptor is outside the logical canvas dimensions.");
+    }
+    const packed = bytes[offset + 8];
+    offset += 9;
+    if (packed & 128) offset += 3 * 2 ** ((packed & 7) + 1);
+    if (offset >= bytes.length) throw new Error("Truncated GIF image data.");
+    const minimumCodeSize = bytes[offset++];
+    if (minimumCodeSize < 2 || minimumCodeSize > 8) throw new Error("Invalid GIF LZW code size.");
+    if (skipSubBlocks() < 1) throw new Error("GIF image data is empty.");
+    sawImage = true;
+  }
+  throw new Error("Incomplete GIF image.");
 }
 function inspectRasterAsset(buffer, internalPath, limits = {}) {
   const bytes = Buffer.from(buffer ?? []);
@@ -13645,7 +13709,7 @@ function extractSignature($, helpRoot, title) {
       declaration = "";
     }
     if (!declaration) continue;
-    if (declaration.length > 800) declaration = `${declaration.slice(0, 797).trimEnd()}...`;
+    if (declaration.length > 800) declaration = `${truncateUtf16Safely(declaration, 797).trimEnd()}...`;
     return declaration;
   }
   return "";
@@ -13676,9 +13740,12 @@ function extractInternalLinks($, helpRoot, sourceInternalPath) {
     const resolved = resolveInternalLink(sourceInternalPath, $(element).attr("href"));
     if (!resolved) return;
     const relationship = linkRelationship($, element, helpRoot);
-    const label = cleanInlineText(
-      $(element).text() || $(element).attr("title") || $(element).find("img[alt]").first().attr("alt") || path.posix.basename(resolved.targetInternalPath, path.posix.extname(resolved.targetInternalPath))
-    ).slice(0, 300);
+    const label = truncateUtf16Safely(
+      cleanInlineText(
+        $(element).text() || $(element).attr("title") || $(element).find("img[alt]").first().attr("alt") || path.posix.basename(resolved.targetInternalPath, path.posix.extname(resolved.targetInternalPath))
+      ),
+      300
+    );
     const key = `${resolved.targetInternalPath.toLowerCase()}\0${resolved.targetFragment}`;
     const existing = links.get(key);
     if (existing) {
@@ -13724,7 +13791,8 @@ function splitSections(content, headingPositions, fallbackTitle = "Overview") {
   }).filter((section) => section.content.length > 0).map((section, ordinal) => ({ ...section, ordinal }));
 }
 function normalizeCaptionComponent(value, maximumLength = 500) {
-  return String(value ?? "").normalize("NFKC").replace(/[\u0000-\u001f\u007f-\u009f]/gu, " ").replace(/[\u00a0\u2007\u202f]/gu, " ").replace(/[\u200b\u2060\ufeff]/gu, "").replace(/\s+/gu, " ").trim().slice(0, maximumLength);
+  const normalized = String(value ?? "").normalize("NFKC").replace(/[\u0000-\u001f\u007f-\u009f]/gu, " ").replace(/[\u00a0\u2007\u202f]/gu, " ").replace(/[\u200b\u2060\ufeff]/gu, "").replace(/\s+/gu, " ").trim();
+  return truncateUtf16Safely(normalized, maximumLength);
 }
 function isMeaningfulCaption(value, meaninglessCaptions) {
   const text3 = normalizeCaptionComponent(value);
@@ -13947,7 +14015,7 @@ async function assertPreparedOutputDirectory(outputDirectory, sourceFilenames) {
   } catch (error) {
     throw new Error(`Output directory has an unreadable ownership manifest: ${error.message}`);
   }
-  if (Number(manifest?.schema_version) !== SCHEMA_VERSION || !["mql5-chm-index-v3-assets-v1", INDEX_CONTRACT].includes(manifest?.index_contract) || manifest?.database?.filename !== "mql5-docs.sqlite" || manifest?.assets?.directory !== "assets") {
+  if (Number(manifest?.schema_version) !== SCHEMA_VERSION || !["mql5-chm-index-v3-assets-v1", "mql5-chm-index-v3-assets-v2", INDEX_CONTRACT].includes(manifest?.index_contract) || manifest?.database?.filename !== "mql5-docs.sqlite" || manifest?.assets?.directory !== "assets") {
     throw new Error("Output directory manifest does not identify a compatible owned index build.");
   }
   const databaseInfo = await stat(databasePath);
@@ -14367,7 +14435,9 @@ function validateDatabase(database, {
     FROM topic_assets AS occurrences
     JOIN topics ON topics.topic_id = occurrences.topic_id
     JOIN sections ON sections.section_id = occurrences.section_id
+    JOIN assets ON assets.asset_id = occurrences.asset_id
     WHERE sections.topic_id <> occurrences.topic_id
+      OR assets.source <> topics.source
       OR occurrences.text_offset > topics.content_length
       OR occurrences.text_offset < sections.start_offset
       OR occurrences.text_offset > sections.end_offset
@@ -15463,11 +15533,23 @@ async function publishIndexBuildTransaction({
 }
 function requireIsoTimestamp(value, label) {
   const text3 = String(value ?? "");
+  const components = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-](\d{2}):(\d{2}))$/u.exec(text3);
   const parsed = Date.parse(text3);
-  if (!text3 || text3.length > 64 || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u.test(text3) || Number.isNaN(parsed)) {
+  const canonical = Number.isNaN(parsed) ? "" : new Date(parsed).toISOString();
+  const year = Number(components?.[1]);
+  const month = Number(components?.[2]);
+  const day = Number(components?.[3]);
+  const hour = Number(components?.[4]);
+  const minute = Number(components?.[5]);
+  const second = Number(components?.[6]);
+  const offsetHour = components?.[7] === void 0 ? 0 : Number(components[7]);
+  const offsetMinute = components?.[8] === void 0 ? 0 : Number(components[8]);
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1] ?? 0;
+  if (!text3 || text3.length > 64 || !components || Number.isNaN(parsed) || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/u.test(canonical) || month < 1 || month > 12 || day < 1 || day > daysInMonth || hour > 23 || minute > 59 || second > 59 || offsetHour > 23 || offsetMinute > 59) {
     throw new Error(`${label} must be an ISO-8601 timestamp with an explicit timezone.`);
   }
-  return new Date(parsed).toISOString();
+  return canonical;
 }
 function optionalBoundedString(value, label, maximumLength = 1e3) {
   if (value === null || value === void 0 || value === "") return null;

@@ -261,7 +261,7 @@ function New-ArchivePathCollisionFixture {
 try {
     $metadataProbe = Invoke-NativeCapture -FilePath $nodeFixtureSource -Arguments @(
         '-e',
-        "const fs=require('node:fs'),p=require('node:path'),r=process.argv[1],a=JSON.parse(fs.readFileSync(p.join(r,'package.json'),'utf8')),b=JSON.parse(fs.readFileSync(p.join(r,'package-lock.json'),'utf8')),c=b.packages[''];if(a.version!=='1.2.4'||b.version!=='1.2.4'||c.version!=='1.2.4'||a.engines.node!=='24.17.0'||c.engines.node!=='24.17.0')process.exit(2)",
+        "const fs=require('node:fs'),p=require('node:path'),r=process.argv[1],a=JSON.parse(fs.readFileSync(p.join(r,'package.json'),'utf8')),b=JSON.parse(fs.readFileSync(p.join(r,'package-lock.json'),'utf8')),c=b.packages[''];if(!a.version||a.version!==b.version||a.version!==c.version||a.engines.node!=='24.17.0'||c.engines.node!=='24.17.0')process.exit(2)",
         $projectRoot
     )
     Assert-Test ($metadataProbe.ExitCode -eq 0) 'Package version or exact Node engine metadata is inconsistent.'
@@ -331,6 +331,49 @@ try {
     }
     Assert-Test $true 'Reparse-point validation could not recover a provider-null existing path.'
 
+    $sharedOutputRoot = Join-Path $testRoot 'shared-package-output'
+    New-Item -ItemType Directory -Path $sharedOutputRoot | Out-Null
+    $outputMutexLease = $null
+    $outputMutexProbe = Join-Path $testRoot 'probe-output-mutex.ps1'
+    [IO.File]::WriteAllText($outputMutexProbe, @'
+param([string]$CommonPath,[string]$ReleaseRoot,[string]$ReleaseName)
+$ErrorActionPreference='Stop'
+. $CommonPath
+$lease=$null
+try {
+    $lease=Enter-PackageOutputMutex -ReleaseRoot $ReleaseRoot -ReleaseName $ReleaseName -TimeoutSeconds 1
+    exit 42
+} catch {
+    if($_.Exception.Message -like 'Timed out waiting for the package output mutex*'){exit 0}
+    [Console]::Error.WriteLine($_.Exception.Message)
+    exit 41
+} finally {
+    if($null -ne $lease){$lease.Dispose()}
+}
+'@, $utf8)
+    try {
+        $outputMutexLease = Enter-PackageOutputMutex -ReleaseRoot $sharedOutputRoot -ReleaseName 'shared-release' -TimeoutSeconds 5
+        Assert-Test ([string]$outputMutexLease.Name -like 'Global\Mql5ChmMcp-Package-*') 'Package output lock was not created in the machine-global namespace.'
+        $outputMutexResult = Invoke-NativeCapture -FilePath (Get-Process -Id $PID).Path -Arguments @(
+            '-NoProfile','-ExecutionPolicy','Bypass','-File',$outputMutexProbe,
+            (Join-Path $PSScriptRoot 'Common.ps1'),$sharedOutputRoot,'different-release'
+        )
+        Assert-Test ($outputMutexResult.ExitCode -eq 0) "Two package callers independently acquired the same output root. $($outputMutexResult.Text)"
+    } finally {
+        if($null -ne $outputMutexLease){$outputMutexLease.Dispose()}
+    }
+    $packageSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Package-Portable.ps1') -Raw
+    $projectMutexIndex = $packageSource.IndexOf('$updateLock = Enter-ExclusiveFileLock',[StringComparison]::Ordinal)
+    $releaseRootCreationIndex = $packageSource.IndexOf('[IO.Directory]::CreateDirectory($releaseRoot)',[StringComparison]::Ordinal)
+    $outputMutexIndex = $packageSource.IndexOf('$outputLock = Enter-PackageOutputMutex',[StringComparison]::Ordinal)
+    $outputRecoveryIndex = if ($outputMutexIndex -lt 0) { -1 } else { $packageSource.IndexOf('Repair-PackageZipPublicationContext',$outputMutexIndex,[StringComparison]::Ordinal) }
+    Assert-Test (
+        $projectMutexIndex -ge 0 -and
+        $releaseRootCreationIndex -gt $projectMutexIndex -and
+        $outputMutexIndex -gt $releaseRootCreationIndex -and
+        $outputRecoveryIndex -gt $outputMutexIndex
+    ) 'Portable packaging does not acquire the project lock, safely create the release root, and acquire the output lock before recovery.'
+
     $cleanupLockRoot = Join-Path $testRoot 'cleanup-lock-disposal'
     $cleanupBuildRoot = Join-Path $cleanupLockRoot 'build'
     $cleanupCandidateRoot = Join-Path $cleanupBuildRoot 'candidate'
@@ -341,17 +384,22 @@ try {
     $cleanupLockPath = Join-Path $cleanupMaintenanceRoot '.update.lock'
     [IO.File]::WriteAllBytes($cleanupLockPath, (New-Object byte[] 0))
     $cleanupLease = Enter-ExclusiveFileLock -Path $cleanupLockPath -IdentityRoot $cleanupLockRoot -TimeoutSeconds 5
+    $cleanupOutputRoot = Join-Path $cleanupLockRoot 'release'
+    New-Item -ItemType Directory -Path $cleanupOutputRoot | Out-Null
+    $cleanupOutputLease = Enter-PackageOutputMutex -ReleaseRoot $cleanupOutputRoot -ReleaseName 'cleanup-release' -TimeoutSeconds 5
     $cleanupFailure = $null
     $cleanupProbeScript = Join-Path $cleanupLockRoot 'acquire-after-cleanup.ps1'
     [IO.File]::WriteAllText($cleanupProbeScript, @'
-param([string]$CommonPath,[string]$ProjectRoot,[string]$LockPath)
+param([string]$CommonPath,[string]$ProjectRoot,[string]$LockPath,[string]$ReleaseRoot,[string]$ReleaseName)
 $ErrorActionPreference='Stop'
 . $CommonPath
-$lease=$null
+$lease=$null;$outputLease=$null
 try {
     $lease=Enter-ExclusiveFileLock -Path $LockPath -IdentityRoot $ProjectRoot -TimeoutSeconds 2
-    Write-Output 'second-process-acquired'
+    $outputLease=Enter-PackageOutputMutex -ReleaseRoot $ReleaseRoot -ReleaseName $ReleaseName -TimeoutSeconds 2
+    Write-Output 'second-process-acquired-both'
 } finally {
+    if($null -ne $outputLease){$outputLease.Dispose()}
     if($null -ne $lease){$lease.Dispose()}
 }
 '@, $utf8)
@@ -361,6 +409,7 @@ try {
                 -ProjectRoot $cleanupLockRoot `
                 -CandidateBuildRoot $cleanupCandidateRoot `
                 -UpdateLock $cleanupLease `
+                -OutputLock $cleanupOutputLease `
                 -InternalTestHooks @{
                     RemoveCandidateBuildRoot = {
                         param([string]$ConfinementRoot,[string]$Path)
@@ -376,11 +425,14 @@ try {
             '-File',$cleanupProbeScript,
             (Join-Path $PSScriptRoot 'Common.ps1'),
             $cleanupLockRoot,
-            $cleanupLockPath
+            $cleanupLockPath,
+            $cleanupOutputRoot,
+            'cleanup-release'
         )
         Assert-Test ([string]$cleanupFailure -match 'injected candidate cleanup failure') 'Package final cleanup did not surface the injected candidate cleanup failure.'
-        Assert-Test ($cleanupProbe.ExitCode -eq 0 -and $cleanupProbe.Text -match 'second-process-acquired') "Package final cleanup retained the maintenance lock after cleanup failed. $($cleanupProbe.Text)"
+        Assert-Test ($cleanupProbe.ExitCode -eq 0 -and $cleanupProbe.Text -match 'second-process-acquired-both') "Package final cleanup retained a project or output lock after cleanup failed. $($cleanupProbe.Text)"
     } finally {
+        try { $cleanupOutputLease.Dispose() } catch {}
         try { $cleanupLease.Dispose() } catch {}
     }
 

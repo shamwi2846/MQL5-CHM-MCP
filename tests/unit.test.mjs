@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -41,6 +42,12 @@ test("stable IDs reject traversal and remain deterministic", () => {
   assert.equal(first, second);
   assert.match(first, /^mql5:[0-9a-f]{24}$/);
   assert.equal(makeSectionId(first, 2), `${first}:s002`);
+  assert.equal(makeSectionId(first, 999), `${first}:s999`);
+  assert.throws(() => makeTopicId("unknown", "ordersend.htm"), /source/i);
+  assert.throws(() => makeTopicId("mql5", ""), /path/i);
+  assert.throws(() => makeTopicId("mql5", null), /path/i);
+  assert.throws(() => makeSectionId("not-a-topic-id", 0), /topic/i);
+  assert.throws(() => makeSectionId(first, 1_000), /ordinal/i);
 });
 
 test("HTML parsing keeps code layout, signature, breadcrumbs, and sections", () => {
@@ -65,13 +72,36 @@ test("FTS input is tokenized instead of accepting raw syntax", () => {
   assert.ok(makeSnippet("x".repeat(2_000), "x", 500).length <= 500);
 });
 
+test("snippets preserve complete UTF-16 surrogate pairs at truncation edges", () => {
+  const unpairedSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u;
+  const trailingBoundary = makeSnippet(`${"A".repeat(498)}😀${"B".repeat(20)}`, "not-present", 500);
+  const leadingBoundary = makeSnippet(`${"A".repeat(100)}😀${"B".repeat(138)}needle${"C".repeat(600)}`, "needle", 500);
+
+  assert.ok(trailingBoundary.length <= 500);
+  assert.ok(leadingBoundary.length <= 500);
+  assert.doesNotMatch(trailingBoundary, unpairedSurrogate);
+  assert.doesNotMatch(leadingBoundary, unpairedSurrogate);
+});
+
 test("opaque cursors round-trip and reject tampering", () => {
   const topicId = "mql5:0123456789abcdef01234567";
   const indexRevision = "a".repeat(64);
   const cursor = encodeCursor({ indexRevision, topicId, offset: 500 });
   assert.deepEqual(decodeCursor(cursor), { indexRevision, topicId, sectionId: null, offset: 500 });
-  assert.throws(() => decodeCursor(`${cursor.slice(0, -1)}0`), /cursor/i);
+  const replacementNibble = cursor.endsWith("0") ? "1" : "0";
+  assert.throws(() => decodeCursor(`${cursor.slice(0, -1)}${replacementNibble}`), /cursor/i);
   assert.throws(() => encodeCursor({ topicId, offset: 500 }), /cursor/i);
+
+  const unkeyedBody = Buffer.from(
+    JSON.stringify({ v: 2, i: indexRevision, t: topicId, s: null, o: 0 }),
+    "utf8",
+  ).toString("base64url");
+  const unkeyedTag = createHash("sha256")
+    .update("mql5-chm-read-cursor-v2\0")
+    .update(unkeyedBody)
+    .digest("hex")
+    .slice(0, 24);
+  assert.throws(() => decodeCursor(`${unkeyedBody}.${unkeyedTag}`), /cursor/i);
 
   const legacyBody = Buffer.from(JSON.stringify({ v: 1, t: topicId, s: null, o: 500 }), "utf8").toString("base64url");
   const legacyTag = createHash("sha256")
@@ -80,6 +110,46 @@ test("opaque cursors round-trip and reject tampering", () => {
     .digest("hex")
     .slice(0, 24);
   assert.throws(() => decodeCursor(`${legacyBody}.${legacyTag}`), /cursor/i);
+});
+
+test("cursor decoders reject correctly signed payloads with unknown keys", { concurrency: false }, async () => {
+  const require = createRequire(import.meta.url);
+  const cryptoCjs = require("node:crypto");
+  const originalRandomBytes = cryptoCjs.randomBytes;
+  const key = Buffer.alloc(32, 0x5a);
+  let isolated;
+  try {
+    cryptoCjs.randomBytes = (size) => {
+      assert.equal(size, 32);
+      return Buffer.from(key);
+    };
+    syncBuiltinESMExports();
+    const moduleUrl = new URL("../src/search-service.mjs", import.meta.url);
+    moduleUrl.searchParams.set("cursor-exactness-test", String(Date.now()));
+    isolated = await import(moduleUrl.href);
+  } finally {
+    cryptoCjs.randomBytes = originalRandomBytes;
+    syncBuiltinESMExports();
+  }
+
+  const revision = "a".repeat(64);
+  const topicId = "mql5:0123456789abcdef01234567";
+  const sign = (payload, domain) => {
+    const body = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+    const tag = createHmac("sha256", key).update(domain).update(body).digest("hex").slice(0, 24);
+    return `${body}.${tag}`;
+  };
+  const textCursor = sign(
+    { v: 2, i: revision, t: topicId, s: null, o: 0, unexpected: true },
+    "mql5-chm-read-cursor-v2\0",
+  );
+  const imageCursor = sign(
+    { v: 1, i: revision, t: topicId, s: null, o: 0, unexpected: true },
+    "mql5-chm-image-cursor-v1\0",
+  );
+
+  assert.throws(() => isolated.decodeCursor(textCursor), (error) => error?.code === "INVALID_CURSOR");
+  assert.throws(() => isolated.decodeImageCursor(imageCursor), (error) => error?.code === "INVALID_IMAGE_CURSOR");
 });
 
 test("text continuation preserves supplementary Unicode at UTF-16 boundaries", () => {
@@ -192,6 +262,16 @@ test("malformed optional update status never disables MCP status", () => {
       "{",
       JSON.stringify({ schema_version: 1, unexpected: true }),
       JSON.stringify({ schema_version: 99 }),
+      JSON.stringify({
+        schema_version: 2,
+        checked_at: "2026-02-31T00:00:00Z",
+        status: "up-to-date",
+        active_revision: "c".repeat(64),
+        active_corpus_revision: revision,
+        candidate_revision: null,
+        candidate_corpus_revision: null,
+        message: "No documentation update is available.",
+      }),
     ]) {
       writeFileSync(join(maintenance, "update-status.json"), invalid, "utf8");
       assert.equal(service.status().update_check, null);

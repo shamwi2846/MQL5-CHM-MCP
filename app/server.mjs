@@ -33114,7 +33114,7 @@ import { fileURLToPath as fileURLToPath2 } from "node:url";
 import { resolve as resolve2 } from "node:path";
 
 // src/search-service.mjs
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import {
   closeSync,
   createReadStream,
@@ -33168,14 +33168,21 @@ var DATABASE_FILENAME = "mql5-docs.sqlite";
 var LEGACY_SCHEMA_VERSION = 2;
 var IMAGE_SCHEMA_VERSION = 3;
 var LEGACY_INDEX_CONTRACT = "mql5-chm-index-v3-assets-v1";
-var SUPPORTED_INDEX_CONTRACT = "mql5-chm-index-v3-assets-v2";
-var ACCEPTED_INDEX_CONTRACTS = /* @__PURE__ */ new Set([LEGACY_INDEX_CONTRACT, SUPPORTED_INDEX_CONTRACT]);
+var PREVIOUS_INDEX_CONTRACT = "mql5-chm-index-v3-assets-v2";
+var SUPPORTED_INDEX_CONTRACT = "mql5-chm-index-v3-assets-v3";
+var ACCEPTED_INDEX_CONTRACTS = /* @__PURE__ */ new Set([
+  LEGACY_INDEX_CONTRACT,
+  PREVIOUS_INDEX_CONTRACT,
+  SUPPORTED_INDEX_CONTRACT
+]);
 var CURSOR_DOMAIN = "mql5-chm-read-cursor-v2\0";
 var IMAGE_CURSOR_DOMAIN = "mql5-chm-image-cursor-v1\0";
+var CURSOR_HMAC_KEY = randomBytes(32);
 var TOPIC_ID_PATTERN = /^(mql5|mql5book|neuronetworksbook):[0-9a-f]{24}$/;
 var SECTION_ID_PATTERN = /^(mql5|mql5book|neuronetworksbook):[0-9a-f]{24}:s\d{3}$/;
 var ASSET_ID_PATTERN = /^(mql5|mql5book|neuronetworksbook):asset:[0-9a-f]{24}$/;
 var ASSET_STORAGE_PATTERN = /^assets\/(mql5|mql5book|neuronetworksbook)\/([0-9a-f]{64})\.bin$/;
+var EXPECTED_FTS_SCHEMA = "create virtual table search_fts using fts5(topic_id unindexed,section_id unindexed,source unindexed,title,aliases,heading,breadcrumb,body,tokenize='unicode61 remove_diacritics 2',prefix='2 3 4')";
 var MAX_IMAGE_BYTES = 2 * 1024 * 1024;
 var MAX_IMAGE_DIMENSION = 4096;
 var MAX_IMAGE_PIXELS = 4194304;
@@ -33206,6 +33213,19 @@ var SOURCES = Object.freeze({
 });
 var SOURCE_NAMES = Object.freeze(Object.keys(SOURCES));
 var SEARCH_SOURCES = Object.freeze(["all", ...SOURCE_NAMES]);
+var SEARCH_INPUT_KEYS = /* @__PURE__ */ new Set(["query", "source", "limit", "expand", "require_current"]);
+var READ_INPUT_KEYS = /* @__PURE__ */ new Set([
+  "topic_id",
+  "section_id",
+  "focus",
+  "cursor",
+  "max_chars",
+  "include_related",
+  "related_limit",
+  "include_images",
+  "image_limit",
+  "image_cursor"
+]);
 var SEARCH_STOPWORDS = /* @__PURE__ */ new Set([
   "a",
   "an",
@@ -33322,7 +33342,7 @@ var TOPIC_ASSET_COLUMNS = Object.freeze([
   "caption_source"
 ]);
 var REVISION_PATTERN = /^[0-9a-f]{64}$/;
-var ISO_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+var ISO_TIMESTAMP_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z$/;
 var MATCH_KINDS = Object.freeze(["exact", "fts", "expanded", "fuzzy"]);
 var UPDATE_STATUSES = Object.freeze(["up-to-date", "different-revision-available", "check-unavailable"]);
 var EXPANSION_RANK_WEIGHT = 0.35;
@@ -33346,6 +33366,33 @@ function hasInvalidTopicContentRows(rows) {
 }
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function rejectUnknownInputKeys(input, allowedKeys, label) {
+  const unknownKey = Object.keys(input).find((key) => !allowedKeys.has(key));
+  if (unknownKey !== void 0) {
+    fail("INVALID_ARGUMENT", `${label} contains an unknown argument: ${unknownKey}.`);
+  }
+}
+function normalizeStoredTopicPath(value) {
+  if (typeof value !== "string") return null;
+  let candidate = value.replaceAll("\\", "/").trim();
+  candidate = candidate.replace(/^mk:@msitstore:[^:]+::\//i, "");
+  candidate = candidate.replace(/^\/+/, "");
+  candidate = candidate.split("#", 1)[0].split("?", 1)[0];
+  try {
+    candidate = decodeURIComponent(candidate);
+  } catch {
+  }
+  const segments = candidate.split("/").filter((segment) => segment && segment !== ".");
+  if (segments.some((segment) => segment === "..")) return null;
+  return segments.join("/");
+}
+function expectedTopicId(source, internalPath) {
+  const normalizedPath = normalizeStoredTopicPath(internalPath);
+  const extension = normalizedPath ? extname(normalizedPath).toLowerCase() : "";
+  if (!SOURCE_NAMES.includes(source) || !normalizedPath || normalizedPath !== internalPath || ![".htm", ".html"].includes(extension)) return null;
+  const digest = createHash("sha256").update(normalizedPath.toLowerCase(), "utf8").digest("hex");
+  return `${source}:${digest.slice(0, 24)}`;
 }
 function requireString(value, label, pattern) {
   if (typeof value !== "string" || value.length === 0 || pattern && !pattern.test(value)) {
@@ -33412,6 +33459,9 @@ function resolveProjectRoot({ root, env = process.env } = {}) {
 }
 function normalizeText(value) {
   return String(value ?? "").normalize("NFKD").toLowerCase().replace(new RegExp("\\p{M}", "gu"), "").replace(/[^\p{L}\p{N}_]+/gu, " ").trim().replace(/\s+/g, " ");
+}
+function compareOrdinal(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 function ftsTokens(value, maximum = 16) {
   const tokens = normalizeText(value).match(/[\p{L}\p{N}_]+/gu) ?? [];
@@ -33495,10 +33545,10 @@ function makeSnippet(content, query, maximum = 500) {
   let start = matchAt < 0 ? 0 : Math.max(0, matchAt - contextBefore);
   let end = Math.min(text.length, start + maximum);
   if (end === text.length) start = Math.max(0, end - maximum);
-  let snippet = text.slice(start, end);
-  if (start > 0) snippet = `\u2026${snippet.slice(1)}`;
-  if (end < text.length) snippet = `${snippet.slice(0, -1)}\u2026`;
-  return snippet.slice(0, maximum);
+  const snippetCodePoints = Array.from(text.slice(start, end));
+  if (start > 0 && snippetCodePoints.length > 0) snippetCodePoints[0] = "\u2026";
+  if (end < text.length && snippetCodePoints.length > 0) snippetCodePoints[snippetCodePoints.length - 1] = "\u2026";
+  return snippetCodePoints.join("");
 }
 async function sha256File(pathname) {
   return await new Promise((resolveHash, rejectHash) => {
@@ -33536,7 +33586,10 @@ function requireExactKeys(value, expected, label, code) {
   }
 }
 function requireIsoTimestamp(value, label, code = "INVALID_MANIFEST") {
-  if (typeof value !== "string" || !ISO_TIMESTAMP_PATTERN.test(value) || !Number.isFinite(Date.parse(value))) {
+  const match = typeof value === "string" ? ISO_TIMESTAMP_PATTERN.exec(value) : null;
+  const timestamp = match ? Date.parse(value) : Number.NaN;
+  const parsed = Number.isFinite(timestamp) ? new Date(timestamp) : null;
+  if (!match || !parsed || parsed.getUTCFullYear() !== Number(match[1]) || parsed.getUTCMonth() + 1 !== Number(match[2]) || parsed.getUTCDate() !== Number(match[3]) || parsed.getUTCHours() !== Number(match[4]) || parsed.getUTCMinutes() !== Number(match[5]) || parsed.getUTCSeconds() !== Number(match[6])) {
     fail(code, `${label} is invalid.`);
   }
   return value;
@@ -33884,12 +33937,15 @@ function inspectGif(buffer) {
   const height = buffer.readUInt16LE(8);
   let offset = 13;
   if (buffer[10] & 128) offset += 3 * 2 ** ((buffer[10] & 7) + 1);
+  if (offset > buffer.length) throw new Error("Truncated GIF global color table.");
   const skipSubBlocks = () => {
+    let totalBytes = 0;
     while (offset < buffer.length) {
       const length = buffer[offset++];
-      if (length === 0) return;
+      if (length === 0) return totalBytes;
       if (offset + length > buffer.length) throw new Error("Truncated GIF data block.");
       offset += length;
+      totalBytes += length;
     }
     throw new Error("Unterminated GIF data block.");
   };
@@ -33907,22 +33963,33 @@ function inspectGif(buffer) {
       continue;
     }
     if (marker !== 44 || offset + 9 > buffer.length) throw new Error("Invalid GIF block.");
+    const left = buffer.readUInt16LE(offset);
+    const top = buffer.readUInt16LE(offset + 2);
+    const imageWidth = buffer.readUInt16LE(offset + 4);
+    const imageHeight = buffer.readUInt16LE(offset + 6);
+    if (!imageWidth || !imageHeight || left + imageWidth > width || top + imageHeight > height) {
+      throw new Error("GIF image descriptor is outside the logical canvas bounds.");
+    }
     const packed = buffer[offset + 8];
     offset += 9;
     if (packed & 128) offset += 3 * 2 ** ((packed & 7) + 1);
     if (offset >= buffer.length) throw new Error("Truncated GIF image data.");
-    offset += 1;
-    skipSubBlocks();
+    const minimumCodeSize = buffer[offset++];
+    if (minimumCodeSize < 2 || minimumCodeSize > 8) throw new Error("Invalid GIF LZW code size.");
+    if (skipSubBlocks() < 1) throw new Error("GIF image data is empty.");
     sawImage = true;
   }
   throw new Error("Incomplete GIF.");
 }
 function inspectRasterImage(buffer) {
   if (!Buffer.isBuffer(buffer) || buffer.length < 4) throw new Error("Raster data is invalid.");
-  if (buffer[0] === 137 && buffer[1] === 80) return inspectPng(buffer);
-  if (buffer[0] === 255 && buffer[1] === 216) return inspectJpeg(buffer);
-  if (buffer[0] === 71 && buffer[1] === 73 && buffer[2] === 70) return inspectGif(buffer);
-  throw new Error("Unsupported raster signature.");
+  let inspected;
+  if (buffer[0] === 137 && buffer[1] === 80) inspected = inspectPng(buffer);
+  else if (buffer[0] === 255 && buffer[1] === 216) inspected = inspectJpeg(buffer);
+  else if (buffer[0] === 71 && buffer[1] === 73 && buffer[2] === 70) inspected = inspectGif(buffer);
+  else throw new Error("Unsupported raster signature.");
+  assertRasterBounds(buffer.length, inspected.width, inspected.height);
+  return inspected;
 }
 function inspectCatalogRasterImage(buffer, row, fullSha256) {
   try {
@@ -34076,7 +34143,7 @@ function verifyAssetCatalog(database, manifest, packageInfo) {
     "SELECT COUNT(*) AS count FROM topic_assets ta JOIN assets a ON a.asset_id=ta.asset_id WHERE a.exposure='exposed'"
   ).get().count;
   const invalidOccurrences = database.prepare(
-    "SELECT COUNT(*) AS count FROM topic_assets ta LEFT JOIN topics t ON t.topic_id=ta.topic_id LEFT JOIN assets a ON a.asset_id=ta.asset_id LEFT JOIN sections s ON s.section_id=ta.section_id AND s.topic_id=ta.topic_id WHERE t.topic_id IS NULL OR a.asset_id IS NULL OR ta.occurrence_ordinal < 0 OR ta.text_offset < 0 OR ta.text_offset > t.content_length OR ta.section_id IS NULL OR s.section_id IS NULL OR length(ta.figcaption_text)>500 OR length(ta.title_text)>500 OR length(ta.alt_text)>500 OR length(ta.nearby_text)>500 OR length(ta.contextual_caption)>500 OR length(ta.caption_source)>500"
+    "SELECT COUNT(*) AS count FROM topic_assets ta LEFT JOIN topics t ON t.topic_id=ta.topic_id LEFT JOIN assets a ON a.asset_id=ta.asset_id LEFT JOIN sections s ON s.section_id=ta.section_id AND s.topic_id=ta.topic_id WHERE t.topic_id IS NULL OR a.asset_id IS NULL OR a.source <> t.source OR ta.occurrence_ordinal < 0 OR ta.text_offset < 0 OR ta.text_offset > t.content_length OR ta.section_id IS NULL OR s.section_id IS NULL OR ta.text_offset < s.start_offset OR ta.text_offset > s.end_offset OR length(ta.figcaption_text)>500 OR length(ta.title_text)>500 OR length(ta.alt_text)>500 OR length(ta.nearby_text)>500 OR length(ta.contextual_caption)>500 OR length(ta.caption_source)>500"
   ).get().count;
   const occurrenceTextRows = database.prepare(
     "SELECT figcaption_text, title_text, alt_text, nearby_text, contextual_caption, caption_source FROM topic_assets"
@@ -34120,9 +34187,9 @@ function verifyDatabase(database, manifest, packageInfo) {
       verifyColumns(database, table, columns);
     }
   }
-  const ftsSql = String(byName.get("search_fts")?.sql ?? "").toLowerCase();
-  if (!ftsSql.includes("virtual table") || !ftsSql.includes("using fts5")) {
-    fail("INVALID_INDEX", "The search index is not an FTS5 table.");
+  const ftsSql = String(byName.get("search_fts")?.sql ?? "").toLowerCase().replace(/\s+/gu, " ").replace(/\s*([(),=])\s*/gu, "$1").trim();
+  if (ftsSql !== EXPECTED_FTS_SCHEMA) {
+    fail("INVALID_INDEX", "The search index schema is invalid.");
   }
   const metadataRows = database.prepare("SELECT key, value FROM metadata").all();
   const metadata = Object.fromEntries(metadataRows.map((row) => [row.key, row.value]));
@@ -34165,6 +34232,10 @@ function verifyDatabase(database, manifest, packageInfo) {
     fail("INVALID_INDEX", "The legacy database timestamp does not match the package manifest.");
   }
   if (manifest.schema_version === IMAGE_SCHEMA_VERSION && (metadata.index_contract !== manifest.index_contract || metadata.image_policy_sha256 !== manifest.assets.policy_sha256 || metadata.asset_catalog_sha256 !== manifest.assets.catalog_sha256 || metadata.asset_tree_sha256 !== manifest.assets.tree_sha256 || metadata.asset_count !== String(manifest.assets.cataloged_count) || metadata.exposed_asset_count !== String(manifest.assets.exposed_count) || metadata.excluded_asset_count !== String(manifest.assets.excluded_count) || metadata.topic_asset_count !== String(manifest.assets.occurrence_count) || metadata.exposed_topic_asset_count !== String(manifest.assets.exposed_occurrence_count) || metadata.asset_total_bytes !== String(manifest.assets.total_bytes))) fail("INVALID_INDEX", "The schema-3 database metadata does not match the package manifest.");
+  const foreignKeyFailures = database.prepare("PRAGMA foreign_key_check").all();
+  if (foreignKeyFailures.length !== 0) {
+    fail("INVALID_INDEX", "The documentation database failed its foreign-key check.");
+  }
   const total = database.prepare("SELECT COUNT(*) AS count FROM topics").get().count;
   if (total !== manifest.total_topic_count) {
     fail("INVALID_INDEX", "The documentation database has an unexpected topic count.");
@@ -34185,20 +34256,118 @@ function verifyDatabase(database, manifest, packageInfo) {
     if (actualCount !== declared.topic_count) {
       fail("INVALID_INDEX", `The ${row.source} database topic count is invalid.`);
     }
+    const actualSectionCount = database.prepare(
+      "SELECT COUNT(*) AS count FROM sections s JOIN topics t ON t.topic_id=s.topic_id WHERE t.source=?"
+    ).get(row.source).count;
+    if (actualSectionCount !== declared.section_count) {
+      fail("INVALID_INDEX", `The ${row.source} database section count is invalid.`);
+    }
   }
-  const invalidTopics = hasInvalidTopicContentRows(
-    database.prepare("SELECT content, content_length, content_sha256 FROM topics").all()
+  const topicRows = database.prepare(
+    "SELECT topic_id, source, internal_path, title, normalized_title, breadcrumb, signature, content, content_length, content_sha256 FROM topics"
+  ).all();
+  const invalidTopics = hasInvalidTopicContentRows(topicRows) || topicRows.some((row) => {
+    const expectedId = expectedTopicId(row.source, row.internal_path);
+    const expectedContentHash = createHash("sha256").update(row.content, "utf8").digest("hex");
+    return expectedId === null || !TOPIC_ID_PATTERN.test(row.topic_id) || row.topic_id !== expectedId || typeof row.title !== "string" || row.title.length === 0 || typeof row.normalized_title !== "string" || row.normalized_title !== normalizeText(row.title) || typeof row.breadcrumb !== "string" || typeof row.signature !== "string" || row.content_sha256 !== expectedContentHash;
+  });
+  const topicById = new Map(topicRows.map((row) => [row.topic_id, row]));
+  const topicByPath = new Map(
+    topicRows.map((row) => [`${row.source}\0${row.internal_path.toLowerCase()}`, row.topic_id])
   );
-  const invalidSections = database.prepare(
-    "SELECT COUNT(*) AS count FROM sections s LEFT JOIN topics t ON t.topic_id=s.topic_id WHERE t.topic_id IS NULL OR s.start_offset < 0 OR s.end_offset < s.start_offset OR s.end_offset > t.content_length"
-  ).get().count;
-  const orphanAliases = database.prepare("SELECT COUNT(*) AS count FROM aliases a LEFT JOIN topics t ON t.topic_id=a.topic_id WHERE t.topic_id IS NULL").get().count;
-  const ftsRows = database.prepare("SELECT COUNT(*) AS count FROM search_fts").get().count;
-  const linkRows = database.prepare("SELECT COUNT(*) AS count FROM topic_links").get().count;
-  const invalidLinks = database.prepare(
-    "SELECT COUNT(*) AS count FROM topic_links l LEFT JOIN topics s ON s.topic_id=l.source_topic_id LEFT JOIN topics t ON t.topic_id=l.target_topic_id WHERE s.topic_id IS NULL OR l.relationship NOT IN ('inline','see-also') OR l.resolution_status NOT IN ('resolved','unresolved') OR (l.resolution_status='resolved' AND t.topic_id IS NULL) OR (l.resolution_status='unresolved' AND l.target_topic_id IS NOT NULL)"
-  ).get().count;
-  if (invalidTopics || invalidSections || orphanAliases || ftsRows !== manifest.total_section_count || linkRows !== manifest.topic_link_count || invalidLinks) {
+  const sectionCount = database.prepare("SELECT COUNT(*) AS count FROM sections").get().count;
+  const sectionRows = database.prepare(
+    "SELECT section_id, topic_id, ordinal, heading, start_offset, end_offset, content FROM sections ORDER BY topic_id, ordinal"
+  );
+  const sectionById = /* @__PURE__ */ new Map();
+  const sectionedTopicIds = /* @__PURE__ */ new Set();
+  let invalidSections = sectionCount !== manifest.total_section_count;
+  let partitionTopicId = null;
+  let nextOrdinal = 0;
+  let nextStartOffset = 0;
+  const closePartition = () => {
+    if (partitionTopicId !== null && nextStartOffset !== topicById.get(partitionTopicId)?.content_length) {
+      invalidSections = true;
+    }
+  };
+  for (const row of sectionRows.iterate()) {
+    const topic = topicById.get(row.topic_id);
+    if (row.topic_id !== partitionTopicId) {
+      closePartition();
+      partitionTopicId = row.topic_id;
+      nextOrdinal = 0;
+      nextStartOffset = 0;
+    }
+    const expectedSectionId = `${row.topic_id}:s${String(row.ordinal).padStart(3, "0")}`;
+    if (!topic || !TOPIC_ID_PATTERN.test(row.topic_id) || !SECTION_ID_PATTERN.test(row.section_id) || !Number.isSafeInteger(row.ordinal) || row.ordinal !== nextOrdinal || row.ordinal < 0 || row.ordinal > 999 || row.section_id !== expectedSectionId || !Number.isSafeInteger(row.start_offset) || !Number.isSafeInteger(row.end_offset) || row.start_offset !== nextStartOffset || row.end_offset < row.start_offset || row.end_offset > (topic?.content_length ?? -1) || typeof row.heading !== "string" || typeof row.content !== "string" || topic?.content.slice(row.start_offset, row.end_offset).trimEnd() !== row.content || sectionById.has(row.section_id)) {
+      invalidSections = true;
+    }
+    sectionById.set(row.section_id, { topic_id: row.topic_id, heading: row.heading });
+    sectionedTopicIds.add(row.topic_id);
+    nextOrdinal = row.ordinal + 1;
+    nextStartOffset = row.end_offset;
+  }
+  closePartition();
+  if (sectionedTopicIds.size !== topicRows.length) invalidSections = true;
+  const aliasRows = database.prepare(
+    "SELECT alias, normalized_alias, topic_id, source_kind FROM aliases"
+  );
+  const aliasRowsByTopic = /* @__PURE__ */ new Map();
+  let invalidAliases = false;
+  for (const row of aliasRows.iterate()) {
+    const topic = topicById.get(row.topic_id);
+    if (!topic || typeof row.alias !== "string" || row.alias.length === 0 || typeof row.normalized_alias !== "string" || row.normalized_alias.length === 0 || row.normalized_alias !== normalizeText(row.alias) || !["html-title", "html-keyword", "help-index"].includes(row.source_kind)) {
+      invalidAliases = true;
+    }
+    if (!aliasRowsByTopic.has(row.topic_id)) aliasRowsByTopic.set(row.topic_id, []);
+    aliasRowsByTopic.get(row.topic_id).push(row);
+  }
+  const expectedAliasText = /* @__PURE__ */ new Map();
+  for (const topic of topicRows) {
+    const rows = aliasRowsByTopic.get(topic.topic_id) ?? [];
+    rows.sort((left, right) => compareOrdinal(left.normalized_alias, right.normalized_alias));
+    if (!rows.some(
+      (row) => row.normalized_alias === topic.normalized_title && row.source_kind === "html-title"
+    )) invalidAliases = true;
+    expectedAliasText.set(topic.topic_id, rows.map((row) => row.alias).join(" | "));
+  }
+  const ftsCount = database.prepare("SELECT COUNT(*) AS count FROM search_fts").get().count;
+  const ftsRows = database.prepare(
+    "SELECT f.topic_id, f.section_id, f.source, f.title, f.aliases, f.heading, f.breadcrumb, f.body, s.content AS section_content FROM search_fts f LEFT JOIN sections s ON s.section_id=f.section_id"
+  );
+  const seenFtsSections = /* @__PURE__ */ new Set();
+  let invalidFts = ftsCount !== manifest.total_section_count;
+  for (const row of ftsRows.iterate()) {
+    const topic = topicById.get(row.topic_id);
+    const section = sectionById.get(row.section_id);
+    if (!topic || !section || section.topic_id !== row.topic_id || seenFtsSections.has(row.section_id) || row.source !== topic.source || row.title !== topic.title || row.aliases !== expectedAliasText.get(row.topic_id) || row.heading !== section.heading || row.breadcrumb !== topic.breadcrumb || row.body !== row.section_content) {
+      invalidFts = true;
+    }
+    seenFtsSections.add(row.section_id);
+  }
+  if (seenFtsSections.size !== sectionById.size) invalidFts = true;
+  const linkCount = database.prepare("SELECT COUNT(*) AS count FROM topic_links").get().count;
+  const linkRows = database.prepare(
+    "SELECT source_topic_id, ordinal, target_topic_id, target_internal_path, target_fragment, label, relationship, resolution_status FROM topic_links"
+  );
+  const duplicateLinkKeys = /* @__PURE__ */ new Set();
+  let resolvedLinkCount = 0;
+  let unresolvedLinkCount = 0;
+  let invalidLinks = linkCount !== manifest.topic_link_count;
+  for (const row of linkRows.iterate()) {
+    const sourceTopic = topicById.get(row.source_topic_id);
+    const pathIsCanonicalHtml = sourceTopic && expectedTopicId(sourceTopic.source, row.target_internal_path) !== null;
+    const expectedTargetId = sourceTopic ? topicByPath.get(`${sourceTopic.source}\0${String(row.target_internal_path).toLowerCase()}`) ?? null : null;
+    const duplicateKey = `${row.source_topic_id}\0${String(row.target_internal_path).toLowerCase()}\0${row.target_fragment}`;
+    if (!sourceTopic || !Number.isSafeInteger(row.ordinal) || row.ordinal < 0 || typeof row.target_internal_path !== "string" || !pathIsCanonicalHtml || typeof row.target_fragment !== "string" || typeof row.label !== "string" || !["inline", "see-also"].includes(row.relationship) || !["resolved", "unresolved"].includes(row.resolution_status) || row.resolution_status === "resolved" && (expectedTargetId === null || row.target_topic_id !== expectedTargetId || topicById.get(row.target_topic_id)?.source !== sourceTopic.source) || row.resolution_status === "unresolved" && (row.target_topic_id !== null || expectedTargetId !== null) || duplicateLinkKeys.has(duplicateKey)) {
+      invalidLinks = true;
+    }
+    duplicateLinkKeys.add(duplicateKey);
+    if (row.resolution_status === "resolved") resolvedLinkCount += 1;
+    if (row.resolution_status === "unresolved") unresolvedLinkCount += 1;
+  }
+  if (resolvedLinkCount !== manifest.resolved_topic_link_count || unresolvedLinkCount !== manifest.unresolved_topic_link_count) invalidLinks = true;
+  if (invalidTopics || invalidSections || invalidAliases || invalidFts || invalidLinks) {
     fail("INVALID_INDEX", "The documentation database failed relational consistency checks.");
   }
   if (manifest.schema_version === IMAGE_SCHEMA_VERSION) verifyAssetCatalog(database, manifest, packageInfo);
@@ -34279,26 +34448,28 @@ function readUpdateStatus(projectRoot, activeIndexRevision, activeCorpusRevision
 }
 function validateSearchInput(input) {
   if (!isRecord(input)) fail("INVALID_ARGUMENT", "Search input must be an object.");
+  rejectUnknownInputKeys(input, SEARCH_INPUT_KEYS, "Search input");
   const query = typeof input.query === "string" ? input.query.trim() : "";
   if (query.length < 1 || query.length > 200) {
     fail("INVALID_ARGUMENT", "query must contain 1 to 200 characters.");
   }
-  const source = input.source ?? "all";
+  const source = input.source === void 0 ? "all" : input.source;
   if (!SEARCH_SOURCES.includes(source)) {
     fail("INVALID_ARGUMENT", "source must be all, mql5, mql5book, or neuronetworksbook.");
   }
-  const limit = input.limit ?? 3;
+  const limit = input.limit === void 0 ? 3 : input.limit;
   if (!Number.isInteger(limit) || limit < 1 || limit > 8) {
     fail("INVALID_ARGUMENT", "limit must be an integer from 1 to 8.");
   }
-  const expand = input.expand ?? true;
-  const requireCurrent = input.require_current ?? false;
+  const expand = input.expand === void 0 ? true : input.expand;
+  const requireCurrent = input.require_current === void 0 ? false : input.require_current;
   if (typeof expand !== "boolean") fail("INVALID_ARGUMENT", "expand must be a boolean.");
   if (typeof requireCurrent !== "boolean") fail("INVALID_ARGUMENT", "require_current must be a boolean.");
   return { query, source, limit, expand, requireCurrent };
 }
 function validateReadInput(input) {
   if (!isRecord(input)) fail("INVALID_ARGUMENT", "Read input must be an object.");
+  rejectUnknownInputKeys(input, READ_INPUT_KEYS, "Read input");
   if (typeof input.topic_id !== "string" || !TOPIC_ID_PATTERN.test(input.topic_id)) {
     fail("INVALID_ARGUMENT", "topic_id is not a valid stable MQL5 CHM topic ID.");
   }
@@ -34317,7 +34488,7 @@ function validateReadInput(input) {
       fail("INVALID_ARGUMENT", "focus must contain 1 to 200 characters.");
     }
   }
-  if (input.cursor !== void 0 && (typeof input.cursor !== "string" || input.cursor.length > 2048)) {
+  if (input.cursor !== void 0 && (typeof input.cursor !== "string" || input.cursor.length < 10 || input.cursor.length > 2048)) {
     fail("INVALID_ARGUMENT", "cursor is invalid.");
   }
   if (input.cursor && focus) {
@@ -34329,18 +34500,18 @@ function validateReadInput(input) {
   if (input.image_cursor && (input.cursor || focus)) {
     fail("INVALID_ARGUMENT", "image_cursor cannot be combined with cursor or focus.");
   }
-  const maxChars = input.max_chars ?? 4e3;
+  const maxChars = input.max_chars === void 0 ? 4e3 : input.max_chars;
   if (!Number.isInteger(maxChars) || maxChars < 500 || maxChars > 8e3) {
     fail("INVALID_ARGUMENT", "max_chars must be an integer from 500 to 8000.");
   }
-  const includeRelated = input.include_related ?? true;
-  const relatedLimit = input.related_limit ?? 3;
+  const includeRelated = input.include_related === void 0 ? true : input.include_related;
+  const relatedLimit = input.related_limit === void 0 ? 3 : input.related_limit;
   if (typeof includeRelated !== "boolean") fail("INVALID_ARGUMENT", "include_related must be a boolean.");
   if (!Number.isInteger(relatedLimit) || relatedLimit < 0 || relatedLimit > 5) {
     fail("INVALID_ARGUMENT", "related_limit must be an integer from 0 to 5.");
   }
-  const includeImages = input.include_images ?? true;
-  const imageLimit = input.image_limit ?? 5;
+  const includeImages = input.include_images === void 0 ? true : input.include_images;
+  const imageLimit = input.image_limit === void 0 ? 5 : input.image_limit;
   if (typeof includeImages !== "boolean") fail("INVALID_ARGUMENT", "include_images must be a boolean.");
   if (!Number.isInteger(imageLimit) || imageLimit < 1 || imageLimit > 8) {
     fail("INVALID_ARGUMENT", "image_limit must be an integer from 1 to 8.");
@@ -34366,7 +34537,7 @@ function validateReadImageInput(input) {
   return input.asset_id;
 }
 function cursorTag(body) {
-  return createHash("sha256").update(CURSOR_DOMAIN).update(body).digest("hex").slice(0, 24);
+  return createHmac("sha256", CURSOR_HMAC_KEY).update(CURSOR_DOMAIN).update(body).digest("hex").slice(0, 24);
 }
 function encodeCursor({ indexRevision, topicId, sectionId = null, offset }) {
   if (!REVISION_PATTERN.test(indexRevision) || !TOPIC_ID_PATTERN.test(topicId)) {
@@ -34403,13 +34574,17 @@ function decodeCursor(cursor) {
     if (error51 instanceof Mql5ChmError) throw error51;
     fail("INVALID_CURSOR", "The continuation cursor payload is invalid.", { cause: error51 });
   }
-  if (!isRecord(payload) || payload.v !== 2 || typeof payload.i !== "string" || !REVISION_PATTERN.test(payload.i) || typeof payload.t !== "string" || !TOPIC_ID_PATTERN.test(payload.t) || payload.s !== null && (typeof payload.s !== "string" || !SECTION_ID_PATTERN.test(payload.s) || !payload.s.startsWith(`${payload.t}:`)) || !Number.isSafeInteger(payload.o) || payload.o < 0) {
+  if (!isRecord(payload)) {
+    fail("INVALID_CURSOR", "The continuation cursor payload is invalid.");
+  }
+  requireExactKeys(payload, ["v", "i", "t", "s", "o"], "The continuation cursor payload", "INVALID_CURSOR");
+  if (payload.v !== 2 || typeof payload.i !== "string" || !REVISION_PATTERN.test(payload.i) || typeof payload.t !== "string" || !TOPIC_ID_PATTERN.test(payload.t) || payload.s !== null && (typeof payload.s !== "string" || !SECTION_ID_PATTERN.test(payload.s) || !payload.s.startsWith(`${payload.t}:`)) || !Number.isSafeInteger(payload.o) || payload.o < 0) {
     fail("INVALID_CURSOR", "The continuation cursor payload is invalid.");
   }
   return { indexRevision: payload.i, topicId: payload.t, sectionId: payload.s, offset: payload.o };
 }
 function imageCursorTag(body) {
-  return createHash("sha256").update(IMAGE_CURSOR_DOMAIN).update(body).digest("hex").slice(0, 24);
+  return createHmac("sha256", CURSOR_HMAC_KEY).update(IMAGE_CURSOR_DOMAIN).update(body).digest("hex").slice(0, 24);
 }
 function encodeImageCursor({ indexRevision, topicId, sectionId = null, offset }) {
   if (!REVISION_PATTERN.test(indexRevision) || !TOPIC_ID_PATTERN.test(topicId) || sectionId !== null && (!SECTION_ID_PATTERN.test(sectionId) || !sectionId.startsWith(`${topicId}:`)) || !Number.isSafeInteger(offset) || offset < 0) {
@@ -34435,7 +34610,9 @@ function decodeImageCursor(cursor) {
   } catch (error51) {
     fail("INVALID_IMAGE_CURSOR", "The image cursor payload is invalid.", { cause: error51 });
   }
-  if (!isRecord(payload) || payload.v !== 1 || typeof payload.i !== "string" || !REVISION_PATTERN.test(payload.i) || typeof payload.t !== "string" || !TOPIC_ID_PATTERN.test(payload.t) || payload.s !== null && (typeof payload.s !== "string" || !SECTION_ID_PATTERN.test(payload.s) || !payload.s.startsWith(`${payload.t}:`)) || !Number.isSafeInteger(payload.o) || payload.o < 0) {
+  if (!isRecord(payload)) fail("INVALID_IMAGE_CURSOR", "The image cursor payload is invalid.");
+  requireExactKeys(payload, ["v", "i", "t", "s", "o"], "The image cursor payload", "INVALID_IMAGE_CURSOR");
+  if (payload.v !== 1 || typeof payload.i !== "string" || !REVISION_PATTERN.test(payload.i) || typeof payload.t !== "string" || !TOPIC_ID_PATTERN.test(payload.t) || payload.s !== null && (typeof payload.s !== "string" || !SECTION_ID_PATTERN.test(payload.s) || !payload.s.startsWith(`${payload.t}:`)) || !Number.isSafeInteger(payload.o) || payload.o < 0) {
     fail("INVALID_IMAGE_CURSOR", "The image cursor payload is invalid.");
   }
   return { indexRevision: payload.i, topicId: payload.t, sectionId: payload.s, offset: payload.o };
@@ -34716,7 +34893,7 @@ var Mql5ChmSearchService = class {
       online_check: {
         recommended: reason !== null,
         reason,
-        official_search_query: reason === null ? null : officialSearchQuery.slice(0, 500)
+        official_search_query: reason === null ? null : officialSearchQuery.slice(0, safeUtf16Boundary(officialSearchQuery, 500))
       },
       results
     };
@@ -35088,6 +35265,37 @@ var corpusSourceSchema = external_exports.enum(["mql5", "mql5book", "neuronetwor
 var topicIdSchema = external_exports.string().regex(/^(mql5|mql5book|neuronetworksbook):[0-9a-f]{24}$/, "Invalid stable topic ID");
 var sectionIdSchema = external_exports.string().regex(/^(mql5|mql5book|neuronetworksbook):[0-9a-f]{24}:s\d{3}$/, "Invalid stable section ID");
 var assetIdSchema = external_exports.string().regex(/^(mql5|mql5book|neuronetworksbook):asset:[0-9a-f]{24}$/, "Invalid stable asset ID");
+function closedEmptyInputSchema() {
+  const schema = external_exports.strictObject({}).default({});
+  const definition = schema?._zod?.def;
+  if (!definition || definition.type !== "default" || !Reflect.defineProperty(definition, "shape", {
+    value: {},
+    enumerable: false,
+    configurable: false,
+    writable: false
+  })) {
+    throw new Error("The pinned MCP SDK/Zod empty-input schema compatibility guard failed.");
+  }
+  return schema;
+}
+var statusInputSchema = closedEmptyInputSchema();
+function installInvalidToolRequestMapping(server) {
+  const handlers = server?.server?._requestHandlers;
+  const original = handlers instanceof Map ? handlers.get("tools/call") : null;
+  if (typeof original !== "function") {
+    throw new Error("The pinned MCP SDK tools/call compatibility guard failed.");
+  }
+  handlers.set("tools/call", async (request, extra) => {
+    try {
+      return await original(request, extra);
+    } catch (error51) {
+      if (error51 instanceof external_exports.ZodError || error51?.name === "ZodError" || error51?.name === "$ZodError") {
+        throw new McpError(ErrorCode.InvalidParams, "Invalid tools/call parameters.");
+      }
+      throw error51;
+    }
+  });
+}
 var citationSchema = external_exports.object({
   source_file: external_exports.string().min(1),
   title: external_exports.string(),
@@ -35194,7 +35402,7 @@ function toolFailure(error51) {
 }
 function createMcpServer(service) {
   const server = new McpServer(
-    { name: "mql5-chm", version: "1.2.4" },
+    { name: "mql5-chm", version: "1.2.5" },
     { capabilities: { tools: {} } }
   );
   server.registerTool(
@@ -35202,13 +35410,13 @@ function createMcpServer(service) {
     {
       title: "Search local MQL5 CHM documentation",
       description: "Search the verified offline MQL5 reference, MQL5 book, and neural-networks book. Exact API names outrank bounded MQL5-aware expansions and typo fallback. The limit input must be an integer from 1 to 8 and must not exceed 8. In answers, name each exact returned title, include citation.topic_id, and state citation.corpus_revision or citation.index_revision once per answer when findings share that revision.",
-      inputSchema: {
+      inputSchema: external_exports.strictObject({
         query: external_exports.string().trim().min(1).max(200).describe("API name or documentation question"),
         source: sourceSchema.optional().default("all").describe("CHM corpus filter"),
         limit: external_exports.number().int().min(1).max(8).optional().default(3).describe("Number of ranked results; integer from 1 to 8 and must not exceed 8"),
         expand: external_exports.boolean().optional().default(true).describe("Use bounded MQL5-aware query expansion"),
         require_current: external_exports.boolean().optional().default(false).describe("Recommend an official-domain check")
-      },
+      }),
       outputSchema: {
         query: external_exports.string(),
         source: sourceSchema,
@@ -35254,7 +35462,7 @@ function createMcpServer(service) {
     {
       title: "Read local MQL5 CHM documentation",
       description: "Read a bounded passage from a stable topic ID. Optionally select a section or focus and include bounded related-topic metadata. The max_chars input must be an integer from 500 to 8000 and must not exceed 8000. In answers, name the exact returned section_heading when present (otherwise title), include citation.topic_id and citation.section_id when relevant, and state citation.corpus_revision or citation.index_revision once per answer when findings share that revision.",
-      inputSchema: {
+      inputSchema: external_exports.strictObject({
         topic_id: topicIdSchema.describe("Stable topic ID returned by mql5_chm_search"),
         section_id: sectionIdSchema.optional().describe("Optional stable section ID from search"),
         focus: external_exports.string().trim().min(1).max(200).optional().describe("Passage-selection query"),
@@ -35265,7 +35473,7 @@ function createMcpServer(service) {
         include_images: external_exports.boolean().optional().default(true).describe("Include bounded technical-image references when available"),
         image_limit: external_exports.number().int().min(1).max(8).optional().default(5),
         image_cursor: external_exports.string().min(10).max(2048).optional().describe("Opaque next_image_cursor from an earlier read")
-      },
+      }),
       outputSchema: {
         topic_id: topicIdSchema,
         section_id: sectionIdSchema.nullable(),
@@ -35347,7 +35555,10 @@ function createMcpServer(service) {
     {
       title: "Show local MQL5 CHM documentation status",
       description: "Report the active verified corpus and index revisions, source metadata, counts, and the last validated manual update check.",
-      inputSchema: {},
+      // SDK 1.29.0 otherwise replaces this default-wrapped strict object with
+      // an open empty schema in tools/list. The guarded shape marker preserves
+      // both omitted-argument defaulting and additionalProperties: false.
+      inputSchema: statusInputSchema,
       outputSchema: {
         schema_version: external_exports.number().int().positive(),
         active_revision: sha256Schema,
@@ -35434,6 +35645,7 @@ function createMcpServer(service) {
       }
     }
   );
+  installInvalidToolRequestMapping(server);
   return server;
 }
 async function main() {

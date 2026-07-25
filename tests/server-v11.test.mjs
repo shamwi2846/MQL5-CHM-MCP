@@ -3,6 +3,7 @@ import test from "node:test";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { CallToolResultSchema, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 
 import { createMcpServer } from "../src/server.mjs";
 
@@ -200,10 +201,15 @@ test("source MCP exposes v1.2 schemas and keeps text and image bytes in separate
         idempotentHint: true,
         openWorldHint: false,
       });
+      assert.equal(tool.inputSchema.additionalProperties, false);
     }
     const imageTool = listed.tools.find((tool) => tool.name === "mql5_chm_read_image");
-    assert.equal(imageTool.inputSchema.additionalProperties, false);
     assert.deepEqual(imageTool.inputSchema.required, ["asset_id"]);
+    const statusTool = listed.tools.find((tool) => tool.name === "mql5_chm_status");
+    assert.equal(statusTool.inputSchema.type, "object");
+    assert.deepEqual(statusTool.inputSchema.properties, {});
+    assert.deepEqual(statusTool.inputSchema.required ?? [], []);
+    assert.equal(statusTool.inputSchema.additionalProperties, false);
 
     const search = await client.callTool({
       name: "mql5_chm_search",
@@ -212,6 +218,11 @@ test("source MCP exposes v1.2 schemas and keeps text and image bytes in separate
     assert.equal(search.isError, undefined);
     assert.equal(Object.hasOwn(search.structuredContent.results[0], "snippet"), false);
     assert.equal(search.structuredContent.results[0].match_kind, "exact");
+    const searchWithExtraArgument = await client.callTool({
+      name: "mql5_chm_search",
+      arguments: { query: "PositionSelectByTicket", path: "secret.txt" },
+    });
+    assert.equal(searchWithExtraArgument.isError, true);
 
     const read = await client.callTool({ name: "mql5_chm_read", arguments: { topic_id: topicId } });
     assert.equal(read.isError, undefined);
@@ -220,6 +231,11 @@ test("source MCP exposes v1.2 schemas and keeps text and image bytes in separate
     assert.equal(read.structuredContent.related[0].relationship, "see-also");
     assert.equal(read.structuredContent.images[0].asset_id, assetId);
     assert.equal(JSON.stringify(read.structuredContent).includes("verified-image"), false);
+    const readWithExtraArgument = await client.callTool({
+      name: "mql5_chm_read",
+      arguments: { topic_id: topicId, path: "secret.txt" },
+    });
+    assert.equal(readWithExtraArgument.isError, true);
 
     const image = await client.callTool({ name: "mql5_chm_read_image", arguments: { asset_id: assetId } });
     assert.equal(image.isError, undefined);
@@ -234,9 +250,30 @@ test("source MCP exposes v1.2 schemas and keeps text and image bytes in separate
     assert.equal(extraArgument.isError, true);
     assert.match(extraArgument.content[0].text, /Invalid arguments|unrecognized|validation/i);
 
+    const statusWithoutArguments = await client.callTool({ name: "mql5_chm_status" });
+    assert.equal(statusWithoutArguments.isError, undefined);
+    assert.equal(statusWithoutArguments.structuredContent.totals.topics, 4_827);
     const status = await client.callTool({ name: "mql5_chm_status", arguments: {} });
     assert.equal(status.isError, undefined);
     assert.equal(status.structuredContent.totals.topics, 4_827);
+    const statusWithExtraArgument = await client.callTool({
+      name: "mql5_chm_status",
+      arguments: { path: "secret.txt" },
+    });
+    assert.equal(statusWithExtraArgument.isError, true);
+
+    for (const invalidArguments of [null, []]) {
+      await assert.rejects(
+        () => client.request(
+          {
+            method: "tools/call",
+            params: { name: "mql5_chm_status", arguments: invalidArguments },
+          },
+          CallToolResultSchema,
+        ),
+        (error) => error?.code === ErrorCode.InvalidParams,
+      );
+    }
   } finally {
     await client.close();
     await server.close();

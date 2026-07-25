@@ -178,7 +178,7 @@ function Invoke-BoundedSevenZipDownload {
     try {
         while ($true) {
             $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Get, $current)
-            [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.2.4')
+            [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.2.5')
             $response = $null
             $stream = $null
             try {
@@ -229,19 +229,17 @@ function Invoke-SevenZipMsiAdministrativeExtract {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$MsiPath,
-        [Parameter(Mandatory)][string]$Destination
+        [Parameter(Mandatory)][string]$Destination,
+        [ValidateRange(1,1800)][int]$TimeoutSeconds = 300
     )
     $msi = Resolve-FullPath -Path $MsiPath -MustExist -PathType Leaf
     $destinationFull = Resolve-FullPath -Path $Destination -MustExist -PathType Container
     $windowsRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::Windows)
     if ([string]::IsNullOrWhiteSpace($windowsRoot)) { throw 'Unable to resolve the trusted Windows directory.' }
     $msiexec = Resolve-FullPath -Path (Join-Path $windowsRoot 'System32\msiexec.exe') -MustExist -PathType Leaf
-    $result = Invoke-NativeCapture -FilePath $msiexec -Arguments @(
+    Invoke-NativeProcessWithTimeout -FilePath $msiexec -Arguments @(
         '/a',$msi,'/qn','/norestart','REBOOT=ReallySuppress',"TARGETDIR=$destinationFull"
-    )
-    if ([int]$result.ExitCode -ne 0) {
-        throw "Administrative extraction of the pinned 7-Zip MSI failed with exit code $($result.ExitCode). $($result.Text)"
-    }
+    ) -TimeoutSeconds $TimeoutSeconds -FailureMessage 'Administrative extraction of the pinned 7-Zip MSI failed.' | Out-Null
 }
 
 function Assert-InternalSevenZipRuntimeTestHooks {
@@ -512,9 +510,9 @@ function Ensure-PinnedSevenZipRuntime {
             throw 'Downloaded 7-Zip MSI does not match its pinned byte count and SHA-256.'
         }
         if ($null -eq $InternalTestHooks) {
-            Invoke-SevenZipMsiAdministrativeExtract -MsiPath $artifactPath -Destination $extractRoot
+            Invoke-SevenZipMsiAdministrativeExtract -MsiPath $artifactPath -Destination $extractRoot -TimeoutSeconds 300
         } else {
-            & $InternalTestHooks.ExtractArtifact $artifactPath $extractRoot | Out-Null
+            & $InternalTestHooks.ExtractArtifact $artifactPath $extractRoot 300 | Out-Null
         }
         $reparse = @(Get-ChildItem -LiteralPath $extractRoot -Recurse -Force | Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 })
         if ($reparse.Count -gt 0) { throw "Extracted 7-Zip MSI contains a reparse point: $($reparse[0].FullName)" }

@@ -16,6 +16,21 @@ import {
   resolveInternalLink,
 } from "../src/indexer.mjs";
 
+function hasUnpairedSurrogate(value) {
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      if (index + 1 >= value.length) return true;
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xdc00 || next > 0xdfff) return true;
+      index += 1;
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
+}
+
 test("schema v3 keeps deterministic source identity and adds the image catalog", () => {
   const database = new DatabaseSync(":memory:");
   try {
@@ -64,7 +79,7 @@ test("schema v3 keeps deterministic source identity and adds the image catalog",
     database.close();
   }
   assert.equal(SCHEMA_VERSION, 3);
-  assert.equal(INDEX_CONTRACT, "mql5-chm-index-v3-assets-v2");
+  assert.equal(INDEX_CONTRACT, "mql5-chm-index-v3-assets-v3");
 });
 
 test("topic schema stores JavaScript UTF-16 content lengths for supplementary Unicode", () => {
@@ -131,6 +146,30 @@ test("internal link resolution accepts confined HTML targets and rejects unsafe 
   assert.equal(resolveInternalLink("reference/order.htm", "%68%74%74%70%73%3A%2F%2Fevil.test/x.htm"), null);
   assert.equal(resolveInternalLink("reference/order.htm", "image.png"), null);
   assert.equal(resolveInternalLink("reference/order.htm", "%2e%2e/%2e%2e/escape.htm"), null);
+});
+
+test("bounded link metadata and signatures never split a Unicode surrogate pair", () => {
+  const longFragment = `${"a".repeat(299)}😀tail`;
+  const resolved = resolveInternalLink("reference/order.htm", `#${longFragment}`);
+  assert.ok(resolved);
+  assert.ok(resolved.targetFragment.length <= 300);
+  assert.equal(hasUnpairedSurrogate(resolved.targetFragment), false);
+
+  const longLabel = `${"a".repeat(299)}😀tail`;
+  const linkedTopic = parseHtmlTopic(
+    `<div id="help"><h1>Demo</h1><p><a href="other.htm">${longLabel}</a></p></div>`,
+    { source: "mql5", internalPath: "demo.htm" },
+  );
+  assert.ok(linkedTopic.links[0].label.length <= 300);
+  assert.equal(hasUnpairedSurrogate(linkedTopic.links[0].label), false);
+
+  const declaration = `void Demo(${"a".repeat(786)}😀tail)`;
+  const signatureTopic = parseHtmlTopic(
+    `<div id="help"><h1>Demo</h1><p class="p_CodeExample">${declaration}</p></div>`,
+    { source: "mql5", internalPath: "demo.htm" },
+  );
+  assert.ok(signatureTopic.signature.length <= 800);
+  assert.equal(hasUnpairedSurrogate(signatureTopic.signature), false);
 });
 
 test("topic parsing extracts only safe help anchors, deduplicates them, and upgrades See also relationships", () => {

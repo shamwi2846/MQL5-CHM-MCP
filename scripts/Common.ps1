@@ -14,8 +14,8 @@ $script:PinnedSevenZipLicenseSha256 = '519ac0a4bded9c18ea02e0afb71f663d8c47373bd
 $script:ManifestSchemaVersion = 3
 $script:LegacyManifestSchemaVersion = 2
 $script:ActivePointerSchemaVersion = 2
-$script:IndexContract = 'mql5-chm-index-v3-assets-v2'
-$script:SupportedIndexContracts = @('mql5-chm-index-v3-assets-v1','mql5-chm-index-v3-assets-v2')
+$script:IndexContract = 'mql5-chm-index-v3-assets-v3'
+$script:SupportedIndexContracts = @('mql5-chm-index-v3-assets-v1','mql5-chm-index-v3-assets-v2','mql5-chm-index-v3-assets-v3')
 $script:ExpectedTotalTopics = 4827
 $script:MaximumStatusMessageChars = 500
 
@@ -332,6 +332,90 @@ function Invoke-NativeCapture {
     return [pscustomobject]@{ ExitCode = $exitCode; Lines = $captured; Text = ($captured -join [Environment]::NewLine) }
 }
 
+function ConvertTo-WindowsNativeArgument {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+    if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') { return $Value }
+    $builder = New-Object Text.StringBuilder
+    [void]$builder.Append('"')
+    $slashes = 0
+    foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq '\') {
+            $slashes++
+            continue
+        }
+        if ($character -eq '"') {
+            [void]$builder.Append(('\' * (($slashes * 2) + 1)))
+            [void]$builder.Append('"')
+            $slashes = 0
+            continue
+        }
+        if ($slashes -gt 0) { [void]$builder.Append(('\' * $slashes)); $slashes = 0 }
+        [void]$builder.Append($character)
+    }
+    if ($slashes -gt 0) { [void]$builder.Append(('\' * ($slashes * 2))) }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function Get-NativeDiagnosticTail {
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$Text,[ValidateRange(1,32768)][int]$MaximumCharacters = 4096)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
+    $trimmed = $Text.Trim()
+    if ($trimmed.Length -le $MaximumCharacters) { return $trimmed }
+    return '[output tail] ' + $trimmed.Substring($trimmed.Length - $MaximumCharacters)
+}
+
+function Invoke-NativeProcessWithTimeout {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$Arguments = @(),
+        [ValidateRange(1,1800)][int]$TimeoutSeconds,
+        [string]$FailureMessage = 'Native process failed.'
+    )
+    $executable = Resolve-FullPath -Path $FilePath -MustExist -PathType Leaf
+    $startInfo = New-Object Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $executable
+    $startInfo.Arguments = (@($Arguments | ForEach-Object { ConvertTo-WindowsNativeArgument -Value ([string]$_) }) -join ' ')
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $startInfo
+    $stdoutTask = $null
+    $stderrTask = $null
+    try {
+        if (-not $process.Start()) { throw "Could not start native process: $executable" }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            try {
+                if (-not $process.HasExited) { $process.Kill() }
+            } catch {
+                throw [TimeoutException]::new("Native process exceeded its $TimeoutSeconds-second deadline and could not be terminated: $executable", $_.Exception)
+            }
+            if (-not $process.WaitForExit(5000)) {
+                throw [TimeoutException]::new("Native process exceeded its $TimeoutSeconds-second deadline and did not terminate: $executable")
+            }
+            throw [TimeoutException]::new("Native process exceeded its $TimeoutSeconds-second deadline: $executable")
+        }
+        $process.WaitForExit()
+        $stdout = [string]$stdoutTask.GetAwaiter().GetResult()
+        $stderr = [string]$stderrTask.GetAwaiter().GetResult()
+        $diagnostic = Get-NativeDiagnosticTail -Text (($stdout,$stderr | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join [Environment]::NewLine)
+        if ($process.ExitCode -ne 0) {
+            $suffix = if ([string]::IsNullOrWhiteSpace($diagnostic)) { '' } else { " $diagnostic" }
+            throw "$FailureMessage Exit code: $($process.ExitCode).$suffix"
+        }
+        return [pscustomobject]@{ExitCode=[int]$process.ExitCode;Text=$diagnostic}
+    } finally {
+        $process.Dispose()
+    }
+}
+
 function Resolve-NodeExecutable {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$ProjectRoot, [switch]$RequireBundled)
@@ -583,6 +667,57 @@ function Enter-ExclusiveFileLock {
     }
 }
 
+function Enter-PackageOutputMutex {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ReleaseRoot,
+        [Parameter(Mandatory)][ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$')][string]$ReleaseName,
+        [ValidateRange(1,3600)][int]$TimeoutSeconds = 120,
+        [scriptblock]$InternalMutexFactory
+    )
+
+    $releaseRootFull = Resolve-FullPath -Path $ReleaseRoot -MustExist -PathType Container
+    Assert-NoReparsePoint -Root $releaseRootFull -Path $releaseRootFull
+    $physicalRootIdentity = Get-PhysicalDirectoryIdentity -Path $releaseRootFull
+    # Publication recovery and prepared artifacts are release-root scoped, so
+    # every release name and source clone targeting this physical root shares
+    # one mutex.
+    $mutexIdentity = $physicalRootIdentity
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $digest = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($mutexIdentity)))).Replace('-','').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+    $mutexName = "Global\Mql5ChmMcp-Package-$digest"
+    try {
+        $mutex = if ($null -eq $InternalMutexFactory) { New-Object Threading.Mutex($false, $mutexName) } else { & $InternalMutexFactory $mutexName }
+    } catch {
+        throw "Could not open the machine-global package output mutex '$mutexName'; no package payload or publication was changed. $($_.Exception.Message)"
+    }
+    if ($null -eq $mutex -or $null -eq $mutex.PSObject.Methods['WaitOne'] -or $null -eq $mutex.PSObject.Methods['ReleaseMutex']) {
+        if ($null -ne $mutex -and $null -ne $mutex.PSObject.Methods['Dispose']) { $mutex.Dispose() }
+        throw 'The machine-global package output mutex factory returned an invalid mutex; no package payload or publication was changed.'
+    }
+    $acquired = $false
+    try {
+        try { $acquired = $mutex.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds)) }
+        catch [Threading.AbandonedMutexException] { $acquired = $true }
+        if (-not $acquired) { throw "Timed out waiting for the package output mutex after $TimeoutSeconds seconds: $releaseRootFull\$ReleaseName" }
+        $lease = [pscustomobject]@{ Mutex=$mutex; Name=$mutexName; Released=$false; ReleaseRoot=$releaseRootFull; ReleaseName=$ReleaseName }
+        $lease | Add-Member ScriptMethod Dispose {
+            if (-not $this.Released) {
+                $this.Mutex.ReleaseMutex()
+                $this.Mutex.Dispose()
+                $this.Released = $true
+            }
+        }
+        return $lease
+    } catch {
+        if ($acquired) {
+            try { $mutex.ReleaseMutex() } finally { $mutex.Dispose() }
+        } else { $mutex.Dispose() }
+        throw
+    }
+}
+
 function Get-RequiredJsonProperty {
     [CmdletBinding()]
     param([Parameter(Mandatory)][AllowNull()][object]$Object, [Parameter(Mandatory)][string]$Name, [string]$Context = 'JSON object')
@@ -703,7 +838,7 @@ function Invoke-BoundedNodeJsDownload {
     $client = New-Object Net.Http.HttpClient($handler, $true)
     $client.Timeout = [Threading.Timeout]::InfiniteTimeSpan
     $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Get, $Uri)
-    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.2.4')
+    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.2.5')
     $response = $null
     $stream = $null
     $deadline = New-Object Threading.CancellationTokenSource([TimeSpan]::FromSeconds($TimeoutSeconds))
@@ -3373,7 +3508,7 @@ function Invoke-OfficialChmDownload {
             try {
                 if ($null -eq $InternalTestHooks) {
                     $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Get, $current)
-                    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp/1.1')
+                    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp/1.2.5')
                     try {
                         $httpResponse = $client.SendAsync(
                             $request,

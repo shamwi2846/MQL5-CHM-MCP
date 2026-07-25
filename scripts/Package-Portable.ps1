@@ -48,6 +48,7 @@ function Invoke-PortablePackageFinalCleanup {
         [Parameter(Mandatory)][string]$ProjectRoot,
         [AllowNull()][string]$CandidateBuildRoot,
         [AllowNull()][object]$UpdateLock,
+        [AllowNull()][object]$OutputLock,
         [hashtable]$InternalTestHooks
     )
     try {
@@ -63,7 +64,11 @@ function Invoke-PortablePackageFinalCleanup {
             }
         }
     } finally {
-        if ($null -ne $UpdateLock) { $UpdateLock.Dispose() }
+        try {
+            if ($null -ne $OutputLock) { $OutputLock.Dispose() }
+        } finally {
+            if ($null -ne $UpdateLock) { $UpdateLock.Dispose() }
+        }
     }
 }
 
@@ -811,6 +816,7 @@ $maintenanceRoot = Join-Path $root 'maintenance'
 if ($portablePrebuiltMode -and -not (Test-Path -LiteralPath $maintenanceRoot -PathType Container)) { throw 'Verified portable package is missing its maintenance lock directory.' }
 Assert-NoReparsePoint -Root $root -Path $maintenanceRoot
 $updateLock = $null
+$outputLock = $null
 $candidateBuildRoot = $null
 try {
     $updateLock = Enter-ExclusiveFileLock -Path (Join-Path $maintenanceRoot '.update.lock') -IdentityRoot $root -TimeoutSeconds 120
@@ -819,10 +825,11 @@ try {
     # recoverable ZIP/sidecar publication.
     if (-not (Test-Path -LiteralPath $releaseRoot -PathType Container)) {
         if (Test-Path -LiteralPath $releaseRoot) { throw "Package release path is not a directory: $releaseRoot" }
-        New-Item -ItemType Directory -Path $releaseRoot -ErrorAction Stop | Out-Null
+        [IO.Directory]::CreateDirectory($releaseRoot) | Out-Null
     }
     $releaseRoot = Resolve-FullPath -Path $releaseRoot -MustExist -PathType Container
     $outputPlan = Assert-PackageOutputPlan -Root $root -ReleaseRoot $releaseRoot -StageRoot $stageCandidate -ZipPath $zipCandidate -ManifestPath $manifestCandidate -ProtectedSources $protectedProjectSources
+    $outputLock = Enter-PackageOutputMutex -ReleaseRoot $outputPlan.ReleaseRoot -ReleaseName $ReleaseName -TimeoutSeconds 120
     Repair-PackageZipPublicationContext -ReleaseRoot $outputPlan.ReleaseRoot -ZipPath $outputPlan.ZipPath -ManifestPath $outputPlan.ManifestPath -DeferPreparedOrphans | Out-Null
     if ($layoutMode -eq 'incomplete-development') { throw 'Development build inputs are incomplete; refusing to package stale prebuilt application bundles.' }
     if ($layoutMode -eq 'unverified-portable') { throw 'Portable prebuilt mode requires checksums.sha256; refusing to execute unverified bundled tools.' }
@@ -966,5 +973,5 @@ Write-Host "Sidecar manifest: $($publication.ManifestPath)"
 Write-Host "Bytes: $($publication.Bytes)"
 Write-Host "SHA-256: $($publication.Sha256)"
 } finally {
-    Invoke-PortablePackageFinalCleanup -ProjectRoot $root -CandidateBuildRoot $candidateBuildRoot -UpdateLock $updateLock
+    Invoke-PortablePackageFinalCleanup -ProjectRoot $root -CandidateBuildRoot $candidateBuildRoot -UpdateLock $updateLock -OutputLock $outputLock
 }
