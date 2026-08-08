@@ -34,14 +34,23 @@ public sealed class Mql5ChmSlowReadStream : Stream
 {
     private readonly byte[] payload;
     private readonly int delayMilliseconds;
+    private readonly CancellationToken expectedToken;
     private int position;
 
-    public Mql5ChmSlowReadStream(byte[] payload, int delayMilliseconds)
+    public Mql5ChmSlowReadStream(
+        byte[] payload,
+        int delayMilliseconds,
+        CancellationToken expectedToken)
     {
         if (payload == null) throw new ArgumentNullException("payload");
         this.payload = payload;
         this.delayMilliseconds = delayMilliseconds;
+        this.expectedToken = expectedToken;
     }
+
+    public int AsyncReadCalls { get; private set; }
+    public bool TokenMismatch { get; private set; }
+    public bool CancellationObserved { get; private set; }
 
     public override bool CanRead { get { return true; } }
     public override bool CanSeek { get { return false; } }
@@ -55,8 +64,7 @@ public sealed class Mql5ChmSlowReadStream : Stream
 
     public override int Read(byte[] buffer, int offset, int count)
     {
-        Thread.Sleep(delayMilliseconds);
-        return CopyNextByte(buffer, offset, count);
+        throw new InvalidOperationException("Deadline fixture used a synchronous stream read.");
     }
 
     public override async Task<int> ReadAsync(
@@ -65,7 +73,21 @@ public sealed class Mql5ChmSlowReadStream : Stream
         int count,
         CancellationToken cancellationToken)
     {
-        await Task.Delay(delayMilliseconds, cancellationToken).ConfigureAwait(false);
+        AsyncReadCalls++;
+        if (!cancellationToken.Equals(expectedToken))
+        {
+            TokenMismatch = true;
+            throw new InvalidOperationException("Deadline fixture received a different cancellation token.");
+        }
+        try
+        {
+            await Task.Delay(delayMilliseconds, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            CancellationObserved = true;
+            throw;
+        }
         return CopyNextByte(buffer, offset, count);
     }
 
@@ -85,15 +107,82 @@ public sealed class Mql5ChmSlowReadStream : Stream
 '@
     }
 
+    $commonSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Common.ps1') -Raw
+    $downloadStart = $commonSource.IndexOf('function Invoke-OfficialChmDownload',[StringComparison]::Ordinal)
+    $downloadEnd = $commonSource.IndexOf('function Get-ValidatedRevisionChecksumFiles',[StringComparison]::Ordinal)
+    if ($downloadStart -lt 0 -or $downloadEnd -le $downloadStart) {
+        throw 'Could not isolate Invoke-OfficialChmDownload for deadline regression validation.'
+    }
+    $downloadSource = $commonSource.Substring($downloadStart,$downloadEnd-$downloadStart)
+    $deadlineCreations = [regex]::Matches(
+        $downloadSource,
+        'New-Object\s+Threading\.CancellationTokenSource\s*\(',
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant
+    )
+    $redirectLoopStart = $downloadSource.IndexOf('while ($true)',[StringComparison]::Ordinal)
+    if ($deadlineCreations.Count -ne 1 -or $redirectLoopStart -lt 0 -or
+        $deadlineCreations[0].Index -ge $redirectLoopStart) {
+        throw 'Official CHM download must create exactly one deadline token source before the redirect loop.'
+    }
+    if ($downloadSource.IndexOf('.CancelAfter(',[StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        throw 'Official CHM download must not rearm its end-to-end deadline.'
+    }
+    if ($downloadSource.Contains('Get-FileHash') -or -not $downloadSource.Contains('-HashAlgorithm')) {
+        throw 'Official CHM SHA-256 is not computed inside the cancellable bounded stream copy.'
+    }
+
+    $negativeExpected = New-Object Threading.CancellationTokenSource
+    $negativeSubstitute = New-Object Threading.CancellationTokenSource
+    $negativeStream = $null
+    $negativeRejected = $false
+    try {
+        $negativeStream = New-Object Mql5ChmSlowReadStream(
+            [Text.Encoding]::ASCII.GetBytes('ITSFdata'),
+            1,
+            $negativeExpected.Token
+        )
+        $negativeBuffer = New-Object byte[] 1
+        [void]$negativeStream.ReadAsync(
+            $negativeBuffer,
+            0,
+            $negativeBuffer.Length,
+            $negativeSubstitute.Token
+        ).GetAwaiter().GetResult()
+    } catch {
+        $negativeFailure = $_.Exception.GetBaseException()
+        if ($negativeFailure.Message -ceq 'Deadline fixture received a different cancellation token.') {
+            $negativeRejected = $true
+        } else {
+            throw
+        }
+    } finally {
+        if ($null -ne $negativeStream) { $negativeStream.Dispose() }
+        $negativeSubstitute.Dispose()
+        $negativeExpected.Dispose()
+    }
+    if (-not $negativeRejected -or -not $negativeStream.TokenMismatch) {
+        throw 'Deadline fixture accepted a deliberately substituted cancellation token.'
+    }
+
     $tempBase = Resolve-FullPath -Path ([IO.Path]::GetTempPath()) -MustExist -PathType Container
     $fixture = Join-Path $tempBase ('mql5-chm-official-download-deadline-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $fixture | Out-Null
     $destination = Join-Path $fixture 'candidate.chm'
-    $observation = [pscustomobject]@{ Calls=0 }
+    $observation = [pscustomobject]@{
+        Calls=0
+        Tokens=@()
+        ExpectedToken=$null
+        Stream=$null
+    }
     $provider = {
         param([uri]$CurrentUri, [Threading.CancellationToken]$CancellationToken)
         $observation.Calls++
-        [void]([Threading.Tasks.Task]::Delay(1000,$CancellationToken).GetAwaiter().GetResult())
+        $observation.Tokens += $CancellationToken
+        if ($observation.Calls -eq 1) {
+            $observation.ExpectedToken = $CancellationToken
+        } elseif (-not $CancellationToken.Equals([Threading.CancellationToken]$observation.ExpectedToken)) {
+            throw 'Deadline fixture observed a reset cancellation token across redirects.'
+        }
         $headers = New-Object Net.WebHeaderCollection
         if ($observation.Calls -le 2) {
             $headers['Location'] = "https://www.mql5.com/files/docs/deadline-$($observation.Calls).chm"
@@ -103,8 +192,10 @@ public sealed class Mql5ChmSlowReadStream : Stream
         } else {
             $stream = New-Object Mql5ChmSlowReadStream(
                 [Text.Encoding]::ASCII.GetBytes('ITSFdata'),
-                500
+                60000,
+                [Threading.CancellationToken]$observation.ExpectedToken
             )
+            $observation.Stream = $stream
             $statusCode = 200
             $contentLength = 8
         }
@@ -122,8 +213,8 @@ public sealed class Mql5ChmSlowReadStream : Stream
         return $response
     }.GetNewClosure()
 
-    $timer = [Diagnostics.Stopwatch]::StartNew()
     $deadlineError = $null
+    $destinationRemained = $false
     try {
         Invoke-OfficialChmDownload `
             -Uri ([uri]'https://www.mql5.com/files/docs/deadline-start.chm') `
@@ -135,7 +226,7 @@ public sealed class Mql5ChmSlowReadStream : Stream
     } catch {
         $deadlineError = $_.Exception.Message
     } finally {
-        $timer.Stop()
+        $destinationRemained = Test-Path -LiteralPath $destination
         if (Test-Path -LiteralPath $fixture -PathType Container) {
             Remove-SafeDirectory -ConfinementRoot $tempBase -Path $fixture
         }
@@ -144,22 +235,28 @@ public sealed class Mql5ChmSlowReadStream : Stream
     if ($null -eq $deadlineError -or $deadlineError -notmatch '5-second deadline') {
         throw "Official CHM download did not enforce one end-to-end deadline. Error: $deadlineError"
     }
-    if ($timer.Elapsed.TotalSeconds -gt 7.0) {
-        throw "Official CHM download deadline reset across redirects or trickle reads: $($timer.Elapsed.TotalSeconds) seconds."
-    }
     if ($observation.Calls -ne 3) {
         throw "Official CHM deadline fixture did not reach the redirected trickle stream: $($observation.Calls) responses."
     }
-
-    $commonSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Common.ps1') -Raw
-    $downloadStart = $commonSource.IndexOf('function Invoke-OfficialChmDownload',[StringComparison]::Ordinal)
-    $downloadEnd = $commonSource.IndexOf('function Get-ValidatedRevisionChecksumFiles',[StringComparison]::Ordinal)
-    if ($downloadStart -lt 0 -or $downloadEnd -le $downloadStart) {
-        throw 'Could not isolate Invoke-OfficialChmDownload for deadline regression validation.'
+    if ($observation.Tokens.Count -ne 3 -or $null -eq $observation.ExpectedToken) {
+        throw 'Official CHM deadline fixture did not record all response cancellation tokens.'
     }
-    $downloadSource = $commonSource.Substring($downloadStart,$downloadEnd-$downloadStart)
-    if ($downloadSource.Contains('Get-FileHash') -or -not $downloadSource.Contains('-HashAlgorithm')) {
-        throw 'Official CHM SHA-256 is not computed inside the cancellable bounded stream copy.'
+    foreach ($observedToken in $observation.Tokens) {
+        if (-not $observedToken.Equals([Threading.CancellationToken]$observation.ExpectedToken)) {
+            throw 'Official CHM download reset its cancellation token across redirects.'
+        }
+    }
+    if ($null -eq $observation.Stream -or $observation.Stream.AsyncReadCalls -lt 1) {
+        throw 'Official CHM deadline fixture did not exercise the cancellable asynchronous stream read.'
+    }
+    if ($observation.Stream.TokenMismatch) {
+        throw 'Official CHM bounded stream copy received a different cancellation token.'
+    }
+    if (-not $observation.Stream.CancellationObserved) {
+        throw 'Official CHM deadline fixture did not observe cancellation during the stream read.'
+    }
+    if ($destinationRemained) {
+        throw 'Official CHM deadline failure left a partial destination.'
     }
 }
 
