@@ -396,10 +396,10 @@ SOFTWARE.
 
 ================================================================================
 Package: fast-uri
-Version: 3.1.4
+Version: 3.1.5
 Instance: node_modules/fast-uri
 License: BSD-3-Clause
-Bundles: server.mjs (27111 bytes)
+Bundles: server.mjs (28238 bytes)
 Notice sources: node_modules/fast-uri/LICENSE
 ================================================================================
 

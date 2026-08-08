@@ -274,17 +274,17 @@ test("release version remains consistent across package, runtime, documentation,
 
 test("release identity validation rejects mixed current and stale product versions", () => {
   const fixture = [
-    "'mql5-chm-mcp/1.2.5'",
-    "'mql5-chm-mcp-packager/1.2.4'",
+    "'mql5-chm-mcp/1.2.6'",
+    "'mql5-chm-mcp-packager/1.2.5'",
   ].join("\n");
   assert.throws(
     () => assertCurrentProductVersions(
       fixture,
       releaseIdentityPattern(String.raw`mql5-chm-mcp(?:-packager)?\/`, "'"),
-      "1.2.5",
+      "1.2.6",
       "identity fixture",
     ),
-    /reports stale product release 1\.2\.4/u,
+    /reports stale product release 1\.2\.5/u,
   );
 });
 

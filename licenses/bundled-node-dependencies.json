@@ -276,13 +276,13 @@
     },
     {
       "name": "fast-uri",
-      "version": "3.1.4",
+      "version": "3.1.5",
       "instance": "node_modules/fast-uri",
       "license": "BSD-3-Clause",
       "bundles": [
         {
           "name": "server.mjs",
-          "bytes_in_output": 27111
+          "bytes_in_output": 28238
         }
       ],
       "notices": [
