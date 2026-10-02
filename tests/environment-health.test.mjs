@@ -11,6 +11,7 @@ import { buildFixture } from "./helpers/runtime-fixture.mjs";
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const packageVersion = JSON.parse(await readFile(path.join(repository, "package.json"), "utf8")).version;
 const peerSkill = process.env.MQL5_HEALTH_SKILL_ROOT;
+const skillVersion = peerSkill ? JSON.parse(await readFile(path.join(peerSkill, "version.json"), "utf8")).version : null;
 const python = process.env.MQL5_HEALTH_PYTHON;
 const hash = bytes => createHash("sha256").update(bytes).digest("hex");
 
@@ -136,7 +137,7 @@ for (const shell of ["pwsh.exe", "powershell.exe"]) {
       assert.equal(report.mcp.source_comparison.status, "same");
       assert.equal(report.skill.source_comparison.status, "same");
       assert.equal(report.skill.file_count, 21);
-      assert.equal(report.skill.declared_version, "1.0.0");
+      assert.equal(report.skill.declared_version, skillVersion);
       assert.match(report.skill.fingerprint_sha256, /^[0-9a-f]{64}$/u);
       assert.equal(report.skill.fingerprint_sha256, hash(Buffer.from(Object.keys(originalSkill).sort().map(name => `${name}\0${originalSkill[name]}`).join("\n"))), "Inventory fingerprints must agree across PowerShell versions");
       assert.equal(report.metaeditor.candidates[0].build, 6230);
