@@ -55,6 +55,8 @@ The skill has the [installed health command and options](https://github.com/sham
 
 The counterpart skill also ships [reusable project profiles](https://github.com/shamwi2846/MQL5-Coding-Skill/blob/main/skills/mql5-coding/references/project-profiles.md). The current health gate expects its seventeen-file package, including the profile validator, creation/invocation commands, and reference. Profile regression tests run in the skill's Windows CI under both shells. These additions require no change to the production MCP runtime or documentation interface.
 
+Generated profiles keep files inside the EA project relative and external selections absolute, preserving the selected include/preset when the project moves. Saving a profile does not save executable trust or execution acknowledgement.
+
 Each repository's `.github/workflows/skill-compatibility.yml` checks out its event revision and the counterpart's `main`; a manual run can select another `peer_ref`. Both exact resolved commits are recorded in the artifact. Node and Python versions, dependency lockfiles, and action commits are pinned. MCP release packaging has `needs: compatibility`; skill tag pushes run the pair check as well.
 
 Each repository needs an Actions secret named `MQL5_PEER_READ_KEY`: a unique read-only SSH deploy key registered on the counterpart repository. Create separate keys for each direction. Never store private keys in source control, use write access, or copy an account's broad token into CI. Checkouts set `persist-credentials: false`. Fork pull requests skip the secret-bearing job; trusted runs fail when the credential is missing. Rotate a target deploy key and its corresponding consumer secret together.
