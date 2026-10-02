@@ -137,4 +137,4 @@ See `SPEC.md` for the complete public contract.
 
 ## Skill compatibility
 
-Both repositories verify the actual MCP server against the [MQL5 coding skill](https://github.com/shamwi2846/MQL5-Coding-Skill)'s packaged consumer contract on trusted pushes and pull requests. MCP release validation also requires this check. Each successful run retains both repository revisions and artifact hashes. See [the compatibility guide](docs/skill-compatibility.md) for the checks, private-repository CI credentials, and local or installed-pair commands.
+Both repositories verify the actual MCP server against the [MQL5 coding skill](https://github.com/shamwi2846/MQL5-Coding-Skill)'s packaged consumer contract on trusted pushes and pull requests. MCP release validation also requires this check. Each successful run retains both repository revisions and artifact hashes. See [the compatibility guide](https://github.com/shamwi2846/MQL5-CHM-MCP/blob/main/docs/skill-compatibility.md) for the checks, private-repository CI credentials, and local or installed-pair commands.
