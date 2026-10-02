@@ -1,0 +1,98 @@
+name: MCP and skill compatibility
+
+on:
+  workflow_call:
+    inputs:
+      peer_ref:
+        description: Counterpart branch, tag, or commit to verify
+        type: string
+        default: main
+    secrets:
+      MQL5_PEER_READ_KEY:
+        required: true
+  workflow_dispatch:
+    inputs:
+      peer_ref:
+        description: Counterpart branch, tag, or commit to verify
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  pair:
+    name: Verify the actual MCP and skill pair
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out this revision without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: mcp
+          persist-credentials: false
+
+      - name: Check out the counterpart with a read-only deploy key
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ github.repository_owner }}/MQL5-Coding-Skill
+          ref: ${{ inputs.peer_ref || 'main' }}
+          path: skill
+          ssh-key: ${{ secrets.MQL5_PEER_READ_KEY }}
+          persist-credentials: false
+
+      - name: Use Node.js 24.17.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24.17.0
+          package-manager-cache: false
+
+      - name: Use Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+          architecture: x64
+
+      - name: Install the hash-pinned skill validator dependency
+        shell: pwsh
+        run: >-
+          python -m pip install --disable-pip-version-check --only-binary=:all:
+          --require-hashes -r skill/.github/requirements-ci.txt
+
+      - name: Validate the actual skill package and consumer contract
+        shell: pwsh
+        run: |
+          python -B skill/tests/validate_skill.py
+          if ($LASTEXITCODE -ne 0) { throw 'Skill package validation failed.' }
+          python -B skill/tests/test_mcp_contract.py
+          if ($LASTEXITCODE -ne 0) { throw 'Skill consumer contract regressions failed.' }
+
+      - name: Install locked MCP dependencies
+        working-directory: mcp
+        shell: pwsh
+        run: npm ci
+
+      - name: Build the actual MCP server
+        working-directory: mcp
+        shell: pwsh
+        run: npm run build:candidate
+
+      - name: Exercise the skill contract against the real stdio server
+        shell: pwsh
+        run: |
+          $pythonPath = (Get-Command python.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+          node mcp/scripts/Test-SkillCompatibility.mjs --skill-root skill/skills/mql5-coding --python $pythonPath --report compatibility.json
+          if ($LASTEXITCODE -ne 0) { throw 'MCP and skill compatibility failed.' }
+          $proof = Get-Content -LiteralPath compatibility.json -Raw | ConvertFrom-Json
+          "MCP commit: $($proof.mcp_checkout_commit)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "Skill commit: $($proof.skill_checkout_commit)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          "Passed checks: $($proof.checks.Count)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Retain the verified repository pair
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: mql5-compatibility-${{ github.sha }}
+          path: compatibility.json
+          if-no-files-found: error
+          retention-days: 30

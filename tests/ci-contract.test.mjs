@@ -13,6 +13,34 @@ const SETUP_NODE_ACTION = "actions/setup-node@820762786026740c76f36085b0efc47a31
 const UPLOAD_ARTIFACT_ACTION = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
 const PINNED_HONO_NODE_SERVER_VERSION = "2.0.11";
 const APPROVED_HONO_NODE_SERVER_VERSIONS = new Set([PINNED_HONO_NODE_SERVER_VERSION]);
+
+test("compatibility CI tests the real private skill and gates release packaging", async () => {
+  const workflow = await text(".github/workflows/skill-compatibility.yml");
+  assert.match(workflow, /workflow_call:/u);
+  assert.match(workflow, /MQL5_PEER_READ_KEY:\s*\n\s*required: true/u);
+  assert.match(workflow, /github\.event\.pull_request\.head\.repo\.full_name == github\.repository/u);
+  const checkouts = verifiedActionSteps(workflow, "actions/checkout@", "compatibility CI");
+  assert.equal(checkouts.length, 2);
+  const peer = actionStepInputs(checkouts[1]);
+  assert.equal(peer.get("repository"), "${{ github.repository_owner }}/MQL5-Coding-Skill");
+  assert.equal(peer.get("ssh-key"), "${{ secrets.MQL5_PEER_READ_KEY }}");
+  assert.equal(peer.get("persist-credentials"), "false");
+  assert.equal(peer.get("path"), "skill");
+  assert.match(workflow, /npm run build:candidate/u);
+  assert.match(workflow, /Test-SkillCompatibility\.mjs --skill-root skill\/skills\/mql5-coding --python \$pythonPath --report compatibility\.json/u);
+  assert.match(workflow, /--require-hashes -r skill\/\.github\/requirements-ci\.txt/u);
+  assert.match(workflow, /mcp_checkout_commit/u);
+  assert.match(workflow, /skill_checkout_commit/u);
+  const upload = verifiedActionSteps(workflow, "actions/upload-artifact@", "compatibility CI");
+  assert.equal(upload.length, 1);
+  assert.equal(actionStepUses(upload[0]), UPLOAD_ARTIFACT_ACTION);
+  assert.equal(actionStepInputs(upload[0]).get("if-no-files-found"), "error");
+  for (const file of ["windows-ci.yml", "release-validation.yml"]) {
+    assert.match(await text(`.github/workflows/${file}`), /uses: \.\/\.github\/workflows\/skill-compatibility\.yml\s*\n\s*secrets: inherit/u);
+  }
+  assert.match(await text(".github/workflows/release-validation.yml"), /release:\s*\n\s*needs: compatibility/u);
+  assert.match(JSON.parse(await text("package.json")).scripts["test:fast"], /tests\/skill-compatibility\.test\.mjs/u);
+});
 const RELEASE_VERSION_SOURCE = String.raw`(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?`;
 
 async function text(relativePath) {

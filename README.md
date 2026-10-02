@@ -134,3 +134,7 @@ Uninstalling is a no-op when `mql5-chm` is absent. It removes only a registratio
 OCR, image conversion, resize/transcoding, extracted HTML, and native image-processing runtimes are not included.
 
 See `SPEC.md` for the complete public contract.
+
+## Skill compatibility
+
+Both repositories verify the actual MCP server against the [MQL5 coding skill](https://github.com/shamwi2846/MQL5-Coding-Skill)'s packaged consumer contract on trusted pushes and pull requests. MCP release validation also requires this check. Each successful run retains both repository revisions and artifact hashes. See [the compatibility guide](docs/skill-compatibility.md) for the checks, private-repository CI credentials, and local or installed-pair commands.
