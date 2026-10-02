@@ -137,4 +137,6 @@ See `SPEC.md` for the complete public contract.
 
 ## Skill compatibility
 
+For installation troubleshooting, the coding skill supplies one read-only `Test-Mql5Environment.ps1` command. It checks Codex registration, the installed package's listed checksums and pinned Node version, actual MCP stdio startup, source differences, skill contents, MetaEditor paths, and Python availability. It never starts MetaEditor or MT5. See the skill's [environment health command](https://github.com/shamwi2846/MQL5-Coding-Skill/blob/main/skills/mql5-coding/references/environment-health.md) for invocation and limits. Both repositories exercise it against a real MCP bundle on Windows under PowerShell 7 and Windows PowerShell 5.1 in their compatibility job.
+
 Both repositories verify the actual MCP server against the [MQL5 coding skill](https://github.com/shamwi2846/MQL5-Coding-Skill)'s packaged consumer contract on trusted pushes and pull requests. MCP release validation also requires this check. Each successful run retains both repository revisions and artifact hashes. See [the compatibility guide](https://github.com/shamwi2846/MQL5-CHM-MCP/blob/main/docs/skill-compatibility.md) for the checks, private-repository CI credentials, and local or installed-pair commands.

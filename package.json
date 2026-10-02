@@ -26,7 +26,8 @@
     "stage-update": "powershell -NoProfile -ExecutionPolicy Bypass -File ./Update-Documentation.ps1 -Stage",
     "test": "npm run test:fast",
     "package:portable": "powershell -NoProfile -ExecutionPolicy Bypass -File ./Package-Portable.ps1",
-    "test:skill-compatibility": "node scripts/Test-SkillCompatibility.mjs"
+    "test:skill-compatibility": "node scripts/Test-SkillCompatibility.mjs",
+    "test:environment-health": "node --test tests/environment-health.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",

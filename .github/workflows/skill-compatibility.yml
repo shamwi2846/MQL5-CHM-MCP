@@ -89,6 +89,14 @@ jobs:
           "Skill commit: $($proof.skill_checkout_commit)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
           "Passed checks: $($proof.checks.Count)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
 
+      - name: Test the environment health command under both PowerShell versions
+        shell: pwsh
+        run: |
+          $env:MQL5_HEALTH_SKILL_ROOT = (Resolve-Path skill/skills/mql5-coding).Path
+          $env:MQL5_HEALTH_PYTHON = (Get-Command python.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+          node --test mcp/tests/environment-health.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Environment health regression tests failed.' }
+
       - name: Retain the verified repository pair
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
