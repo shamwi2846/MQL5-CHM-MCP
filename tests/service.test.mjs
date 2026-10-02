@@ -227,6 +227,27 @@ test("read supports focus and opaque continuation", () => {
   );
 });
 
+test("read supports focus on API names and aliases without selecting unrelated sections", () => {
+  for (const [focus, expectedHeading, maxChars] of [["CopyBuffer", "CopyBuffer", 1200], ["SYMBOL_VOLUME_STEP", "Symbol Properties", 1200], ["OBJPROP_FONT", "Object Properties", null], ["ACCOUNT_CURRENCY", "Account Properties", 1200], ["CHART_SCALE", "Chart Properties", 500]]) {
+    const hit = service.search({ query: focus, source: "mql5", expand: false, limit: 1 }).results[0];
+    assert.equal(hit.match_kind, "exact");
+    const focused = service.read({ topic_id: hit.topic_id, focus, ...(maxChars ? { max_chars: maxChars } : {}), include_related: false, include_images: false });
+    assert.equal(focused.section_heading, expectedHeading);
+    assert.match(focused.text, new RegExp(`(?<![A-Za-z0-9_])${focus}(?![A-Za-z0-9_])`, "u"));
+    assert.equal(focused.focus_match, "exact");
+  }
+});
+
+test("read supports focus match status for absent and approximate queries", () => {
+  const hit = service.search({ query: "CopyBuffer", source: "mql5", expand: false, limit: 1 }).results[0];
+  const unmatched = service.read({ topic_id: hit.topic_id, focus: "zzzzzzzzzzzzz_987654321", include_related: false, include_images: false });
+  assert.equal(unmatched.focus_match, "none");
+  assert.equal(unmatched.section_id, null);
+  const approximate = service.read({ topic_id: hit.topic_id, focus: "Retun Value", include_related: false, include_images: false });
+  assert.equal(approximate.focus_match, "approximate");
+  assert.equal(approximate.section_heading, "Return Value");
+});
+
 test("service handlers enforce bounds and stable IDs", () => {
   assert.throws(() => service.search({ query: "", limit: 3 }), /query/i);
   assert.throws(() => service.search({ query: "x".repeat(201), limit: 3 }), /query/i);

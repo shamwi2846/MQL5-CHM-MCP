@@ -17,6 +17,8 @@ Text and image continuation cursors are opaque, revision-bound HMAC tokens authe
 
 `mql5_chm_search.limit` must be an integer from 1 through 8. `mql5_chm_read.max_chars` must be an integer from 500 through 8,000 and must not exceed 8,000. Out-of-range values are rejected and are never silently clamped.
 
+For a focused read, `focus_match` reports `exact`, `approximate`, or `none`; it is `null` for unfocused reads and continuation pages. An exact match must occur in the returned bounded passage; a phrase extending beyond that passage is reported as approximate. Token boundaries are checked against the original documentation, so truncating an identifier suffix cannot turn a partial match into an exact match. Complete identifiers and phrases take priority over partial matches, so `OBJPROP_FONT` is preferred over the prefix in `OBJPROP_FONTSIZE`. Approximate and absent matches include a text notice. An absent focus without an explicit section returns a bounded topic passage rather than an arbitrary section. Verify the complete requested identifier in the returned passage before using it as documentation support.
+
 When documentation supports a final answer, use the structured citation metadata: name the exact returned topic `title`, or the exact read `section_heading` when present; include the stable `citation.topic_id` and relevant `citation.section_id`; and state `citation.corpus_revision` or `citation.index_revision` once per answer when multiple findings share that revision. The structured citation also retains the source filename. Revision metadata does not need to be repeated in every paragraph.
 
 ## Install in Codex

@@ -181,6 +181,30 @@ const fakeService = {
   },
 };
 
+test("focused MCP results expose exact, approximate, and missing match status", async () => {
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const service = { ...fakeService, read(input) { return { ...fakeService.read(), focus_match: input.focus ?? null }; } };
+  const server = createMcpServer(service);
+  const client = new Client({ name: "mql5-chm-focus-test", version: "1.0.0" });
+  try {
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    for (const focus of ["exact", "approximate", "none"]) {
+      const read = await client.callTool({ name: "mql5_chm_read", arguments: { topic_id: topicId, focus } });
+      assert.equal(read.isError, undefined);
+      assert.equal(read.structuredContent.focus_match, focus);
+      if (focus === "none") assert.match(read.content[0].text, /^No match for the requested focus/u);
+      if (focus === "approximate") assert.match(read.content[0].text, /^Approximate focus match/u);
+      if (focus === "exact") assert.ok(read.content[0].text.startsWith("Return Value"));
+    }
+    const unfiltered = await client.callTool({ name: "mql5_chm_read", arguments: { topic_id: topicId } });
+    assert.equal(unfiltered.structuredContent.focus_match, null);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
 test("source MCP exposes v1.2 schemas and keeps text and image bytes in separate content fields", async () => {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const server = createMcpServer(fakeService);

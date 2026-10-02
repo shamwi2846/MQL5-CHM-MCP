@@ -57,7 +57,8 @@ Update documentation:
 
 ## Product Context
 
-- Project root: `C:\Users\Shari\Desktop\MCP CHM MQL5`
+- Workspace root: `C:\Users\Shari\Desktop\MQL5 EAS\MQL5 CODEX`
+- Development project root: `C:\Users\Shari\Desktop\MQL5 EAS\MQL5 CODEX\MQL5-CHM-MCP-main\MQL5-CHM-MCP-main`
 - Initial trusted sources: `mql5.chm`, `mql5book.chm`, `neuronetworksbook.chm`
 - Initial corpus: 4,134 + 581 + 112 = 4,827 HTML topics
 - Initial searchable sections: 16,261
@@ -123,6 +124,7 @@ Inputs:
 Results:
 
 - Source metadata, source/index revision, offsets, bounded passage, compact citation footer, structured citation, related-topic metadata, `next_cursor`, bounded `images`, `image_count`, and `next_image_cursor`
+- `focus_match` is `exact`, `approximate`, or `none` for an initial focused read and `null` for unfocused reads and continuation pages. An exact match must occur in the returned bounded passage; a phrase extending beyond that passage is approximate. Token boundaries are checked against the original documentation, so truncating an identifier suffix cannot turn a partial match into an exact match. Complete identifier/phrase matches take priority over partial matches. Approximate and unmatched focus results include an explicit text notice; an unmatched focus without an explicit section falls back to the topic rather than an arbitrary section. Callers must verify the complete identifier in the actual returned passage before asserting support.
 - Related topics contain metadata only and never duplicate their body text
 - Image references contain only asset ID, contextual caption, detected MIME, dimensions, byte count, section ID, occurrence count, and topic citation; they never contain binary or base64
 - Topic-wide reads cover the topic. Section/focus reads cover the selected section. Returned asset IDs are deduplicated while occurrence counts are retained and ordering is deterministic by section, rendered-text offset, and occurrence ordinal.

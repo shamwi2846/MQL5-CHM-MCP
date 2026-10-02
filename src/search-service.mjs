@@ -403,13 +403,7 @@ function compactWhitespace(value) {
 function makeSnippet(content, query, maximum = 500) {
   const text = compactWhitespace(content);
   if (text.length <= maximum) return text;
-  const lowerText = text.toLowerCase();
-  const terms = [String(query ?? "").trim(), ...ftsTokens(query)].filter(Boolean).sort((left, right) => right.length - left.length);
-  let matchAt = -1;
-  for (const term of terms) {
-    matchAt = lowerText.indexOf(term.toLowerCase());
-    if (matchAt >= 0) break;
-  }
+  const matchAt = findFocusMatch(text, query).index;
   const contextBefore = Math.floor(maximum * 0.28);
   let start = matchAt < 0 ? 0 : Math.max(0, matchAt - contextBefore);
   let end = Math.min(text.length, start + maximum);
@@ -1664,15 +1658,33 @@ function exactQueryTerms(query) {
   ).map(normalizeText).filter((term) => term && !SEARCH_STOPWORDS.has(term));
   return [...new Set([wholeQuery, ...identifierTerms ?? []].filter(Boolean))].slice(0, 16);
 }
+function findFocusMatch(text, focus, start = 0, end = text.length) {
+  const phrase = String(focus ?? "").trim();
+  if (!phrase) return { index: -1, kind: "none" };
+  const escape = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = phrase.split(/\s+/u).map(escape).join("\\s+");
+  const findWithin = (pattern) => {
+    const expression = new RegExp(pattern, "giu");
+    expression.lastIndex = start;
+    const match = expression.exec(text);
+    return match && match.index + match[0].length <= end ? match : null;
+  };
+  const exact = findWithin("(?<![\\p{L}\\p{N}_])" + pattern + "(?![\\p{L}\\p{N}_])");
+  if (exact) return { index: exact.index, kind: "exact" };
+  const terms = ftsTokens(phrase).sort((a, b) => b.length - a.length);
+  for (const term of terms) {
+    const match = findWithin("(?<![\\p{L}\\p{N}_])" + escape(term) + "(?![\\p{L}\\p{N}_])");
+    if (match) return { index: match.index, kind: "approximate" };
+  }
+  for (const term of [phrase, ...terms]) {
+    const match = findWithin(escape(term));
+    if (match) return { index: match.index, kind: "approximate" };
+  }
+  return { index: -1, kind: "none" };
+}
 function locateFocusOffset(text, focus, maxChars) {
   if (!focus || text.length <= maxChars) return 0;
-  const lowerText = text.toLowerCase();
-  const terms = [focus.trim(), ...ftsTokens(focus)].filter(Boolean).sort((a, b) => b.length - a.length);
-  let at = -1;
-  for (const term of terms) {
-    at = lowerText.indexOf(term.toLowerCase());
-    if (at >= 0) break;
-  }
+  const at = findFocusMatch(text, focus).index;
   return at < 0 ? 0 : safeUtf16Boundary(text, Math.max(0, at - Math.floor(maxChars * 0.2)));
 }
 function boundedEnd(text, start, maximum) {
@@ -1950,12 +1962,16 @@ var Mql5ChmSearchService = class {
   #selectFocusedSection(topicId, focus) {
     const ftsQuery = buildFtsQuery(focus);
     if (ftsQuery) {
-      const row = this.database.prepare(
-        "SELECT s.section_id, s.heading, s.start_offset, s.end_offset, s.content, bm25(search_fts, 0.0, 0.0, 0.0, 8.0, 7.0, 10.0, 3.0, 1.0) AS rank FROM search_fts f JOIN sections s ON s.section_id=f.section_id WHERE search_fts MATCH ? AND f.topic_id=? AND f.section_id IS NOT NULL ORDER BY rank LIMIT 1"
-      ).get(ftsQuery, topicId);
-      if (row) return row;
+      // Topic metadata is repeated on every section; only section text can locate the focus.
+      const rows = this.database.prepare(
+        "SELECT s.section_id, s.heading, s.start_offset, s.end_offset, s.content, bm25(search_fts, 0.0, 0.0, 0.0, 8.0, 7.0, 10.0, 3.0, 1.0) AS rank FROM search_fts f JOIN sections s ON s.section_id=f.section_id WHERE search_fts MATCH ? AND f.topic_id=? AND f.section_id IS NOT NULL ORDER BY rank, s.ordinal"
+      ).all(`{heading body}: (${ftsQuery})`, topicId);
+      const exact = rows.find((row) => findFocusMatch(row.content, focus).kind === "exact" || findFocusMatch(row.heading, focus).kind === "exact");
+      if (exact) return { ...exact, focus_match: "exact" };
+      if (rows.length) return { ...rows[0], focus_match: "approximate" };
     }
     const normalizedFocus = normalizeText(focus);
+    if (!normalizedFocus) return null;
     const sections = this.database.prepare(
       "SELECT section_id, heading, start_offset, end_offset, content FROM sections WHERE topic_id=? ORDER BY ordinal"
     ).all(topicId);
@@ -1970,7 +1986,7 @@ var Mql5ChmSearchService = class {
         best = section;
       }
     }
-    return best;
+    return best && bestScore >= fuzzyThreshold(focus) ? { ...best, focus_match: "approximate" } : null;
   }
   #relatedTopics(topic, limit) {
     if (limit <= 0) return [];
@@ -2085,6 +2101,8 @@ var Mql5ChmSearchService = class {
     let selectedSectionId = sectionId ?? null;
     let selectedText = topic.content;
     let selectedHeading = null;
+    let selectedFocusKind = null;
+    let focusMatch = null;
     let topicBaseOffset = 0;
     let offset = 0;
     let imageStart = 0;
@@ -2096,7 +2114,10 @@ var Mql5ChmSearchService = class {
       offset = continuation.offset;
     } else if (!sectionId && focus) {
       const focused = this.#selectFocusedSection(topicId, focus);
-      if (focused) selectedSectionId = focused.section_id;
+      if (focused) {
+        selectedSectionId = focused.section_id;
+        selectedFocusKind = focused.focus_match;
+      }
     }
     if (selectedSectionId) {
       const section = this.database.prepare(
@@ -2107,7 +2128,9 @@ var Mql5ChmSearchService = class {
       selectedHeading = section.heading;
       topicBaseOffset = section.start_offset;
     }
-    if (!cursor && !imageCursor && focus) offset = locateFocusOffset(selectedText, focus, maxChars);
+    if (!cursor && !imageCursor && focus) {
+      offset = locateFocusOffset(selectedText, focus, maxChars);
+    }
     if (offset < 0 || offset >= selectedText.length + (selectedText.length === 0 ? 1 : 0)) {
       fail("INVALID_CURSOR", "The continuation cursor offset is outside the selected documentation text.");
     }
@@ -2116,6 +2139,11 @@ var Mql5ChmSearchService = class {
     }
     const end = imageCursor ? offset : boundedEnd(selectedText, offset, maxChars);
     const text = imageCursor ? "" : selectedText.slice(offset, end);
+    if (!cursor && !imageCursor && focus) {
+      // Keep original token boundaries while requiring the full match inside this passage.
+      const match = findFocusMatch(selectedText, focus, offset, end);
+      focusMatch = match.kind === "exact" ? "exact" : match.kind === "approximate" || selectedFocusKind ? "approximate" : "none";
+    }
     const nextCursor = !imageCursor && end < selectedText.length ? encodeCursor({ indexRevision: this.indexSha256, topicId, sectionId: selectedSectionId, offset: end }) : null;
     const imagePage = includeImages
       ? this.#topicImages(topic, selectedSectionId, imageStart, imageLimit)
@@ -2130,6 +2158,7 @@ var Mql5ChmSearchService = class {
       source_revision: this.manifest.sources[topic.source].sha256,
       corpus_revision: this.manifest.corpus_sha256,
       section_heading: selectedHeading,
+      focus_match: focusMatch,
       start_offset: offset,
       end_offset: end,
       topic_start_offset: topicBaseOffset + offset,

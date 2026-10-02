@@ -144,7 +144,10 @@ function readText(result) {
     return `Continued image references for ${result.title}. No documentation passage was repeated.\n\n${citationFooter(result.citation)}`;
   }
   const passage = result.text.replace(/\s+$/u, "");
-  return `${passage}\n\n${citationFooter(result.citation)}`;
+  const focusNotice = result.focus_match === "none"
+    ? "No match for the requested focus. Showing the selected documentation.\n\n"
+    : result.focus_match === "approximate" ? "Approximate focus match. Verify the requested identifier in the passage.\n\n" : "";
+  return `${focusNotice}${passage}\n\n${citationFooter(result.citation)}`;
 }
 
 function conciseReadOutput(result) {
@@ -272,6 +275,7 @@ export function createMcpServer(service) {
         breadcrumb: z.string(),
         signature: z.string(),
         section_heading: nullableTextSchema,
+        focus_match: z.enum(["exact", "approximate", "none"]).nullable().optional(),
         start_offset: z.number().int().nonnegative(),
         end_offset: z.number().int().nonnegative(),
         topic_start_offset: z.number().int().nonnegative(),

@@ -72,6 +72,11 @@ test("FTS input is tokenized instead of accepting raw syntax", () => {
   assert.ok(makeSnippet("x".repeat(2_000), "x", 500).length <= 500);
 });
 
+test("identifier snippets prefer complete tokens over longer names", () => {
+  const content = `OBJPROP_FONTSIZE ${"x".repeat(1_000)} OBJPROP_FONT ${"y".repeat(1_000)}`;
+  assert.match(makeSnippet(content, "OBJPROP_FONT", 500), /(?<![A-Za-z0-9_])OBJPROP_FONT(?![A-Za-z0-9_])/u);
+});
+
 test("snippets preserve complete UTF-16 surrogate pairs at truncation edges", () => {
   const unpairedSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u;
   const trailingBoundary = makeSnippet(`${"A".repeat(498)}😀${"B".repeat(20)}`, "not-present", 500);
@@ -213,9 +218,107 @@ test("text continuation preserves supplementary Unicode at UTF-16 boundaries", (
     assert.ok(focused.text.startsWith("😀"));
     assert.match(focused.text, /needle/u);
     assert.doesNotMatch(focused.text, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u);
+    const caseExpandedContent = `${"İ".repeat(1_000)} needle ${"z".repeat(900)}`;
+    database.prepare("UPDATE topics SET content_sha256=?, content=?, content_length=? WHERE topic_id=?")
+      .run(createHash("sha256").update(caseExpandedContent, "utf8").digest("hex"), caseExpandedContent, caseExpandedContent.length, topicId);
+    const caseExpanded = unicodeService.read({ topic_id: topicId, focus: "needle", max_chars: 500, include_related: false, include_images: false });
+    assert.match(caseExpanded.text, /needle/u);
+    assert.equal(caseExpanded.focus_match, "exact");
   } finally {
     database.close();
     rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("focused reads match section headings and bodies instead of shared topic metadata", () => {
+  const database = new DatabaseSync(":memory:");
+  const topicId = makeTopicId("mql5", "focus-api.htm");
+  const longFocus = "A".repeat(150);
+  const tokenHead = `${longFocus}_suffix\n`;
+  const tokenPrefix = `${tokenHead}${"x".repeat(500 - longFocus.length - tokenHead.length - 1)} ${longFocus}`;
+  const sections = [
+    { heading: "FocusApi", content: `FocusApi\nalias_only_more breadcrumb_only_more\n${"Detailed documentation. ".repeat(100)}\nalias_only breadcrumb_only` },
+    { heading: "See also", content: "See also\nOtherApi" },
+    { heading: "Return Value", content: "Return Value\nTrue on success." },
+    { heading: "alias_only_suffix", content: "alias_only_suffix\nShort unrelated identifier." },
+    { heading: "Spaced Phrase", content: `Spaced Phrase\n${"Context. ".repeat(130)}\nalpha${" ".repeat(650)}beta\n${"Tail. ".repeat(130)}` },
+    { heading: "Clipped suffix", content: `${tokenPrefix}_suffix` },
+    { heading: "Clipped Unicode suffix", content: `${tokenPrefix}\u{10400}` },
+    { heading: "Complete token at limit", content: tokenPrefix },
+  ];
+  const content = sections.map((section) => section.content).join("\n");
+  try {
+    createSchema(database);
+    database.prepare(`
+      INSERT INTO sources(source, chm_filename, chm_sha256, chm_bytes, topic_count, section_count)
+      VALUES('mql5', 'mql5.chm', ?, 1, 1, ?)
+    `).run("b".repeat(64), sections.length);
+    database.prepare(`
+      INSERT INTO topics(topic_id, source, internal_path, title, normalized_title, breadcrumb, signature, content_sha256, content, content_length)
+      VALUES(?, 'mql5', 'focus-api.htm', 'FocusApi', 'focusapi', 'Reference > breadcrumb_only', '', ?, ?, ?)
+    `).run(topicId, createHash("sha256").update(content, "utf8").digest("hex"), content, content.length);
+    let offset = 0;
+    for (const [ordinal, section] of sections.entries()) {
+      const sectionId = makeSectionId(topicId, ordinal);
+      database.prepare(`
+        INSERT INTO sections(section_id, topic_id, ordinal, heading, start_offset, end_offset, content)
+        VALUES(?, ?, ?, ?, ?, ?, ?)
+      `).run(sectionId, topicId, ordinal, section.heading, offset, offset + section.content.length, section.content);
+      database.prepare(`
+        INSERT INTO search_fts(topic_id, section_id, source, title, aliases, heading, breadcrumb, body)
+        VALUES(?, ?, 'mql5', 'FocusApi', 'alias_only', ?, 'Reference > breadcrumb_only', ?)
+      `).run(topicId, sectionId, section.heading, section.content);
+      offset += section.content.length + 1;
+    }
+    const focusedService = new Mql5ChmSearchService(database, {
+      databaseHash: "c".repeat(64),
+      manifest: {
+        schema_version: 2,
+        corpus_sha256: "a".repeat(64),
+        sources: { mql5: { filename: "mql5.chm", sha256: "b".repeat(64) } },
+      },
+    });
+    const read = (focus) => focusedService.read({
+      topic_id: topicId, focus, max_chars: 500, include_related: false, include_images: false,
+    });
+    for (const focus of ["FocusApi", "alias_only", "breadcrumb_only", "FocusApi alias_only"]) {
+      assert.equal(read(focus).section_id, makeSectionId(topicId, 0), focus);
+    }
+    assert.doesNotThrow(() => read('alias_only OR * "bad"'));
+    assert.match(read("alias_only").text, /(?<![A-Za-z0-9_])alias_only(?![A-Za-z0-9_])/u);
+    assert.equal(read("alias_only").focus_match, "exact");
+    assert.equal(read("alias_on").focus_match, "approximate");
+    assert.equal(read("Return Value").section_id, makeSectionId(topicId, 2));
+    assert.equal(read("Retun Value").section_id, makeSectionId(topicId, 2));
+    assert.equal(read("Retun Value").focus_match, "approximate");
+    const clippedPhrase = read("alpha beta");
+    assert.equal(clippedPhrase.focus_match, "approximate");
+    assert.ok(clippedPhrase.text.includes("alpha"));
+    assert.ok(!clippedPhrase.text.includes("beta"));
+    assert.ok(clippedPhrase.next_cursor);
+    const completePhrase = focusedService.read({ topic_id: topicId, focus: "alpha beta", max_chars: 1200, include_related: false, include_images: false });
+    assert.equal(completePhrase.focus_match, "exact");
+    assert.match(completePhrase.text, /alpha\s+beta/u);
+    for (const ordinal of [5, 6]) {
+      const clippedToken = focusedService.read({ topic_id: topicId, section_id: makeSectionId(topicId, ordinal), focus: longFocus, max_chars: 500, include_related: false, include_images: false });
+      assert.equal(clippedToken.end_offset, 500);
+      assert.ok(clippedToken.text.endsWith(longFocus));
+      assert.equal(clippedToken.focus_match, "approximate");
+      assert.ok(clippedToken.next_cursor);
+      const fullToken = focusedService.read({ topic_id: topicId, section_id: makeSectionId(topicId, ordinal), focus: longFocus, max_chars: 600, include_related: false, include_images: false });
+      assert.equal(fullToken.focus_match, "approximate");
+    }
+    const completeToken = focusedService.read({ topic_id: topicId, section_id: makeSectionId(topicId, 7), focus: longFocus, max_chars: 500, include_related: false, include_images: false });
+    assert.equal(completeToken.end_offset, 500);
+    assert.equal(completeToken.focus_match, "exact");
+    for (const focus of ["zzzzzzzzzzzzz_987654321", "!!!"]) {
+      const unmatched = read(focus);
+      assert.equal(unmatched.focus_match, "none");
+      assert.equal(unmatched.section_id, null);
+    }
+    assert.equal(focusedService.read({ topic_id: topicId, include_related: false, include_images: false }).focus_match, null);
+  } finally {
+    database.close();
   }
 });
 
