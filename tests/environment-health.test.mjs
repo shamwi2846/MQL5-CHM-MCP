@@ -38,7 +38,9 @@ public class FakeCodex {
     string state = Environment.GetEnvironmentVariable("MQL5_HEALTH_FAKE_STATE");
     if (args.Length == 1 && args[0] == "--version") { Console.WriteLine("codex-cli 0.159.0"); return 0; }
     if (args.Length == 4 && args[0] == "mcp" && args[1] == "get" && args[2] == "mql5-chm" && args[3] == "--json") {
-      if (Environment.GetEnvironmentVariable("CODEX_HOME") != File.ReadAllText(Path.Combine(state, "home.txt"))) return 9;
+      // Verify the selected directory, allowing Windows short/long path aliases.
+      string home = Environment.GetEnvironmentVariable("CODEX_HOME");
+      if (home == null || File.ReadAllText(Path.Combine(home, "health-home-marker.txt")) != File.ReadAllText(Path.Combine(state, "home.txt"))) return 9;
       string mode = File.ReadAllText(Path.Combine(state, "mode.txt"));
       if (mode == "timeout") { File.WriteAllText(Path.Combine(state, "pid.txt"), Process.GetCurrentProcess().Id.ToString()); Thread.Sleep(30000); }
       if (mode == "malformed") { Console.WriteLine("SENSITIVE_TEST_VALUE invalid-json"); return 0; }
@@ -74,7 +76,9 @@ for (const shell of ["pwsh.exe", "powershell.exe"]) {
     const checksumText = Object.entries(packageFiles).map(([name, sha]) => `${sha} *${name}\n`).join("");
     await writeFile(path.join(fixture.root, "checksums.sha256"), checksumText);
     for (const name of ["package.json", "README.md"]) await cp(path.join(fixture.root, name), path.join(sourceMcp, name));
-    await writeFile(path.join(state, "home.txt"), codexHome);
+    const homeMarker = hash(Buffer.from(codexHome));
+    await writeFile(path.join(state, "home.txt"), homeMarker);
+    await writeFile(path.join(codexHome, "health-home-marker.txt"), homeMarker);
     await writeFile(path.join(state, "mode.txt"), "valid");
     const cs = path.join(temporary, "FakeCodex.cs");
     const codex = path.join(temporary, "codex.exe");
