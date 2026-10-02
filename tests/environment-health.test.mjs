@@ -134,7 +134,7 @@ for (const shell of ["pwsh.exe", "powershell.exe"]) {
       assert.equal(report.mcp.checked_files, Object.keys(packageFiles).length);
       assert.equal(report.mcp.source_comparison.status, "same");
       assert.equal(report.skill.source_comparison.status, "same");
-      assert.equal(report.skill.file_count, 13);
+      assert.equal(report.skill.file_count, 17);
       assert.match(report.skill.fingerprint_sha256, /^[0-9a-f]{64}$/u);
       assert.equal(report.skill.fingerprint_sha256, hash(Buffer.from(Object.keys(originalSkill).sort().map(name => `${name}\0${originalSkill[name]}`).join("\n"))), "Inventory fingerprints must agree across PowerShell versions");
       assert.equal(report.metaeditor.candidates[0].build, 6230);
