@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { buildFixture } from "./helpers/runtime-fixture.mjs";
 
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const packageVersion = JSON.parse(await readFile(path.join(repository, "package.json"), "utf8")).version;
 const peerSkill = process.env.MQL5_HEALTH_SKILL_ROOT;
 const python = process.env.MQL5_HEALTH_PYTHON;
 const hash = bytes => createHash("sha256").update(bytes).digest("hex");
@@ -128,13 +129,14 @@ for (const shell of ["pwsh.exe", "powershell.exe"]) {
       assert.equal(report.codex.native_chat_availability, "not_checked");
       assert.equal(report.mcp.stdio_available, true);
       assert.equal(report.mcp.integrity, "passed");
-      assert.equal(report.mcp.package_version, "1.2.6");
+      assert.equal(report.mcp.package_version, packageVersion);
       assert.equal(report.mcp.node_version, "v24.17.0");
       assert.equal(report.mcp.index_revision, fixture.databaseHash);
       assert.equal(report.mcp.checked_files, Object.keys(packageFiles).length);
       assert.equal(report.mcp.source_comparison.status, "same");
       assert.equal(report.skill.source_comparison.status, "same");
-      assert.equal(report.skill.file_count, 17);
+      assert.equal(report.skill.file_count, 21);
+      assert.equal(report.skill.declared_version, "1.0.0");
       assert.match(report.skill.fingerprint_sha256, /^[0-9a-f]{64}$/u);
       assert.equal(report.skill.fingerprint_sha256, hash(Buffer.from(Object.keys(originalSkill).sort().map(name => `${name}\0${originalSkill[name]}`).join("\n"))), "Inventory fingerprints must agree across PowerShell versions");
       assert.equal(report.metaeditor.candidates[0].build, 6230);
@@ -207,7 +209,7 @@ for (const shell of ["pwsh.exe", "powershell.exe"]) {
     });
     for (const [name, update, code] of [
       ["pinned Node version mismatch", packageJson => ({ ...packageJson, engines: { node: "0.0.0" } }), "mcp_node_version_failed"],
-      ["server version mismatch", packageJson => ({ ...packageJson, version: "1.2.7" }), "mcp_stdio_failed"],
+      ["server version mismatch", packageJson => ({ ...packageJson, version: "0.0.0" }), "mcp_stdio_failed"],
     ]) {
       await t.test(name, async () => {
         const file = path.join(fixture.root, "package.json"); const bytes = await readFile(file);

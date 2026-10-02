@@ -1,6 +1,6 @@
 {
   "name": "mql5-chm-mcp",
-  "version": "1.2.6",
+  "version": "1.2.7",
   "private": true,
   "type": "module",
   "description": "Portable read-only MCP server for the official local MQL5 CHM corpus.",
