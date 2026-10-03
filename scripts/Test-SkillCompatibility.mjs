@@ -16,22 +16,25 @@ const toolContract = z.strictObject({
   required_arguments: z.array(z.string().min(1)),
   outputs: z.record(z.string().min(1), z.enum(valueTypes)),
   bounds: z.record(z.string(), z.strictObject({ minimum: z.number().int(), maximum: z.number().int() })).optional(),
+  array_bounds: z.record(z.string(), z.strictObject({ minimum: z.number().int().min(0), maximum: z.number().int().min(0) })).optional(),
   enums: z.record(z.string(), z.array(z.string()).min(1)).optional(),
 });
 const contractSchema = z.strictObject({
   schema_version: z.literal(1),
   server_name: z.string().min(1),
   tools: z.record(z.string().regex(/^mql5_chm_[a-z_]+$/u), toolContract),
+  optional_tools: z.record(z.string().regex(/^mql5_chm_[a-z_]+$/u), toolContract).optional(),
 });
 const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
 export function parseContract(value) {
   const contract = contractSchema.parse(value);
   assert.deepEqual(Object.keys(contract.tools).sort(), ["mql5_chm_read", "mql5_chm_read_image", "mql5_chm_search", "mql5_chm_status"]);
-  for (const tool of Object.values(contract.tools)) {
+  for (const name of Object.keys(contract.optional_tools ?? {})) assert.ok(!Object.hasOwn(contract.tools,name), "Tool is both required and optional");
+  for (const tool of [...Object.values(contract.tools), ...Object.values(contract.optional_tools ?? {})]) {
     assert.ok(Object.keys(tool.outputs).length > 0, "Tool has no consumer output commitments");
     assert.equal(new Set(tool.required_arguments).size, tool.required_arguments.length);
-    for (const [field, bound] of Object.entries(tool.bounds ?? {})) {
+    for (const [field, bound] of [...Object.entries(tool.bounds ?? {}),...Object.entries(tool.array_bounds ?? {})]) {
       assert.ok(bound.minimum <= bound.maximum, `Inverted input bounds: ${field}`);
     }
   }
@@ -62,8 +65,9 @@ export function validateAdvertisedTools(contract, listed, serverName) {
   assert.equal(serverName, contract.server_name, "Server identity differs from the skill dependency");
   const names = listed.tools.map((tool) => tool.name);
   assert.equal(new Set(names).size, names.length, "Duplicate tool names");
-  for (const [name, required] of Object.entries(contract.tools)) {
+  for (const [name, required] of [...Object.entries(contract.tools),...Object.entries(contract.optional_tools ?? {})]) {
     const tool = listed.tools.find((entry) => entry.name === name);
+    if (!tool && Object.hasOwn(contract.optional_tools ?? {},name)) continue;
     assert.ok(tool, `Skill-required tool is missing: ${name}`);
     assert.deepEqual(tool.annotations, { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
     assert.deepEqual([...(tool.inputSchema.required ?? [])].sort(), [...required.required_arguments].sort(), `${name} required inputs changed`);
@@ -76,6 +80,12 @@ export function validateAdvertisedTools(contract, listed, serverName) {
     }
     for (const [field, values] of Object.entries(required.enums ?? {})) {
       for (const value of values) assert.ok(tool.inputSchema.properties?.[field]?.enum?.includes(value), `${name}.${field} removed ${value}`);
+    }
+    for (const [field, bound] of Object.entries(required.array_bounds ?? {})) {
+      const actual = tool.inputSchema.properties?.[field];
+      assert.ok(types(actual).includes("array"), `${name}.${field} is not an array`);
+      assert.ok(Number.isSafeInteger(actual.minItems) && Number.isSafeInteger(actual.maxItems));
+      assert.ok(actual.minItems <= bound.minimum && actual.maxItems >= bound.maximum, `${name}.${field} no longer accepts the skill's array range`);
     }
     for (const [field, kind] of Object.entries(required.outputs)) {
       const schema = advertisedField(tool.outputSchema, field);
@@ -112,7 +122,9 @@ export function validateResponse(contract, name, result) {
   assert.notEqual(result.isError, true, `${name} returned an error: ${result.content?.[0]?.text}`);
   const data = result.structuredContent;
   assert.ok(data && typeof data === "object", `${name} omitted structuredContent`);
-  for (const [field, kind] of Object.entries(contract.tools[name].outputs)) {
+  const commitment = contract.tools[name] ?? contract.optional_tools?.[name];
+  assert.ok(commitment, `${name} has no consumer contract`);
+  for (const [field, kind] of Object.entries(commitment.outputs)) {
     const visit = (current, components) => {
       if (components.length === 0) return checkValue(current, kind, field);
       const component = components[0];
@@ -209,6 +221,28 @@ export async function runCompatibility({ skillRoot, pythonPath, serverPath = pat
     assert.equal(entry.citation.corpus_revision, status.corpus_revision);
     assert.equal(entry.citation.index_revision, status.index_sha256);
     checks.push("exact_identifier_search_and_citation");
+    if (contract.optional_tools?.mql5_chm_lookup_identifiers && listed.tools.some(tool=>tool.name==="mql5_chm_lookup_identifiers")) {
+      const identifiers=[identifier,identifier.slice(0,-1),"zzzz_nonexistent_7391",identifier];
+      const batch=(await call("mql5_chm_lookup_identifiers",{identifiers,source:"mql5",limit:1})).structuredContent;
+      assert.deepEqual(batch.lookups.map(lookup=>lookup.identifier),identifiers);
+      assert.deepEqual(batch.lookups.map(lookup=>lookup.match_status),["exact","non_exact","none","exact"]);
+      for (const [i,lookup] of batch.lookups.entries()) {
+        const single=(await call("mql5_chm_search",{query:identifiers[i],source:"mql5",limit:1,expand:false})).structuredContent;
+        assert.deepEqual(lookup.results,single.results);
+        assert.deepEqual(lookup.online_check,single.online_check);
+        for(const hit of lookup.results) {
+          assert.equal(hit.citation.corpus_revision,status.corpus_revision);
+          assert.equal(hit.citation.index_revision,status.index_sha256);
+        }
+      }
+      checks.push("batch_identifier_order_match_status_and_citations");
+      const maximum=(await call("mql5_chm_lookup_identifiers",{identifiers:Array(16).fill(identifier),limit:3})).structuredContent;
+      assert.equal(maximum.count,16);assert.ok(maximum.result_count<=48);
+      for(const args of [{identifiers:[]},{identifiers:Array(17).fill(identifier)},{identifiers:[identifier],limit:4},{identifiers:[identifier,"Bad(Name"]},{identifiers:[identifier],extra:true}]) {
+        assert.equal((await client.callTool({name:"mql5_chm_lookup_identifiers",arguments:args})).isError,true);
+      }
+      checks.push("batch_identifier_bounds_and_closed_inputs");
+    }
     const read = await call("mql5_chm_read", { topic_id: entry.topic_id, focus: identifier, max_chars: 500 });
     assertExactPassage(read, identifier);
     assert.ok(read.structuredContent.returned_chars <= 500);

@@ -102,6 +102,23 @@ const imageReferenceSchema = z.object({
   occurrence_count: z.number().int().positive(),
   citation: citationSchema,
 });
+const searchResultSchema = z.object({
+  topic_id: topicIdSchema,
+  section_id: sectionIdSchema.nullable(),
+  source: corpusSourceSchema,
+  title: z.string(),
+  breadcrumb: z.string(),
+  signature: z.string(),
+  source_revision: sha256Schema,
+  match_kind: z.enum(["exact", "fts", "expanded", "fuzzy"]),
+  matched_terms: z.array(z.string()).max(12),
+  citation: citationSchema,
+});
+const onlineCheckSchema = z.object({
+  recommended: z.boolean(),
+  reason: z.enum(["current-information-requested", "no-local-match", "fuzzy-only", "newer-revision-available"]).nullable(),
+  official_search_query: nullableTextSchema,
+});
 
 function citationFooter(citation) {
   return `Source: ${citation.source_file} | ${citation.title} | ${citation.section_id ?? citation.topic_id} | source ${citation.source_revision.slice(0, 12)}`;
@@ -137,6 +154,22 @@ function conciseSearchOutput(result) {
     online_check: result.online_check,
     results: result.results.map(({ snippet: _snippet, ...metadata }) => metadata),
   };
+}
+
+function batchText(result) {
+  const lines = [`Identifier lookup: ${result.count} names, up to ${result.limit} results each.`, `Corpus: ${result.corpus_revision} | Index: ${result.index_sha256}`];
+  for (const [index, lookup] of result.lookups.entries()) {
+    lines.push(`${index + 1}. ${lookup.identifier} [${lookup.match_status}]`);
+    for (const entry of lookup.results) lines.push(`  ${entry.title} [${entry.match_kind}] | ${citationFooter(entry.citation)}`);
+    if (lookup.online_check.recommended) lines.push(`  Official check suggested: ${lookup.online_check.official_search_query}`);
+  }
+  return lines.join("\n");
+}
+
+function conciseBatchOutput(result) {
+  return { ...result, lookups: result.lookups.map((lookup) => ({
+    ...lookup, results: lookup.results.map(({ snippet: _snippet, ...metadata }) => metadata),
+  })) };
 }
 
 function readText(result) {
@@ -187,7 +220,7 @@ function toolFailure(error) {
 
 export function createMcpServer(service) {
   const server = new McpServer(
-    { name: "mql5-chm", version: "1.2.7" },
+    { name: "mql5-chm", version: "1.3.0" },
     { capabilities: { tools: {} } },
   );
 
@@ -211,27 +244,8 @@ export function createMcpServer(service) {
         count: z.number().int().min(0).max(8),
         index_sha256: sha256Schema,
         corpus_revision: sha256Schema,
-        online_check: z.object({
-          recommended: z.boolean(),
-          reason: z
-            .enum(["current-information-requested", "no-local-match", "fuzzy-only", "newer-revision-available"])
-            .nullable(),
-          official_search_query: nullableTextSchema,
-        }),
-        results: z.array(
-          z.object({
-            topic_id: topicIdSchema,
-            section_id: sectionIdSchema.nullable(),
-            source: corpusSourceSchema,
-            title: z.string(),
-            breadcrumb: z.string(),
-            signature: z.string(),
-            source_revision: sha256Schema,
-            match_kind: z.enum(["exact", "fts", "expanded", "fuzzy"]),
-            matched_terms: z.array(z.string()).max(12),
-            citation: citationSchema,
-          }),
-        ).max(8),
+        online_check: onlineCheckSchema,
+        results: z.array(searchResultSchema).max(8),
       },
       annotations: TOOL_ANNOTATIONS,
     },
@@ -245,6 +259,43 @@ export function createMcpServer(service) {
       } catch (error) {
         return toolFailure(error);
       }
+    },
+  );
+
+  server.registerTool(
+    "mql5_chm_lookup_identifiers",
+    {
+      title: "Look up a bounded batch of MQL5 identifiers",
+      description: "Look up 1 to 16 ASCII API or constant names in input order, including duplicates, using existing search rankings with expansion disabled. Default source is mql5; limit is 1 to 3 per identifier (default 1). Each name retains its own exact, non_exact or none search status, candidates, advisory check and citations. An exact search match is a lookup result: read and verify the complete identifier in the cited passage before asserting an API fact. The tool returns metadata, not documentation passages or images.",
+      inputSchema: z.strictObject({
+        identifiers: z.array(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,127}$/u)).min(1).max(16)
+          .describe("1 to 16 ASCII identifier names, each 1 to 128 characters; order and duplicates are preserved"),
+        source: sourceSchema.optional().default("mql5"),
+        limit: z.number().int().min(1).max(3).optional().default(1).describe("Maximum results per identifier, integer from 1 to 3"),
+        require_current: z.boolean().optional().default(false),
+      }),
+      outputSchema: {
+        source: sourceSchema,
+        limit: z.number().int().min(1).max(3),
+        count: z.number().int().min(1).max(16),
+        result_count: z.number().int().min(0).max(48),
+        index_sha256: sha256Schema,
+        corpus_revision: sha256Schema,
+        lookups: z.array(z.object({
+          identifier: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,127}$/u),
+          match_status: z.enum(["exact", "non_exact", "none"]),
+          count: z.number().int().min(0).max(3),
+          online_check: onlineCheckSchema,
+          results: z.array(searchResultSchema).max(3),
+        })).min(1).max(16),
+      },
+      annotations: TOOL_ANNOTATIONS,
+    },
+    async (input) => {
+      try {
+        const result = service.lookupIdentifiers(input);
+        return { content: [{ type: "text", text: batchText(result) }], structuredContent: conciseBatchOutput(result) };
+      } catch (error) { return toolFailure(error); }
     },
   );
 

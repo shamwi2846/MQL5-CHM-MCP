@@ -42,7 +42,7 @@ test("v1.2 MCP contract lists the bounded single-image tool", async () => {
     const listed = await client.listTools();
     assert.deepEqual(
       listed.tools.map((tool) => tool.name).sort(),
-      ["mql5_chm_read", "mql5_chm_read_image", "mql5_chm_search", "mql5_chm_status"],
+      ["mql5_chm_lookup_identifiers", "mql5_chm_read", "mql5_chm_read_image", "mql5_chm_search", "mql5_chm_status"],
     );
   } finally {
     await client.close();

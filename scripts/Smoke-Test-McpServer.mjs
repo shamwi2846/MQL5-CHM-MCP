@@ -5,6 +5,7 @@ import path from "node:path";
 
 const SHA256 = /^[0-9a-f]{64}$/u;
 const EXPECTED_TOOLS = Object.freeze([
+  "mql5_chm_lookup_identifiers",
   "mql5_chm_read",
   "mql5_chm_read_image",
   "mql5_chm_search",

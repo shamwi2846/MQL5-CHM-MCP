@@ -1,0 +1,72 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { performance } from "node:perf_hooks";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+
+const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const names = ["OnTick", "CopyBuffer", "PositionSelectByTicket", "OrderSend", "SymbolInfoDouble", "IndicatorRelease", "SYMBOL_VOLUME_STEP", "BarsCalculated", "OnInit", "OnDeinit", "SymbolInfoInteger", "AccountInfoDouble", "CopyRates", "iMA", "OnTikk", "zzzz_nonexistent_7391"];
+const sha256 = bytes => createHash("sha256").update(bytes).digest("hex");
+const options = { packageRoot: repository, serverPath: path.join(repository, "build/candidate-v12/app/server.mjs"), samples: 9, report: null };
+for (let i = 2; i < process.argv.length; i += 2) {
+  const key = process.argv[i], value = process.argv[i+1];
+  assert.ok(value && !value.startsWith("--"), `${key} requires a value`);
+  if (key === "--package-root") options.packageRoot = path.resolve(value);
+  else if (key === "--server-path") options.serverPath = path.resolve(value);
+  else if (key === "--report") options.report = path.resolve(value);
+  else if (key === "--samples") { options.samples = Number(value); assert.ok(Number.isInteger(options.samples) && options.samples >= 3 && options.samples <= 21, "samples must be an integer from 3 to 21"); }
+  else throw new Error(`Unknown option ${key}`);
+}
+const bootstrap = `import { main } from ${JSON.stringify(pathToFileURL(options.serverPath).href)}; await main({ root: ${JSON.stringify(options.packageRoot)} });`;
+const transport = new StdioClientTransport({ command: process.execPath, args: ["--input-type=module", "--eval", bootstrap], cwd: options.packageRoot, stderr: "pipe" });
+const client = new Client({ name: "mql5-identifier-batch-benchmark", version: "1.0.0" });
+let diagnostic = "";
+transport.stderr?.on("data", bytes => { diagnostic = (diagnostic + bytes.toString("utf8")).slice(-4096); });
+const median = values => [...values].sort((a,b) => a-b)[Math.floor(values.length/2)];
+const measurements = [];
+const beforeBundle = sha256(await readFile(options.serverPath));
+const beforePointer = sha256(await readFile(path.join(options.packageRoot, "data/active.json")));
+try {
+  await client.connect(transport);
+  const status = (await client.callTool({ name: "mql5_chm_status", arguments: {} })).structuredContent;
+  for (const size of [1,4,8,16]) {
+    const identifiers = names.slice(0,size);
+    const sequential = async () => {
+      const results = [];
+      for (const query of identifiers) results.push(await client.callTool({ name: "mql5_chm_search", arguments: { query, source: "mql5", limit: 1, expand: false } }));
+      return results;
+    };
+    const parallel = () => Promise.all(identifiers.map(query => client.callTool({ name: "mql5_chm_search", arguments: { query, source: "mql5", limit: 1, expand: false } })));
+    const batch = () => client.callTool({ name: "mql5_chm_lookup_identifiers", arguments: { identifiers, source: "mql5", limit: 1 } });
+    const reference = await sequential(), combined = await batch();
+    assert.notEqual(combined.isError,true);
+    assert.deepEqual(combined.structuredContent.lookups.map(lookup=>lookup.identifier),identifiers);
+    assert.equal(combined.structuredContent.corpus_revision,status.corpus_revision);
+    assert.equal(combined.structuredContent.index_sha256,status.index_revision);
+    for (const [i,lookup] of combined.structuredContent.lookups.entries()) {
+      assert.notEqual(reference[i].isError,true);
+      assert.deepEqual(lookup.results,reference[i].structuredContent.results);
+      assert.deepEqual(lookup.online_check,reference[i].structuredContent.online_check);
+    }
+    const samples = { sequential: [], parallel: [], batch: [] }, sizes = {};
+    for (let run = 0; run < options.samples; run++) {
+      const order = run%2 ? ["batch","parallel","sequential"] : ["sequential","parallel","batch"];
+      for (const mode of order) {
+        const started = performance.now();
+        const result = await ({ sequential,parallel,batch }[mode])();
+        samples[mode].push(performance.now()-started);
+        sizes[mode] = Buffer.byteLength(JSON.stringify(result),"utf8");
+      }
+    }
+    measurements.push({ identifiers: size, requests: { sequential: size, parallel: size, batch: 1 }, median_ms: Object.fromEntries(Object.entries(samples).map(([mode,values])=>[mode,Number(median(values).toFixed(3))])), response_bytes: sizes, response_byte_reduction_percent: Number(((1-sizes.batch/sizes.sequential)*100).toFixed(2)), result_metadata_equal: true });
+  }
+  assert.equal(sha256(await readFile(options.serverPath)),beforeBundle,"Server bytes changed during measurement");
+  assert.equal(sha256(await readFile(path.join(options.packageRoot,"data/active.json"))),beforePointer,"Active pointer changed during measurement");
+  const record = { schema_version: 1, status: "passed", measured_utc: new Date().toISOString(), server_version: client.getServerVersion(), node_version: process.version, server_path: options.serverPath, server_sha256: beforeBundle, package_root: options.packageRoot, corpus_revision: status.corpus_revision, index_revision: status.index_revision, samples_per_mode: options.samples, measurements, scope: "Warm local stdio round trips; same process and queries, alternating mode order. JSON-serialized MCP result bytes exclude request envelopes, SDK framing and assistant scheduling. Queries remain synchronous. Timing is descriptive, not a CI performance threshold or universal speed claim." };
+  if (options.report) await writeFile(options.report,`${JSON.stringify(record,null,2)}\n`,{flag:"wx"});
+  process.stdout.write(`${JSON.stringify(record,null,2)}\n`);
+} catch (error) { throw new Error(`Identifier benchmark failed: ${error.message}\n${diagnostic}`,{cause:error}); }
+finally { await client.close(); }

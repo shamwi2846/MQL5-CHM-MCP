@@ -63,7 +63,7 @@ test("portable stdio MCP resists ambient root redirection and calls the four v1.
     const listed = await client.listTools();
     assert.deepEqual(
       listed.tools.map((tool) => tool.name).sort(),
-      ["mql5_chm_read", "mql5_chm_read_image", "mql5_chm_search", "mql5_chm_status"],
+      ["mql5_chm_lookup_identifiers", "mql5_chm_read", "mql5_chm_read_image", "mql5_chm_search", "mql5_chm_status"],
     );
     for (const tool of listed.tools) {
       assert.deepEqual(tool.annotations, {
@@ -110,6 +110,22 @@ test("portable stdio MCP resists ambient root redirection and calls the four v1.
     const statusTool = listed.tools.find((tool) => tool.name === "mql5_chm_status");
     assert.deepEqual(statusTool.inputSchema.required ?? [], []);
     assert.equal(statusTool.inputSchema.additionalProperties, false);
+
+    const batch = await client.callTool({
+      name: "mql5_chm_lookup_identifiers",
+      arguments: { identifiers: ["PositionSelectByTicket", "OnTick", "zzzz_nonexistent_7391"], source: "mql5", limit: 1 },
+    });
+    assert.equal(batch.isError, undefined);
+    assert.deepEqual(batch.structuredContent.lookups.map(entry=>entry.match_status), ["exact", "exact", "none"]);
+    assert.equal(batch.structuredContent.count,3);
+    for (const lookup of batch.structuredContent.lookups) {
+      assert.ok(lookup.results.length<=1);
+      for (const hit of lookup.results) {
+        assert.equal(hit.citation.corpus_revision,batch.structuredContent.corpus_revision);
+        assert.equal(hit.citation.index_revision,batch.structuredContent.index_sha256);
+      }
+    }
+    assert.equal((await client.callTool({name:"mql5_chm_lookup_identifiers",arguments:{identifiers:Array(17).fill("OnTick")}})).isError,true);
 
     const search = await client.callTool({
       name: "mql5_chm_search",

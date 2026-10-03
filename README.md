@@ -1,12 +1,13 @@
-# MQL5 CHM MCP 1.2.7
+# MQL5 CHM MCP 1.3.0
 
-The versioned Windows package is published on the [v1.2.7 release](https://github.com/shamwi2846/MQL5-CHM-MCP/releases/tag/v1.2.7). Release tags must match the package, lockfile, server, documentation and download user agents. Publish only the portable ZIP and checksum sidecar retained by the successful release-validation run for that exact commit; that run requires MCP/skill compatibility, the full Windows suite and two identical package builds. The companion skill now has [versioned packages and verified update/rollback](https://github.com/shamwi2846/MQL5-Coding-Skill/blob/main/skills/mql5-coding/references/releases.md).
+The versioned Windows package is published on the [v1.3.0 release](https://github.com/shamwi2846/MQL5-CHM-MCP/releases/tag/v1.3.0). Release tags must match the package, lockfile, server, documentation and download user agents. Publish only the portable ZIP and checksum sidecar retained by the successful release-validation run for that exact commit; that run requires MCP/skill compatibility, the full Windows suite and two identical package builds. The companion skill now has [versioned packages and verified update/rollback](https://github.com/shamwi2846/MQL5-Coding-Skill/blob/main/skills/mql5-coding/references/releases.md).
 
 A portable, local MCP server for the official English MQL5 reference, AlgoBook, and Neural Networks book. The active corpus contains 4,827 indexed topics, 16,261 sections, and a secure catalog of the original technical diagrams, screenshots, charts, and MQL5 object icons. Runtime access is offline, stdio-only, and strictly read-only; no MetaTrader account, HTTP port, trading access, or authentication is required.
 
 The server exposes four closed-world tools:
 
 - `mql5_chm_search` searches exact API names first, then deterministically merges full-text matches with lower-weight MQL5-aware expansions before bounded typo recovery.
+- `mql5_chm_lookup_identifiers` looks up 1 to 16 API or constant names in one request. Order and duplicates are preserved; each name has its own match status, candidates, advisory check and citations. Default source is `mql5`, expansion is disabled, and `limit` is 1 to 3 per name (default 1; at most 48 candidates total).
 - `mql5_chm_read` reads a bounded topic passage with citations, related-topic links, and bounded image references. It never returns binary image data.
 - `mql5_chm_read_image` returns exactly one catalogued original technical image by stable asset ID.
 - `mql5_chm_status` reports active corpus/index revisions, source metadata, text and asset counts, and the last valid update-check result.
@@ -18,6 +19,10 @@ Text and image continuation cursors are opaque, revision-bound HMAC tokens authe
 ## Bounded calls and stable citations
 
 `mql5_chm_search.limit` must be an integer from 1 through 8. `mql5_chm_read.max_chars` must be an integer from 500 through 8,000 and must not exceed 8,000. Out-of-range values are rejected and are never silently clamped.
+
+Batch names must be ASCII identifiers, 1 to 128 characters, matching `[A-Za-z_][A-Za-z0-9_]*`; expressions, qualified names, whitespace and paths are rejected before any search runs. `exact`, `non_exact` and `none` describe the search outcome for that name. A prefix, FTS result or typo candidate remains non-exact. Read the selected topic/section and verify the complete identifier before making an API claim. Batch output contains bounded metadata; it does not return passages or image bytes. A request error fails the entire batch instead of returning a successful partial result. Existing single-search behavior is unchanged, and older clients can continue using it.
+
+Example tool arguments: `{"identifiers":["OnTick","CopyBuffer","SYMBOL_VOLUME_STEP"],"source":"mql5","limit":1}`. From a development checkout with locked dependencies installed, measure the shipped tool against sequential and parallel single calls on a verified corpus using `npm run benchmark:identifiers -- --package-root <absolute-package-root> --server-path <absolute-server.mjs> --report <new-report.json>`. The benchmark preserves result metadata/citations and reports request counts, local median latency and serialized response bytes for 1, 4, 8 and 16 names. Timing is descriptive; batch searches remain synchronous and do not guarantee a latency improvement.
 
 For a focused read, `focus_match` reports `exact`, `approximate`, or `none`; it is `null` for unfocused reads and continuation pages. An exact match must occur in the returned bounded passage; a phrase extending beyond that passage is reported as approximate. Token boundaries are checked against the original documentation, so truncating an identifier suffix cannot turn a partial match into an exact match. Complete identifiers and phrases take priority over partial matches, so `OBJPROP_FONT` is preferred over the prefix in `OBJPROP_FONTSIZE`. Approximate and absent matches include a text notice. An absent focus without an explicit section returns a bounded topic passage rather than an arbitrary section. Verify the complete requested identifier in the returned passage before using it as documentation support.
 
@@ -33,7 +38,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Install-Codex.ps1
 
 Fully close and reopen Codex after installation, activation, or rollback.
 
-Before changing Codex registration, the installer launches the bundled server with the bundled Node runtime and a 30-second deadline. It verifies `initialize`, the initialized notification, the exact four read-only tools returned by `tools/list`, and `mql5_chm_status` against the package revisions already validated by the installer. A startup, protocol, tool, annotation, or revision failure leaves Codex registration unchanged.
+Before changing Codex registration, the installer launches the bundled server with the bundled Node runtime and a 30-second deadline. It verifies `initialize`, the initialized notification, the exact five read-only tools returned by `tools/list`, and `mql5_chm_status` against the package revisions already validated by the installer. A startup, protocol, tool, annotation, or revision failure leaves Codex registration unchanged.
 
 Installation and uninstallation serialize package-managed registration changes through one machine-global registration mutex. Installation is idempotent only when the existing `mql5-chm` registration is enabled, path-owned by this package, and has no environment, working-directory, or tool-filter overrides. Disabled, modified, differently owned, malformed, or duplicate entries are preserved and rejected. If registration fails, rollback removes only an entry still observed as owned by the exact Node/server paths just added, then confirms the post-state. This prevents races between cooperating package scripts. Codex currently exposes removal by name rather than by an ownership compare-and-swap token, so an unrelated external config writer must not replace `mql5-chm` during the small `codex mcp remove` command window; the package cannot atomically preserve a replacement it was never able to observe.
 

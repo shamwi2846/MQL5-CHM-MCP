@@ -68,3 +68,22 @@ test("skill compatibility requires complete identifier proof inside the passage"
     read("Unrelated passage\n\nSource: RequestedToken"), read("RequestedToken", "approximate"),
   ]) assert.throws(() => assertExactPassage(response, "RequestedToken"));
 });
+
+test("optional batch contract permits old servers and enforces new server array/output bounds",async()=>{
+  const optional=parseContract({...contract,optional_tools:{mql5_chm_lookup_identifiers:{required_arguments:["identifiers"],array_bounds:{identifiers:{minimum:1,maximum:16}},bounds:{limit:{minimum:1,maximum:3}},outputs:{"lookups[].results[].citation.corpus_revision":"sha256"}}}});
+  const server=createMcpServer({});
+  const client=new Client({name:"optional-batch-contract",version:"1.0.0"});
+  const [a,b]=InMemoryTransport.createLinkedPair();
+  try {
+    await server.connect(b);await client.connect(a);
+    const listed=await client.listTools();
+    validateAdvertisedTools(optional,listed,"mql5-chm");
+    const old=structuredClone(listed);old.tools=old.tools.filter(x=>x.name!=="mql5_chm_lookup_identifiers");
+    assert.doesNotThrow(()=>validateAdvertisedTools(optional,old,"mql5-chm"));
+    for(const change of [tool=>{tool.inputSchema.properties.identifiers.maxItems=15;},tool=>{delete tool.inputSchema.properties.identifiers.maxItems;},tool=>{delete tool.outputSchema.properties.lookups.items.properties.results.items.properties.citation.properties.corpus_revision;}]) {
+      const altered=structuredClone(listed);change(altered.tools.find(x=>x.name==="mql5_chm_lookup_identifiers"));
+      assert.throws(()=>validateAdvertisedTools(optional,altered,"mql5-chm"));
+    }
+    assert.throws(()=>parseContract({...contract,optional_tools:{mql5_chm_status:contract.tools.mql5_chm_status}}));
+  }finally{await client.close();await server.close();}
+});

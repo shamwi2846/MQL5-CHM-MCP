@@ -71,6 +71,8 @@ var SOURCES = Object.freeze({
 var SOURCE_NAMES = Object.freeze(Object.keys(SOURCES));
 var SEARCH_SOURCES = Object.freeze(["all", ...SOURCE_NAMES]);
 var SEARCH_INPUT_KEYS = /* @__PURE__ */ new Set(["query", "source", "limit", "expand", "require_current"]);
+const BATCH_INPUT_KEYS = new Set(["identifiers", "source", "limit", "require_current"]);
+const BATCH_IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/u;
 var READ_INPUT_KEYS = /* @__PURE__ */ new Set([
   "topic_id",
   "section_id",
@@ -1456,6 +1458,27 @@ function validateSearchInput(input) {
   if (typeof requireCurrent !== "boolean") fail("INVALID_ARGUMENT", "require_current must be a boolean.");
   return { query, source, limit, expand, requireCurrent };
 }
+function validateBatchInput(input) {
+  if (!isRecord(input)) fail("INVALID_ARGUMENT", "Identifier lookup input must be an object.");
+  rejectUnknownInputKeys(input, BATCH_INPUT_KEYS, "Identifier lookup input");
+  if (!Array.isArray(input.identifiers) || input.identifiers.length < 1 || input.identifiers.length > 16) {
+    fail("INVALID_ARGUMENT", "identifiers must contain 1 to 16 names.");
+  }
+  // Validate the complete request before running even the first search; holes,
+  // non-string names and expression/path syntax must never become queries.
+  for (const identifier of input.identifiers) {
+    if (typeof identifier !== "string" || !BATCH_IDENTIFIER_PATTERN.test(identifier)) {
+      fail("INVALID_ARGUMENT", "Each identifier must be an ASCII name of 1 to 128 characters.");
+    }
+  }
+  const source = input.source === undefined ? "mql5" : input.source;
+  const limit = input.limit === undefined ? 1 : input.limit;
+  const requireCurrent = input.require_current === undefined ? false : input.require_current;
+  if (!SEARCH_SOURCES.includes(source)) fail("INVALID_ARGUMENT", "source must be all, mql5, mql5book, or neuronetworksbook.");
+  if (!Number.isInteger(limit) || limit < 1 || limit > 3) fail("INVALID_ARGUMENT", "limit must be an integer from 1 to 3 per identifier.");
+  if (typeof requireCurrent !== "boolean") fail("INVALID_ARGUMENT", "require_current must be a boolean.");
+  return { identifiers: [...input.identifiers], source, limit, requireCurrent };
+}
 function validateReadInput(input) {
   if (!isRecord(input)) fail("INVALID_ARGUMENT", "Read input must be an object.");
   rejectUnknownInputKeys(input, READ_INPUT_KEYS, "Read input");
@@ -1957,6 +1980,29 @@ var Mql5ChmSearchService = class {
         official_search_query: reason === null ? null : officialSearchQuery.slice(0, safeUtf16Boundary(officialSearchQuery, 500))
       },
       results
+    };
+  }
+  lookupIdentifiers(input) {
+    this.#assertOpen();
+    const { identifiers, source, limit, requireCurrent } = validateBatchInput(input);
+    const lookups = identifiers.map((identifier) => {
+      const result = this.search({ query: identifier, source, limit, expand: false, require_current: requireCurrent });
+      return {
+        identifier,
+        match_status: result.results.some((entry) => entry.match_kind === "exact") ? "exact" : result.count ? "non_exact" : "none",
+        count: result.count,
+        online_check: result.online_check,
+        results: result.results,
+      };
+    });
+    return {
+      source,
+      limit,
+      count: lookups.length,
+      result_count: lookups.reduce((total, lookup) => total + lookup.count, 0),
+      index_sha256: this.indexSha256,
+      corpus_revision: this.manifest.corpus_sha256,
+      lookups,
     };
   }
   #selectFocusedSection(topicId, focus) {

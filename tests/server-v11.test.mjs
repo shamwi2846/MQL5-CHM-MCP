@@ -216,7 +216,7 @@ test("source MCP exposes v1.2 schemas and keeps text and image bytes in separate
     const listed = await client.listTools();
     assert.deepEqual(
       listed.tools.map((tool) => tool.name).sort(),
-      ["mql5_chm_read", "mql5_chm_read_image", "mql5_chm_search", "mql5_chm_status"],
+      ["mql5_chm_lookup_identifiers", "mql5_chm_read", "mql5_chm_read_image", "mql5_chm_search", "mql5_chm_status"],
     );
     for (const tool of listed.tools) {
       assert.deepEqual(tool.annotations, {

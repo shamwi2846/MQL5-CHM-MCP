@@ -93,7 +93,7 @@ process.stdin.on("data", (chunk) => {
         idempotentHint: true,
         openWorldHint: false,
       };
-      let names = ["mql5_chm_read", "mql5_chm_read_image", "mql5_chm_search", "mql5_chm_status"];
+      let names = ["mql5_chm_lookup_identifiers", "mql5_chm_read", "mql5_chm_read_image", "mql5_chm_search", "mql5_chm_status"];
       if (mode === "missing-tool") names = names.filter((name) => name !== "mql5_chm_status");
       send({
         jsonrpc: "2.0",

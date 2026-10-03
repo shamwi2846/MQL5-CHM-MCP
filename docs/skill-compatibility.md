@@ -4,6 +4,8 @@ The skill owns `skills/mql5-coding/references/mcp-contract.json`; the MCP owns `
 
 The default indexed synthetic corpus is generated locally and deleted after the run. It contains no authoritative MQL5 documentation. A pass establishes these interface behaviors for the recorded repository pair; it does not prove all MQL5 API facts, compile an EA, start MT5, or evaluate a trading strategy. The existing corpus, compiler, and tester suites retain their separate roles.
 
+The original four tools remain required. The skill may declare `mql5_chm_lookup_identifiers` under `optional_tools`, including integer and array bounds and per-name response/citation commitments. Older servers can omit it and the skill falls back to single searches. When advertised, the checker validates its complete contract and exercises mixed exact/non-exact/missing names, input order, duplicates, result equivalence with single search, citation revisions, maximum bounds and malformed inputs. A current pair therefore has two additional checks; saved artifacts retain the actual count and commits for each run.
+
 ## Local repository pair
 
 From the MCP checkout, with the skill checkout alongside it and Node.js 24.17.0 installed:
