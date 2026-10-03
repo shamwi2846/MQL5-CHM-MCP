@@ -43,7 +43,7 @@ test("batch service preserves order, duplicates, rankings and separate citation 
 test("batch service rejects malformed complete requests before the first query", async t => {
   const { service } = await fixture(t);
   let calls = 0; service.search = () => { calls++; throw new Error("Unexpected query"); };
-  const badNames = ["", " OnTick", "OnTick ", "OnTick()", "OnTick OR X", "../file", "éName", "A".repeat(129), 42, null];
+  const badNames = ["", " OnTick", "OnTick ", "OnTick\n", "OnTick\r\n", "OnTick\0", "OnTick()", "OnTick OR X", "../file", "éName", "A".repeat(129), 42, null];
   const bad = [null, [], {}, { identifiers: [] }, { identifiers: Array(17).fill(exact) }, { identifiers: Array(1) },
     ...badNames.map(name => ({ identifiers: [exact, name] })),
     ...[0,4,1.5,true,"1",null,NaN].map(limit => ({ identifiers: [exact],limit })),

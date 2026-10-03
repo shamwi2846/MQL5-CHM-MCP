@@ -1382,7 +1382,7 @@ function Clear-RevisionTransition { param([string]$ProjectRoot,[object]$Expected
     } finally { Set-Item Function:\Assert-Revision -Value $originalAssertRevisionForPackage }
 
     # An existing Codex registration is equivalent only when no environment,
-    # working-directory, or tool-filter override can change the four-tool server.
+    # working-directory, or tool-filter override can change the documentation server.
     function New-RegistrationFixture {
         param(
             [AllowNull()][object]$Env = $null,
