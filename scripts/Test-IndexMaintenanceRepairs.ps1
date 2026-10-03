@@ -358,9 +358,13 @@ exit /b 7
     Assert-RepairFixture -Condition ($batchTimeoutTimer.Elapsed.TotalSeconds -lt 8) -Message 'A timed-out .cmd target did not return promptly.'
     $batchDescendantOutput = Join-Path $fixtureRoot 'batch-inherited-handle-descendant.txt'
     $batchDescendantReady = Join-Path $fixtureRoot 'batch-inherited-handle-descendant.ready'
+    $batchDescendantTrigger = Join-Path $fixtureRoot 'batch-inherited-handle-descendant.trigger'
     $escapedBatchDescendantOutput = $batchDescendantOutput.Replace("'","''")
     $escapedBatchDescendantReady = $batchDescendantReady.Replace("'","''")
-    $batchDescendantCommand = "[IO.File]::WriteAllText('$escapedBatchDescendantReady','ready',[Text.Encoding]::UTF8); Start-Sleep -Seconds 2; [IO.File]::WriteAllText('$escapedBatchDescendantOutput','batch-descendant-survived',[Text.Encoding]::UTF8); Start-Sleep -Seconds 30"
+    $escapedBatchDescendantTrigger = $batchDescendantTrigger.Replace("'","''")
+    # Arm the probe only after Invoke-NativeCapture returns. A fixed delay from
+    # child readiness can expire while a loaded runner still has a live parent.
+    $batchDescendantCommand = "[IO.File]::WriteAllText('$escapedBatchDescendantReady','ready',[Text.Encoding]::UTF8); `$deadline=[DateTime]::UtcNow.AddSeconds(10); while (-not [IO.File]::Exists('$escapedBatchDescendantTrigger')) {if ([DateTime]::UtcNow -gt `$deadline) {exit 2}; Start-Sleep -Milliseconds 20}; [IO.File]::WriteAllText('$escapedBatchDescendantOutput','batch-descendant-survived',[Text.Encoding]::UTF8); Start-Sleep -Seconds 30"
     $encodedBatchDescendant = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($batchDescendantCommand))
     $batchDescendantTimer = [Diagnostics.Stopwatch]::StartNew()
     $batchDescendantResult = Invoke-NativeCapture -FilePath $batchHelper -Arguments @('spawn-child',$encodedBatchDescendant,$batchDescendantReady) -TimeoutSeconds 5
@@ -371,6 +375,7 @@ exit /b 7
         (Test-Path -LiteralPath $batchDescendantReady -PathType Leaf) -and
         (Get-Content -LiteralPath $batchDescendantReady -Raw) -ceq 'ready'
     ) -Message 'The .cmd containment probe did not prove its detached child reached readiness.'
+    [IO.File]::WriteAllText($batchDescendantTrigger,'parent-returned',[Text.Encoding]::UTF8)
     Start-Sleep -Milliseconds 2500
     Assert-RepairFixture -Condition (-not (Test-Path -LiteralPath $batchDescendantOutput)) -Message 'A successful .cmd descendant survived outer job cleanup.'
 
