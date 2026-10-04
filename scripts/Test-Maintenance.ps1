@@ -1381,8 +1381,8 @@ function Clear-RevisionTransition { param([string]$ProjectRoot,[object]$Expected
     Assert-Fixture -Condition $packageTamperRejected -Message 'Package verification accepted a tampered asset.'
     } finally { Set-Item Function:\Assert-Revision -Value $originalAssertRevisionForPackage }
 
-    # An existing Codex registration is equivalent only when no environment,
-    # working-directory, or tool-filter override can change the documentation server.
+    # Inherited or package-root cwd is equivalent; environment overrides and
+    # explicit tool allowlists (including empty ones) remain restrictive.
     function New-RegistrationFixture {
         param(
             [AllowNull()][object]$Env = $null,
@@ -1392,21 +1392,26 @@ function Clear-RevisionTransition { param([string]$ProjectRoot,[object]$Expected
             [AllowNull()][object]$DisabledTools = $null
         )
         return [pscustomobject]@{
-            transport=[pscustomobject]@{type='stdio';command='C:\verified\node.exe';args=@('C:\verified\server.mjs');env=$Env;env_vars=$EnvVars;cwd=$Cwd}
+            name='mql5-chm';enabled=$true
+            transport=[pscustomobject]@{type='stdio';command='C:\verified\runtime\node.exe';args=@('C:\verified\app\server.mjs');env=$Env;env_vars=$EnvVars;cwd=$Cwd}
             enabled_tools=$EnabledTools;disabled_tools=$DisabledTools
         }
     }
     $cleanRegistration=New-RegistrationFixture -Env ([pscustomobject]@{})
-    Assert-Fixture -Condition (Test-Mql5ChmRegistrationMatches -Registration $cleanRegistration -NodePath 'C:\verified\node.exe' -ServerPath 'C:\verified\server.mjs') -Message 'A clean, exact Codex registration was rejected.'
+    Assert-Fixture -Condition (Test-Mql5ChmRegistrationMatches -Registration $cleanRegistration -NodePath 'C:\verified\runtime\node.exe' -ServerPath 'C:\verified\app\server.mjs') -Message 'A clean, exact Codex registration was rejected.'
+    $packageCwdRegistration=New-RegistrationFixture -Cwd 'C:\verified'
+    Assert-Fixture -Condition (Test-Mql5ChmRegistrationMatches -Registration $packageCwdRegistration -NodePath 'C:\verified\runtime\node.exe' -ServerPath 'C:\verified\app\server.mjs') -Message 'The exact package working directory was rejected.'
     $registrationOverrides=@(
         (New-RegistrationFixture -Env ([pscustomobject]@{NODE_OPTIONS='--import=C:\evil.mjs'})),
         (New-RegistrationFixture -EnvVars @('NODE_OPTIONS')),
         (New-RegistrationFixture -Cwd 'C:\untrusted'),
+        (New-RegistrationFixture -Cwd '\verified'),
         (New-RegistrationFixture -EnabledTools @('mql5_chm_search')),
+        (New-RegistrationFixture -EnabledTools @()),
         (New-RegistrationFixture -DisabledTools @('mql5_chm_read_image'))
     )
     foreach($registrationOverride in $registrationOverrides){
-        Assert-Fixture -Condition (-not (Test-Mql5ChmRegistrationMatches -Registration $registrationOverride -NodePath 'C:\verified\node.exe' -ServerPath 'C:\verified\server.mjs')) -Message 'Codex registration equivalence accepted an environment, cwd, or tool-filter override.'
+        Assert-Fixture -Condition (-not (Test-Mql5ChmRegistrationMatches -Registration $registrationOverride -NodePath 'C:\verified\runtime\node.exe' -ServerPath 'C:\verified\app\server.mjs')) -Message 'Codex registration equivalence accepted an environment, cwd, or tool-filter override.'
     }
 
     # A destination appearing after validation must never absorb the temporary

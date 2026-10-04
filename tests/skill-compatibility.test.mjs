@@ -3,7 +3,7 @@ import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createMcpServer } from "../src/server.mjs";
-import { parseContract, validateAdvertisedTools, validateResponse, assertExactPassage } from "../scripts/Test-SkillCompatibility.mjs";
+import { parseContract, validateAdvertisedTools, validateResponse, assertExactPassage, assertIdentifierBatch } from "../scripts/Test-SkillCompatibility.mjs";
 
 // Minimal consumer commitments for isolated validator regression tests. The
 // cross-repository job loads the complete contract from the actual skill.
@@ -67,6 +67,51 @@ test("skill compatibility requires complete identifier proof inside the passage"
     read("RequestedTokenSuffix"), read("_RequestedToken"), read("éRequestedToken"),
     read("Unrelated passage\n\nSource: RequestedToken"), read("RequestedToken", "approximate"),
   ]) assert.throws(() => assertExactPassage(response, "RequestedToken"));
+});
+
+test("skill compatibility rejects inconsistent identifier batch commitments", () => {
+  const status={corpus_revision:"a".repeat(64),index_revision:"b".repeat(64)};
+  const identifiers=["Token","Absent","Token"];
+  const hit={topic_id:`mql5:${"1".repeat(24)}`,section_id:null,source:"mql5",match_kind:"exact"};
+  hit.citation={topic_id:hit.topic_id,section_id:null,corpus_revision:status.corpus_revision,index_revision:status.index_revision};
+  const data={source:"mql5",limit:1,count:3,result_count:2,corpus_revision:status.corpus_revision,index_sha256:status.index_revision,lookups:[
+    {identifier:"Token",count:1,match_status:"exact",results:[hit]},
+    {identifier:"Absent",count:0,match_status:"none",results:[]},
+    {identifier:"Token",count:1,match_status:"exact",results:[hit]},
+  ]};
+  const request={identifiers,source:"mql5",limit:1,status};
+  const before=structuredClone(data);
+  assert.equal(assertIdentifierBatch(data,request),data);
+  assert.deepEqual(data,before);
+  for(const mutate of [
+    value=>{value.count=4;},value=>{value.result_count=3;},
+    value=>{value.source="mql5book";},value=>{value.limit=2;},
+    value=>{value.corpus_revision="c".repeat(64);},value=>{value.index_sha256="c".repeat(64);},
+    value=>{value.lookups[0].count=2;},value=>{value.lookups[0].match_status="none";},
+    value=>{value.lookups[0].identifier="Other";},value=>{value.lookups[0].results[0].source="mql5book";},
+    value=>{value.lookups[0].results[0].match_kind="unsupported";},
+    value=>{value.lookups[0].results[0].citation.topic_id=`mql5:${"2".repeat(24)}`;},
+    value=>{value.lookups[0].results[0].citation.section_id=value.lookups[0].results[0].topic_id+":s000";},
+    value=>{value.lookups[0].results[0].citation.corpus_revision="c".repeat(64);},
+    value=>{value.lookups[0].results[0].citation.index_revision="c".repeat(64);},
+  ]) {
+    const changed=structuredClone(data);mutate(changed);
+    assert.throws(()=>assertIdentifierBatch(changed,request));
+  }
+  const approximate=structuredClone(data);
+  approximate.lookups[0].results[0].match_kind="fts";
+  approximate.lookups[0].match_status="non_exact";
+  approximate.lookups[2].match_status="non_exact";
+  assert.doesNotThrow(()=>assertIdentifierBatch(approximate,request));
+  const maximum={...structuredClone(data),limit:3,count:16,result_count:48,
+    lookups:Array.from({length:16},()=>({identifier:"Token",count:3,match_status:"exact",results:[structuredClone(hit),structuredClone(hit),structuredClone(hit)]}))};
+  const maximumRequest={...request,identifiers:Array(16).fill("Token"),limit:3};
+  assert.doesNotThrow(()=>assertIdentifierBatch(maximum,maximumRequest));
+  maximum.lookups[15].match_status="none";
+  assert.throws(()=>assertIdentifierBatch(maximum,maximumRequest));
+  maximum.lookups[15].match_status="exact";
+  maximum.lookups[15].results[2].citation.index_revision="c".repeat(64);
+  assert.throws(()=>assertIdentifierBatch(maximum,maximumRequest));
 });
 
 test("optional batch contract permits old servers and enforces new server array/output bounds",async()=>{

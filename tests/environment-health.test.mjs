@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -36,8 +37,21 @@ using System.Reflection;
 [assembly: AssemblyDescription("MetaEditor 5")]
 [assembly: AssemblyTitle("MetaEditor 5")]
 public class FakeCodex {
+  [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+  struct StartupInfo {
+    public uint Size; public string Reserved, Desktop, Title;
+    public uint X, Y, XSize, YSize, XCountChars, YCountChars, FillAttribute, Flags;
+    public ushort ShowWindow, ReservedSize; public IntPtr ReservedData, Input, Output, Error;
+  }
+  [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+  struct ProcessInfo { public IntPtr Process, Thread; public uint ProcessId, ThreadId; }
+  [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+  static extern bool CreateProcess(string application, System.Text.StringBuilder command, IntPtr processSecurity, IntPtr threadSecurity, bool inheritHandles, uint flags, IntPtr environment, string directory, ref StartupInfo startup, out ProcessInfo information);
+  [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+  static extern bool CloseHandle(IntPtr handle);
   public static int Main(string[] args) {
     string state = Environment.GetEnvironmentVariable("MQL5_HEALTH_FAKE_STATE");
+    if (args.Length == 1 && args[0] == "--probe-child") { Thread.Sleep(30000); return 0; }
     if (args.Length == 1 && args[0] == "--version") { Console.WriteLine("codex-cli 0.159.0"); return 0; }
     if (args.Length == 4 && args[0] == "mcp" && args[1] == "get" && args[2] == "mql5-chm" && args[3] == "--json") {
       // Verify the selected directory, allowing Windows short/long path aliases.
@@ -45,6 +59,27 @@ public class FakeCodex {
       if (home == null || File.ReadAllText(Path.Combine(home, "health-home-marker.txt")) != File.ReadAllText(Path.Combine(state, "home.txt"))) return 9;
       string mode = File.ReadAllText(Path.Combine(state, "mode.txt"));
       if (mode == "timeout") { File.WriteAllText(Path.Combine(state, "pid.txt"), Process.GetCurrentProcess().Id.ToString()); Thread.Sleep(30000); }
+      if (mode == "oversized-stderr" || mode == "oversized-stdout") {
+        File.WriteAllText(Path.Combine(state, "pid.txt"), Process.GetCurrentProcess().Id.ToString());
+        if (mode == "oversized-stderr") Console.Error.Write("SENSITIVE_TEST_VALUE" + new string('X', 2 * 1024 * 1024));
+        else Console.Write(new string('X', 2 * 1024 * 1024));
+      }
+      if (mode == "early-exit-child" || mode == "early-exit-detached-child") {
+        bool detached = mode == "early-exit-detached-child";
+        string application = Process.GetCurrentProcess().MainModule.FileName;
+        uint childId;
+        if (detached) {
+          // Disable all handle inheritance. Framework Process.Start can retain
+          // unrelated pipe handles even when its standard streams are redirected.
+          StartupInfo startup = new StartupInfo(); startup.Size = (uint)System.Runtime.InteropServices.Marshal.SizeOf(typeof(StartupInfo));
+          ProcessInfo child;
+          if (!CreateProcess(application, new System.Text.StringBuilder("\\\"" + application + "\\\" --probe-child"), IntPtr.Zero, IntPtr.Zero, false, 0x08000000, IntPtr.Zero, null, ref startup, out child)) return 8;
+          childId = child.ProcessId; CloseHandle(child.Thread); CloseHandle(child.Process);
+        } else {
+          using (Process child = Process.Start(new ProcessStartInfo { FileName = application, Arguments = "--probe-child", UseShellExecute = false, CreateNoWindow = true })) childId = (uint)child.Id;
+        }
+        File.WriteAllText(Path.Combine(state, "child-pid.txt"), childId.ToString());
+      }
       if (mode == "malformed") { Console.WriteLine("SENSITIVE_TEST_VALUE invalid-json"); return 0; }
       if (mode == "unavailable") { Console.Error.WriteLine("SENSITIVE_TEST_VALUE failed-query"); return 1; }
       Console.WriteLine(File.ReadAllText(Path.Combine(state, "registration.json"))); return 0;
@@ -95,11 +130,26 @@ for (const shell of ["pwsh.exe", "powershell.exe"]) {
     const mt4Source = path.join(temporary, "FakeMt4.cs");
     await writeFile(mt4Source, fakeSource.replace('AssemblyFileVersion("5.0.0.6230")', 'AssemblyFileVersion("4.0.0.2418")'));
     execFileSync(csc, ["/nologo", `/out:${path.join(mt4, "terminal.exe")}`, mt4Source], { windowsHide: true, timeout: 30_000 });
+    const invalidEditors = [];
+    for (const [name, editorMajor, terminalMajors] of [
+      ["non-MT5 editor beside an MT5 terminal", 4, [5]],
+      ["non-MT5 standalone editor with an MT5 label", 4, []],
+      ["mixed MT4 and MT5 terminal directory", 5, [5, 4]],
+    ]) {
+      const directory = path.join(temporary, name);
+      await mkdir(directory);
+      const selected = path.join(directory, "metaeditor64.exe");
+      await cp(editorMajor === 5 ? codex : path.join(mt4, "terminal.exe"), selected);
+      for (const [index, major] of terminalMajors.entries()) {
+        await cp(major === 5 ? codex : path.join(mt4, "terminal.exe"), path.join(directory, ["terminal64.exe", "terminal.exe"][index]));
+      }
+      invalidEditors.push([name, selected]);
+    }
     const health = path.join(peerSkill, "scripts/Test-Mql5Environment.ps1");
     const registration = { name: "mql5-chm", enabled: true, enabled_tools: null, disabled_tools: null, transport: { type: "stdio", command: path.join(fixture.root, "runtime/node.exe"), args: [path.join(fixture.root, "app/server.mjs")], cwd: fixture.root, env: null, env_vars: [] } };
     const saveRegistration = async value => writeFile(path.join(state, "registration.json"), JSON.stringify(value));
     await saveRegistration(registration);
-    function run(extra = [], expected = 0) {
+    function run(extra = [], expected = 0, workingDirectory = repository) {
       const started = Date.now();
       const parameters = new Map([["-WorkspaceRoot", temporary], ["-CodexHome", codexHome], ["-CodexPath", codex], ["-McpPackageRoot", fixture.root],
         ["-SkillRoot", skill], ["-SkillSourceRoot", sourceSkill], ["-McpSourceRoot", sourceMcp], ["-MetaEditorPath", editor], ["-PythonPath", python], ["-TimeoutSeconds", "5"]]);
@@ -109,7 +159,7 @@ for (const shell of ["pwsh.exe", "powershell.exe"]) {
         else { parameters.set(extra[index], extra[index + 1]); index += 1; }
       }
       const result = spawnSync(shell, ["-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", health, ...[...parameters].flat(), ...switches],
-      { cwd: repository, encoding: "utf8", windowsHide: true, timeout: 35_000, env: { ...process.env, MQL5_HEALTH_FAKE_STATE: state, MQL5_CHM_MCP_ROOT: path.join(temporary, "unused ambient override") } });
+      { cwd: workingDirectory, encoding: "utf8", windowsHide: true, timeout: 35_000, env: { ...process.env, MQL5_HEALTH_FAKE_STATE: state, MQL5_CHM_MCP_ROOT: path.join(temporary, "unused ambient override") } });
       assert.ifError(result.error);
       assert.equal(result.status, expected, result.stdout + result.stderr);
       assert.ok(!`${result.stdout}${result.stderr}`.includes("SENSITIVE_TEST_VALUE"), "Probe/config secrets escaped the report");
@@ -144,6 +194,64 @@ for (const shell of ["pwsh.exe", "powershell.exe"]) {
       assert.equal(report.python.available, true);
       assert.equal(report.python.pyyaml_available, true);
     });
+    async function withDriveRoot(directory, action) {
+      const letter = ["Z", "Y", "X", "W", "V", "U", "T", "S", "R"].find(value => !existsSync(`${value}:\\`));
+      assert.ok(letter, "A free drive letter is needed for the disposable root-path fixture");
+      const drive = `${letter}:`, root = `${drive}\\`;
+      const subst = path.join(process.env.WINDIR, "System32/subst.exe");
+      execFileSync(subst, [drive, directory], { windowsHide: true, timeout: 10_000 });
+      try { return await action(root); }
+      finally { execFileSync(subst, [drive, "/D"], { windowsHide: true, timeout: 10_000 }); }
+    }
+    await t.test("installed skill at a drive root keeps the complete inventory from a nested working folder", async () => {
+      await withDriveRoot(skill, root => {
+        const { report } = run(["-SkillRoot", root], 0, path.join(root, "scripts"));
+        assert.equal(report.status, "passed");
+        assert.equal(report.skill.root, root);
+        assert.equal(report.skill.file_count, Object.keys(originalSkill).length);
+        assert.equal(report.skill.source_comparison.status, "same");
+        assert.equal(report.skill.fingerprint_sha256, hash(Buffer.from(Object.keys(originalSkill).sort().map(name => `${name}\0${originalSkill[name]}`).join("\n"))));
+      });
+    });
+    await t.test("skill source at a drive root compares every relative path from a nested working folder", async () => {
+      await withDriveRoot(sourceSkill, root => {
+        const { report } = run(["-SkillSourceRoot", root], 0, path.join(root, "scripts"));
+        assert.equal(report.status, "passed");
+        assert.equal(report.skill.source_comparison.source_root, root);
+        assert.equal(report.skill.source_comparison.status, "same");
+      });
+    });
+    await t.test("MCP source comparison preserves an absolute drive root", async () => {
+      await withDriveRoot(sourceMcp, root => {
+        const { report } = run(["-McpSourceRoot", root]);
+        assert.equal(report.status, "passed");
+        assert.equal(report.mcp.source_comparison.source_root, root);
+        assert.equal(report.mcp.source_comparison.status, "same");
+      });
+    });
+    await t.test("MCP package at a drive root completes real stdio from a nested working folder", async () => {
+      await withDriveRoot(fixture.root, async root => {
+        await saveRegistration({ ...registration, transport: { ...registration.transport, command: path.join(root, "runtime/node.exe"), args: [path.join(root, "app/server.mjs")], cwd: root } });
+        try {
+          const { report } = run(["-McpPackageRoot", root], 0, path.join(root, "scripts"));
+          assert.equal(report.status, "passed");
+          assert.equal(report.mcp.package_root, root);
+          assert.equal(report.mcp.integrity, "passed");
+          assert.equal(report.mcp.checked_files, Object.keys(packageFiles).length);
+          assert.equal(report.mcp.stdio_available, true);
+        } finally { await saveRegistration(registration); }
+      });
+    });
+    for (const cwd of [null, undefined]) {
+      await t.test(`inherited working directory (${cwd === null ? "null" : "absent"}) agrees with installer registration`, async () => {
+        const changed = { ...registration, transport: { ...registration.transport } };
+        if (cwd === null) changed.transport.cwd = null;
+        else delete changed.transport.cwd;
+        await saveRegistration(changed);
+        try { assert.equal(run().report.status, "passed"); }
+        finally { await saveRegistration(registration); }
+      });
+    }
     await t.test("missing optional tools warn or fail when required", () => {
       const missing = path.join(temporary, "missing.exe");
       const { report } = run(["-MetaEditorPath", missing, "-PythonPath", missing]);
@@ -156,17 +264,37 @@ for (const shell of ["pwsh.exe", "powershell.exe"]) {
       assert.equal(report.metaeditor.available, false);
       assert.ok(codes(report).includes("metaeditor_missing"));
     });
+    for (const [name, selected] of invalidEditors) {
+      await t.test(name, () => {
+        const { report } = run(["-MetaEditorPath", selected, "-RequireCompiler"], 1);
+        assert.equal(report.metaeditor.available, false);
+        assert.ok(codes(report).includes("metaeditor_missing"));
+      });
+    }
     for (const [name, change, code] of [
       ["disabled registration", { enabled: false }, "mcp_disabled"],
       ["disabled required tool", { disabled_tools: ["mql5_chm_read"] }, "mcp_tool_disabled"],
       ["empty enabled-tools list", { enabled_tools: [] }, "mcp_tool_disabled"],
       ["partial enabled-tools list", { enabled_tools: ["mql5_chm_status"] }, "mcp_tool_disabled"],
       ["wrong working directory", { transport: { ...registration.transport, cwd: temporary } }, "mcp_registration_mismatch"],
+      ["root-relative working directory", { transport: { ...registration.transport, cwd: fixture.root.slice(2) } }, "mcp_registration_mismatch"],
       ["ambient root override", { transport: { ...registration.transport, env_vars: ["MQL5_CHM_MCP_ROOT"] } }, "mcp_ambient_root"],
     ]) {
       await t.test(name, async () => {
         await saveRegistration({ ...registration, ...change });
         try { const { report } = run([], 1); assert.ok(codes(report).includes(code)); assert.equal(report.mcp.stdio_available, true); }
+        finally { await saveRegistration(registration); }
+      });
+    }
+    for (const [name, change] of [
+      ["missing enabled state", { enabled: undefined }],
+      ["string enabled state", { enabled: "true" }],
+      ["scalar server arguments", { transport: { ...registration.transport, args: registration.transport.args[0] } }],
+      ["scalar tool denylist", { disabled_tools: "unused_tool" }],
+    ]) {
+      await t.test(`malformed registration: ${name}`, async () => {
+        await saveRegistration({ ...registration, ...change });
+        try { const { report } = run([], 1); assert.ok(codes(report).includes("codex_registration_unavailable")); assert.equal(report.codex.registration_state, "unavailable"); }
         finally { await saveRegistration(registration); }
       });
     }
@@ -226,17 +354,52 @@ for (const shell of ["pwsh.exe", "powershell.exe"]) {
       try { assert.ok(codes(run([], 1).report).includes("skill_unreadable")); }
       finally { await writeFile(file, bytes); }
     });
-    for (const mode of ["malformed", "unavailable", "timeout"]) {
+    for (const [name, identity] of [
+      ["array root", [{ schema_version: 1, version: skillVersion }]],
+      ["array version", { schema_version: 1, version: [skillVersion] }],
+      ["array schema", { schema_version: [1], version: skillVersion }],
+      ["boolean schema", { schema_version: true, version: skillVersion }],
+      ["string schema", { schema_version: "1", version: skillVersion }],
+      ["unknown field", { schema_version: 1, version: skillVersion, extra: true }],
+    ]) {
+      await t.test(`invalid skill version: ${name}`, async () => {
+        const file = path.join(skill, "version.json");
+        const bytes = await readFile(file);
+        const invalid = Buffer.from(JSON.stringify(identity));
+        await writeFile(file, invalid);
+        try {
+          const { report } = run([], 1);
+          assert.ok(codes(report).includes("skill_unreadable"));
+          assert.equal(report.skill.installed, false);
+          assert.equal(report.skill.declared_version, null);
+          assert.equal(report.mcp.stdio_available, true);
+          assert.deepEqual(await readFile(file), invalid, "Health inspection modified invalid version evidence");
+        } finally { await writeFile(file, bytes); }
+      });
+    }
+    for (const mode of ["malformed", "unavailable", "timeout", "early-exit-child", "early-exit-detached-child", "oversized-stderr", "oversized-stdout"]) {
       await t.test(`Codex ${mode} is diagnosed without leaking subprocess output`, async () => {
         await writeFile(path.join(state, "mode.txt"), mode);
         try {
-          const { report, elapsed } = run([], 1);
-          assert.ok(codes(report).includes("codex_registration_unavailable"));
+          const detached = mode === "early-exit-detached-child";
+          const { report, elapsed } = run([], detached ? 0 : 1);
+          if (detached) assert.equal(report.status, "passed");
+          else assert.ok(codes(report).includes("codex_registration_unavailable"));
           assert.equal(report.mcp.stdio_available, true);
           if (mode === "timeout") {
             assert.ok(elapsed < 20_000, `Probe deadline was not bounded: ${elapsed}ms`);
             const pid = (await readFile(path.join(state, "pid.txt"), "utf8")).trim();
             assert.ok(!execFileSync("tasklist.exe", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], { encoding: "utf8", windowsHide: true }).includes(`"${pid}"`), "Timed-out Codex probe is still running");
+          }
+          if (mode.startsWith("early-exit-")) {
+            assert.ok(elapsed < 20_000, `Orphan cleanup was not bounded: ${elapsed}ms`);
+            const pid = (await readFile(path.join(state, "child-pid.txt"), "utf8")).trim();
+            assert.ok(!execFileSync("tasklist.exe", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], { encoding: "utf8", windowsHide: true }).includes(`"${pid}"`), "A child survived after its probe parent exited");
+          }
+          if (mode.startsWith("oversized-")) {
+            assert.ok(elapsed < 20_000, `Oversized output cleanup was not bounded: ${elapsed}ms`);
+            const pid = (await readFile(path.join(state, "pid.txt"), "utf8")).trim();
+            assert.ok(!execFileSync("tasklist.exe", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], { encoding: "utf8", windowsHide: true }).includes(`"${pid}"`), "An oversized-output probe survived cleanup");
           }
         } finally { await writeFile(path.join(state, "mode.txt"), "valid"); }
       });

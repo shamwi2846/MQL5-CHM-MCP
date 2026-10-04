@@ -121,6 +121,20 @@ function Assert-InvalidJournalNumberRejected {
 }
 
 try {
+    # Lexical root checks must not depend on the process's current directory.
+    $filesystemRoot = Get-FilesystemRootPath -Path $testRoot
+    $allowedRoot = Assert-PathWithin -Root $filesystemRoot -Path $filesystemRoot -AllowRoot
+    Assert-Test ($allowedRoot -ceq $filesystemRoot) 'An allowed filesystem root lost its absolute root separator.'
+    Assert-Test ([IO.Path]::GetFullPath($allowedRoot) -ceq $filesystemRoot) 'Renormalizing an allowed root selected the ambient working directory.'
+    $rootRefused = $false
+    try { Assert-PathWithin -Root $filesystemRoot -Path $filesystemRoot | Out-Null } catch { $rootRefused = $true }
+    Assert-Test $rootRefused 'Root preservation allowed a destructive target to equal its confinement root.'
+    Assert-Test ((Assert-PathWithin -Root $testRoot -Path ($testRoot+[IO.Path]::DirectorySeparatorChar) -AllowRoot) -ceq $testRoot) 'Ordinary confinement directories changed their canonical form.'
+    if ($env:OS -ceq 'Windows_NT') {
+        # This is a lexical check; no UNC connection or filesystem access occurs.
+        $uncRoot = '\\mql5-root-fixture\share\'
+        Assert-Test ((Assert-PathWithin -Root $uncRoot -Path $uncRoot -AllowRoot) -ceq $uncRoot) 'An allowed UNC share root lost its root separator.'
+    }
     foreach ($invalidNumber in @('schema-string','new-bytes-string','new-bytes-fraction')) {
         Assert-InvalidJournalNumberRejected -Name "invalid-$invalidNumber" -Mutation $invalidNumber
     }

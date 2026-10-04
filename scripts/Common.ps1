@@ -192,7 +192,12 @@ function Assert-PathWithin {
     $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
     $pathFull = [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
     if ($pathFull.Equals($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) {
-        if ($AllowRoot) { return $pathFull }
+        if ($AllowRoot) {
+            # A drive root must remain C:\, rather than the drive-relative C:.
+            $filesystemRoot = Get-FilesystemRootPath -Path $Path
+            if ($pathFull.Equals($filesystemRoot.TrimEnd('\','/'), [StringComparison]::OrdinalIgnoreCase)) { return $filesystemRoot.TrimEnd('\','/') + [IO.Path]::DirectorySeparatorChar }
+            return $pathFull
+        }
         throw "Refusing to use the confinement root itself as a target: $pathFull"
     }
     $prefix = $rootFull + [System.IO.Path]::DirectorySeparatorChar
@@ -2006,13 +2011,21 @@ function Test-Mql5ChmRegistrationEquivalent {
         }
 
         $cwdProperty = $transport.PSObject.Properties['cwd']
-        if ($null -ne $cwdProperty -and $null -ne $cwdProperty.Value -and
-            (-not ($cwdProperty.Value -is [string]) -or ([string]$cwdProperty.Value).Length -ne 0)) { return $false }
+        if ($null -ne $cwdProperty -and $null -ne $cwdProperty.Value) {
+            $cwd = $cwdProperty.Value
+            $packageRoot = [IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($ServerPath)))
+            if ($cwd -isnot [string] -or -not [IO.Path]::IsPathRooted($cwd) -or
+                -not ($cwd -match '^[A-Za-z]:[\\/]' -or $cwd -match '^\\\\[^\\/]+[\\/][^\\/]+') -or
+                -not [IO.Path]::GetFullPath($cwd).TrimEnd('\','/').Equals($packageRoot.TrimEnd('\','/'), [StringComparison]::OrdinalIgnoreCase)) { return $false }
+        }
 
         foreach ($filterName in @('enabled_tools','disabled_tools')) {
             $filterProperty = $Registration.PSObject.Properties[$filterName]
             if ($null -eq $filterProperty -or $null -eq $filterProperty.Value) { continue }
             $filterValue = $filterProperty.Value
+            # A present allowlist, including [], restricts exposed tools. Only
+            # an absent/null allowlist is equivalent to an unfiltered install.
+            if ($filterName -ceq 'enabled_tools') { return $false }
             if ($filterValue -is [string] -or -not ($filterValue -is [Collections.IEnumerable]) -or @($filterValue).Count -ne 0) { return $false }
         }
 
@@ -2138,13 +2151,79 @@ function Assert-ExactJsonProperties {
 
 function Read-JsonFile {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Path, [string]$Context = 'JSON file')
+    param([Parameter(Mandatory)][string]$Path, [string]$Context = 'JSON file', [switch]$RequireObject)
     $full = Resolve-FullPath -Path $Path -MustExist -PathType Leaf
     try {
         $json = Get-Content -LiteralPath $full -Raw -Encoding UTF8
+        # Inspect the serialized root before PowerShell can unwrap a singleton array.
+        if ($RequireObject -and ($null -eq $json -or -not $json.TrimStart().StartsWith('{'))) { throw "$Context must be a JSON object." }
         if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')) { return ConvertFrom-Json -InputObject $json -DateKind String -ErrorAction Stop }
         return ConvertFrom-Json -InputObject $json -ErrorAction Stop
     } catch { throw "Invalid $Context '$full': $($_.Exception.Message)" }
+}
+
+function Get-RevisionJsonField {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowNull()][object]$Object,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][ValidateSet('Object','String','NullableString','Integer')][string]$Type,
+        [string]$Context = 'revision JSON',
+        [long]$Minimum = 0
+    )
+    if ($Object -isnot [pscustomobject]) { throw "$Context must be a JSON object." }
+    $properties = @($Object.PSObject.Properties | Where-Object { $_.Name -ceq $Name })
+    if ($properties.Count -ne 1) { throw "$Context is missing required property '$Name'." }
+    # Read the property directly, without pipeline enumeration or scalar casts.
+    $value = $properties[0].Value
+    $valid = switch ($Type) {
+        'Object' { $value -is [pscustomobject] }
+        'String' { $value -is [string] -and $value.Length -gt 0 -and $value -cnotmatch '[\x00-\x1f\x7f]' }
+        'NullableString' { $null -eq $value -or ($value -is [string] -and $value -cnotmatch '[\x00-\x1f\x7f]') }
+        'Integer' {
+            $numeric = (Test-TransactionJsonInteger $value) -or $value -is [double] -or $value -is [single] -or $value -is [decimal]
+            $numeric -and $value -ge $Minimum -and $value -le [long]9007199254740991 -and
+                -not [double]::IsNaN([double]$value) -and -not [double]::IsInfinity([double]$value) -and
+                [Math]::Truncate([double]$value) -eq [double]$value
+        }
+    }
+    if (-not $valid) { throw "$Context.$Name must have JSON type $Type$(if ($Type -ceq 'Integer') { ' in the safe integer range' })." }
+    return ,$value
+}
+
+function Assert-RevisionManifestTypes {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$Manifest)
+    $schema = Get-RevisionJsonField $Manifest 'schema_version' Integer 'manifest' -Minimum 1
+    $database = Get-RevisionJsonField $Manifest 'database' Object 'manifest'
+    foreach ($name in @('filename','sha256')) { Get-RevisionJsonField $database $name String 'manifest.database' | Out-Null }
+    Get-RevisionJsonField $database 'bytes' Integer 'manifest.database' -Minimum 1 | Out-Null
+    foreach ($name in @('corpus_sha256','indexed_at','build_timestamp')) { Get-RevisionJsonField $Manifest $name String 'manifest' | Out-Null }
+    foreach ($name in @('total_topic_count','total_section_count','topic_link_count','resolved_topic_link_count','unresolved_topic_link_count')) { Get-RevisionJsonField $Manifest $name Integer 'manifest' | Out-Null }
+    if ($null -ne $Manifest.PSObject.Properties['corpus_revision']) { Get-RevisionJsonField $Manifest 'corpus_revision' NullableString 'manifest' | Out-Null }
+    $sources = Get-RevisionJsonField $Manifest 'sources' Object 'manifest'
+    $sourceNames = @((Get-Mql5CorpusDefinition).Id)
+    Assert-ExactJsonProperties -Object $sources -Names $sourceNames -Context 'manifest.sources'
+    foreach ($id in $sourceNames) {
+        $source = Get-RevisionJsonField $sources $id Object 'manifest.sources'
+        $context = "manifest.sources.$id"
+        foreach ($name in @('filename','sha256','retrieved_at')) { Get-RevisionJsonField $source $name String $context | Out-Null }
+        foreach ($name in @('bytes','topic_count','section_count')) { Get-RevisionJsonField $source $name Integer $context -Minimum 1 | Out-Null }
+        foreach ($name in @('http_last_modified','http_etag')) { Get-RevisionJsonField $source $name NullableString $context | Out-Null }
+    }
+    if ($schema -eq $script:ManifestSchemaVersion) {
+        foreach ($name in @('corpus_revision','index_revision','index_contract')) { Get-RevisionJsonField $Manifest $name String 'manifest' | Out-Null }
+        $assets = Get-RevisionJsonField $Manifest 'assets' Object 'manifest'
+        foreach ($name in @('directory','catalog_sha256','tree_sha256','policy_sha256')) { Get-RevisionJsonField $assets $name String 'manifest.assets' | Out-Null }
+        $counts = @('cataloged_count','exposed_count','excluded_count','occurrence_count','exposed_occurrence_count','total_bytes')
+        foreach ($name in $counts) { Get-RevisionJsonField $assets $name Integer 'manifest.assets' | Out-Null }
+        $bySource = Get-RevisionJsonField $assets 'by_source' Object 'manifest.assets'
+        Assert-ExactJsonProperties -Object $bySource -Names $sourceNames -Context 'manifest.assets.by_source'
+        foreach ($id in $sourceNames) {
+            $source = Get-RevisionJsonField $bySource $id Object 'manifest.assets.by_source'
+            foreach ($name in $counts) { Get-RevisionJsonField $source $name Integer "manifest.assets.by_source.$id" | Out-Null }
+        }
+    }
 }
 
 function Get-PeMachineType {
@@ -3714,7 +3793,10 @@ function Get-ActiveRevisionPointer {
         if ($AllowMissing) { return $null }
         throw "Active revision pointer is missing: $path"
     }
-    $pointer = Read-JsonFile -Path $path -Context 'active revision pointer'
+    $pointer = Read-JsonFile -Path $path -Context 'active revision pointer' -RequireObject
+    Get-RevisionJsonField $pointer 'schema_version' Integer 'active revision pointer' -Minimum 1 | Out-Null
+    foreach ($name in @('active_revision','activated_at')) { Get-RevisionJsonField $pointer $name String 'active revision pointer' | Out-Null }
+    Get-RevisionJsonField $pointer 'previous_revision' NullableString 'active revision pointer' | Out-Null
     Assert-ExactJsonProperties -Object $pointer -Names @('schema_version','active_revision','previous_revision','activated_at') -Context 'active revision pointer'
     $schemaVersion = [int](Get-RequiredJsonProperty $pointer 'schema_version')
     if (@(1,$script:ActivePointerSchemaVersion) -notcontains $schemaVersion) { throw 'Active revision pointer schema_version must be 1 or 2.' }
@@ -3853,7 +3935,8 @@ function Assert-Revision {
     foreach ($immutablePath in @($manifestPath,$databasePath,$corpusLockPath)) { Assert-NoReparsePoint -Root $revisionConfinement -Path $immutablePath }
     $corpusLock = Read-JsonFile -Path $corpusLockPath -Context 'revision corpus lock'
     if ($null -eq $corpusLock.sources -or @($corpusLock.sources).Count -ne 3) { throw 'Revision corpus lock must describe exactly three sources.' }
-    $manifest = Read-JsonFile -Path $manifestPath -Context 'revision manifest'
+    $manifest = Read-JsonFile -Path $manifestPath -Context 'revision manifest' -RequireObject
+    Assert-RevisionManifestTypes -Manifest $manifest
     $manifestSchema = [int](Get-RequiredJsonProperty $manifest 'schema_version' 'manifest')
     if (@($script:LegacyManifestSchemaVersion,$script:ManifestSchemaVersion) -notcontains $manifestSchema) { throw "Manifest schema_version must be 2 or $script:ManifestSchemaVersion." }
     if ($RequireCurrent -and $manifestSchema -ne $script:ManifestSchemaVersion) { throw "The active revision uses legacy manifest schema $manifestSchema. Run Rebuild-Index.ps1 before continuing." }
@@ -3902,6 +3985,8 @@ function Assert-Revision {
     $corpusRevision = Get-CorpusRevision -SourceHashes $hashObject
     $declaredCorpus = [string](Get-RequiredJsonProperty $manifest 'corpus_sha256' 'manifest')
     if ($declaredCorpus -cne $corpusRevision) { throw 'Manifest corpus_sha256 does not match the canonical source hash.' }
+    $corpusAlias = $manifest.PSObject.Properties['corpus_revision']
+    if ($null -ne $corpusAlias -and $null -ne $corpusAlias.Value -and $corpusAlias.Value -cne $corpusRevision) { throw 'Manifest corpus_revision does not match corpus_sha256.' }
     if ($manifestSchema -eq $script:ManifestSchemaVersion) {
         if ([string](Get-RequiredJsonProperty $manifest 'corpus_revision' 'manifest') -cne $corpusRevision) { throw 'Manifest corpus_revision does not match corpus_sha256.' }
         if ([string](Get-RequiredJsonProperty $manifest 'index_revision' 'manifest') -cne $databaseHash) { throw 'Manifest index_revision must equal database.sha256.' }

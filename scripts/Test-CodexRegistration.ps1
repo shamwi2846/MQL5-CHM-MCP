@@ -33,13 +33,13 @@ function New-Registration {
         [Parameter(Mandatory)][string]$Server,
         [bool]$Enabled = $true,
         [AllowNull()][object]$Environment = $null,
-        [string]$Cwd = '',
-        [string[]]$EnabledTools = @()
+        [AllowNull()][object]$Cwd = $null,
+        [AllowNull()][object]$EnabledTools = $null
     )
     return [ordered]@{
         name='mql5-chm'
         enabled=$Enabled
-        enabled_tools=@($EnabledTools)
+        enabled_tools=$EnabledTools
         disabled_tools=@()
         transport=[ordered]@{type='stdio';command=$Node;args=@($Server);env=$Environment;env_vars=@();cwd=$Cwd}
     }
@@ -87,8 +87,8 @@ switch ($arguments[1]) {
         }
         $enabled = $state.scenario -notlike 'partial-disabled*'
         $state.registration = [pscustomobject]@{
-            name='mql5-chm';enabled=$enabled;enabled_tools=@();disabled_tools=@()
-            transport=[pscustomobject]@{type='stdio';command=$node;args=@($server);env=$null;env_vars=@();cwd=''}
+            name='mql5-chm';enabled=$enabled;enabled_tools=$null;disabled_tools=@()
+            transport=[pscustomobject]@{type='stdio';command=$node;args=@($server);env=$null;env_vars=@();cwd=$null}
         }
         Save-State
         if ($state.scenario -eq 'nonzero-owned-add') { exit 44 }
@@ -214,6 +214,25 @@ switch ($arguments[1]) {
         $result = Install-CodexMql5ChmRegistration -CodexPath $codexPath -NodePath $nodePath -ServerPath $serverPath
         Assert-Test ($result.State -ceq 'already-installed') 'Equivalent enabled installation was not idempotent.'
         Assert-Test ([int](Read-FakeState).add_count -eq 1) 'Idempotent installation invoked add twice.'
+
+        foreach ($workingDirectory in @($legalMetacharacterPackage,($legalMetacharacterPackage+'\'))) {
+            Write-FakeState 'normal' (New-Registration $nodePath $serverPath -Cwd $workingDirectory)
+            $result=Install-CodexMql5ChmRegistration -CodexPath $codexPath -NodePath $nodePath -ServerPath $serverPath
+            Assert-Test ($result.State -ceq 'already-installed') 'A package working directory was rejected.'
+            Assert-Test ([int](Read-FakeState).add_count -eq 0 -and [int](Read-FakeState).remove_count -eq 0) 'A correct package working directory caused configuration writes.'
+        }
+        $withoutCwd=New-Registration $nodePath $serverPath
+        $withoutCwd.transport.Remove('cwd')
+        $withoutCwd.Remove('enabled_tools')
+        Write-FakeState 'normal' $withoutCwd
+        Assert-Test ((Install-CodexMql5ChmRegistration -CodexPath $codexPath -NodePath $nodePath -ServerPath $serverPath).State -ceq 'already-installed') 'Absent optional cwd/allowlist fields were rejected.'
+        Write-FakeState 'normal' (New-Registration $nodePath $serverPath -EnabledTools @())
+        Assert-Throws {Install-CodexMql5ChmRegistration -CodexPath $codexPath -NodePath $nodePath -ServerPath $serverPath | Out-Null} 'An empty tool allowlist was accepted as an unrestricted installation.'
+        Assert-Test ([int](Read-FakeState).add_count -eq 0 -and [int](Read-FakeState).remove_count -eq 0) 'An empty allowlist was changed instead of preserved.'
+        foreach ($invalidCwd in @('', '.', 'C:relative', 'C:\another-package', $legalMetacharacterPackage.Substring(2))) {
+            Write-FakeState 'normal' (New-Registration $nodePath $serverPath -Cwd $invalidCwd)
+            Assert-Throws {Install-CodexMql5ChmRegistration -CodexPath $codexPath -NodePath $nodePath -ServerPath $serverPath | Out-Null} 'An invalid or unrelated working directory was accepted.'
+        }
 
         Write-FakeState 'normal' (New-Registration $nodePath $serverPath -Enabled:$false)
         Assert-Throws { Install-CodexMql5ChmRegistration -CodexPath $codexPath -NodePath $nodePath -ServerPath $serverPath | Out-Null } 'Disabled owned registration was replaced.'

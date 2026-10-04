@@ -6,6 +6,8 @@ The default indexed synthetic corpus is generated locally and deleted after the 
 
 The original four tools remain required. The skill may declare `mql5_chm_lookup_identifiers` under `optional_tools`, including integer and array bounds and per-name response/citation commitments. Older servers can omit it and the skill falls back to single searches. When advertised, the checker validates its complete contract and exercises mixed exact/non-exact/missing names, input order, duplicates, result equivalence with single search, citation revisions, maximum bounds and malformed inputs. A current pair therefore has two additional checks; saved artifacts retain the actual count and commits for each run.
 
+Both mixed-name and maximum-size replies must preserve the requested source and limit, report counts equal to their actual lookups/results, and derive each match status from its results. Batch and citation revisions must match the verified status; each citation must identify its returned topic and section. The checker rejects inconsistent metadata even when the values individually satisfy the advertised JSON schema.
+
 ## Local repository pair
 
 From the MCP checkout, with the skill checkout alongside it and Node.js 24.17.0 installed:
@@ -55,7 +57,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Environment health regression tests failed.' }
 
 The skill has the [installed health command and options](https://github.com/shamwi2846/MQL5-Coding-Skill/blob/main/skills/mql5-coding/references/environment-health.md). The health regression suite is a separate Windows pair-job gate; it is not part of the MCP's standalone fast test count.
 
-The counterpart skill also ships [reusable project profiles](https://github.com/shamwi2846/MQL5-Coding-Skill/blob/main/skills/mql5-coding/references/project-profiles.md). The current health gate expects its seventeen-file package, including the profile validator, creation/invocation commands, and reference. Profile regression tests run in the skill's Windows CI under both shells. These additions require no change to the production MCP runtime or documentation interface.
+The counterpart skill also ships [reusable project profiles](https://github.com/shamwi2846/MQL5-Coding-Skill/blob/main/skills/mql5-coding/references/project-profiles.md). The current health gate expects its twenty-one-file package, including the profile commands/reference, release commands/reference, and version metadata. Profile regression tests run in the skill's Windows CI under both shells. These additions require no change to the production MCP runtime or documentation interface.
 
 Generated profiles keep files inside the EA project relative and external selections absolute, preserving the selected include/preset when the project moves. Saving a profile does not save executable trust or execution acknowledgement.
 

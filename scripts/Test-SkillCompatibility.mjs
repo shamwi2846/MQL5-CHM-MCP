@@ -149,6 +149,35 @@ export function assertExactPassage(result, identifier) {
   assert.match(result.content[0].text.split("\n\nSource:")[0], new RegExp(`(?<![\\p{L}\\p{N}_])${escaped}(?![\\p{L}\\p{N}_])`, "u"), "Exact focus did not return a complete identifier token");
 }
 
+export function assertIdentifierBatch(data, { identifiers, source, limit, status }) {
+  assert.ok(Array.isArray(data.lookups), "Batch omitted lookups");
+  assert.deepEqual(data.lookups.map(lookup => lookup.identifier), identifiers, "Batch identifier order changed");
+  assert.equal(data.source, source, "Batch source differs from the request");
+  assert.equal(data.limit, limit, "Batch limit differs from the request");
+  assert.equal(data.corpus_revision, status.corpus_revision, "Batch corpus revision differs from status");
+  assert.equal(data.index_sha256, status.index_revision, "Batch index revision differs from status");
+  assert.equal(data.count, identifiers.length, "Batch lookup count is inconsistent");
+  let resultCount = 0;
+  for (const lookup of data.lookups) {
+    assert.ok(Array.isArray(lookup.results), "Batch lookup omitted results");
+    assert.equal(lookup.count, lookup.results.length, "Batch per-identifier result count is inconsistent");
+    assert.ok(lookup.results.length <= limit, "Batch exceeded its per-identifier result limit");
+    const matchStatus = lookup.results.some(entry => entry.match_kind === "exact") ? "exact" : lookup.results.length ? "non_exact" : "none";
+    assert.equal(lookup.match_status, matchStatus, "Batch match status is inconsistent with its results");
+    resultCount += lookup.results.length;
+    for (const entry of lookup.results) {
+      assert.ok(["exact", "fts", "expanded", "fuzzy"].includes(entry.match_kind), "Batch has an invalid match kind");
+      if (source !== "all") assert.equal(entry.source, source, "Batch result escaped the selected source");
+      assert.equal(entry.citation.topic_id, entry.topic_id, "Batch citation names a different topic");
+      assert.equal(entry.citation.section_id, entry.section_id, "Batch citation names a different section");
+      assert.equal(entry.citation.corpus_revision, status.corpus_revision, "Batch citation corpus revision differs from status");
+      assert.equal(entry.citation.index_revision, status.index_revision, "Batch citation index revision differs from status");
+    }
+  }
+  assert.equal(data.result_count, resultCount, "Batch total result count is inconsistent");
+  return data;
+}
+
 async function artifactHashes(root) {
   const activePath = path.join(root, "data", "active.json");
   const active = JSON.parse(await readFile(activePath, "utf8"));
@@ -224,7 +253,7 @@ export async function runCompatibility({ skillRoot, pythonPath, serverPath = pat
     if (contract.optional_tools?.mql5_chm_lookup_identifiers && listed.tools.some(tool=>tool.name==="mql5_chm_lookup_identifiers")) {
       const identifiers=[identifier,identifier.slice(0,-1),"zzzz_nonexistent_7391",identifier];
       const batch=(await call("mql5_chm_lookup_identifiers",{identifiers,source:"mql5",limit:1})).structuredContent;
-      assert.deepEqual(batch.lookups.map(lookup=>lookup.identifier),identifiers);
+      assertIdentifierBatch(batch,{identifiers,source:"mql5",limit:1,status});
       assert.deepEqual(batch.lookups.map(lookup=>lookup.match_status),["exact","non_exact","none","exact"]);
       for (const [i,lookup] of batch.lookups.entries()) {
         const single=(await call("mql5_chm_search",{query:identifiers[i],source:"mql5",limit:1,expand:false})).structuredContent;
@@ -236,8 +265,9 @@ export async function runCompatibility({ skillRoot, pythonPath, serverPath = pat
         }
       }
       checks.push("batch_identifier_order_match_status_and_citations");
-      const maximum=(await call("mql5_chm_lookup_identifiers",{identifiers:Array(16).fill(identifier),limit:3})).structuredContent;
-      assert.equal(maximum.count,16);assert.ok(maximum.result_count<=48);
+      const maximumNames=Array(16).fill(identifier);
+      const maximum=(await call("mql5_chm_lookup_identifiers",{identifiers:maximumNames,limit:3})).structuredContent;
+      assertIdentifierBatch(maximum,{identifiers:maximumNames,source:"mql5",limit:3,status});
       for(const args of [{identifiers:[]},{identifiers:Array(17).fill(identifier)},{identifiers:[identifier],limit:4},{identifiers:[identifier,"Bad(Name"]},{identifiers:[identifier],extra:true}]) {
         assert.equal((await client.callTool({name:"mql5_chm_lookup_identifiers",arguments:args})).isError,true);
       }
