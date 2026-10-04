@@ -1,10 +1,10 @@
-# MQL5 CHM MCP 1.3.0
+# MQL5 CHM MCP 1.3.1
 
-The versioned Windows package is published on the [v1.3.0 release](https://github.com/shamwi2846/MQL5-CHM-MCP/releases/tag/v1.3.0). Release tags must match the package, lockfile, server, documentation and download user agents. Publish only the portable ZIP and checksum sidecar retained by the successful release-validation run for that exact commit; that run requires MCP/skill compatibility, the full Windows suite and two identical package builds. The companion skill now has [versioned packages and verified update/rollback](https://github.com/shamwi2846/MQL5-Coding-Skill/blob/main/skills/mql5-coding/references/releases.md).
+This checkout prepares **v1.3.1** for reviewed local delivery, correcting long-path pinned Node verification and compatibility inventory validation. The previously published Windows package is available from the [v1.3.0 release](https://github.com/shamwi2846/MQL5-CHM-MCP/releases/tag/v1.3.0). Release tags must match the package, lockfile, server, documentation and download user agents. Publish only the portable ZIP and checksum sidecar retained by the successful release-validation run for that exact commit; that run requires MCP/skill compatibility, the full Windows suite and two identical package builds. The companion skill now has [versioned packages and verified update/rollback](https://github.com/shamwi2846/MQL5-Coding-Skill/blob/main/skills/mql5-coding/references/releases.md).
 
 A portable, local MCP server for the official English MQL5 reference, AlgoBook, and Neural Networks book. The active corpus contains 4,827 indexed topics, 16,261 sections, and a secure catalog of the original technical diagrams, screenshots, charts, and MQL5 object icons. Runtime access is offline, stdio-only, and strictly read-only; no MetaTrader account, HTTP port, trading access, or authentication is required.
 
-The server exposes four closed-world tools:
+The server exposes five closed-world tools:
 
 - `mql5_chm_search` searches exact API names first, then deterministically merges full-text matches with lower-weight MQL5-aware expansions before bounded typo recovery.
 - `mql5_chm_lookup_identifiers` looks up 1 to 16 API or constant names in one request. Order and duplicates are preserved; each name has its own match status, candidates, advisory check and citations. Default source is `mql5`, expansion is disabled, and `limit` is 1 to 3 per name (default 1; at most 48 candidates total).

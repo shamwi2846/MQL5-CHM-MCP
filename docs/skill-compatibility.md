@@ -57,7 +57,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Environment health regression tests failed.' }
 
 The skill has the [installed health command and options](https://github.com/shamwi2846/MQL5-Coding-Skill/blob/main/skills/mql5-coding/references/environment-health.md). The health regression suite is a separate Windows pair-job gate; it is not part of the MCP's standalone fast test count.
 
-The counterpart skill also ships [reusable project profiles](https://github.com/shamwi2846/MQL5-Coding-Skill/blob/main/skills/mql5-coding/references/project-profiles.md). The current health gate expects its twenty-one-file package, including the profile commands/reference, release commands/reference, and version metadata. Profile regression tests run in the skill's Windows CI under both shells. These additions require no change to the production MCP runtime or documentation interface.
+The counterpart skill also ships [reusable project profiles](https://github.com/shamwi2846/MQL5-Coding-Skill/blob/main/skills/mql5-coding/references/project-profiles.md). The health gate derives its expected file count and fingerprint from the actual counterpart skill inventory and verifies source/installed agreement. Exact package completeness remains checked by the skill validator and release manifest. Profile regression tests run in the skill's Windows CI under both shells. These additions require no change to the production MCP runtime or documentation interface.
 
 Generated profiles keep files inside the EA project relative and external selections absolute, preserving the selected include/preset when the project moves. Saving a profile does not save executable trust or execution acknowledgement.
 

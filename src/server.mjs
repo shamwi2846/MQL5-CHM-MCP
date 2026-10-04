@@ -220,7 +220,7 @@ function toolFailure(error) {
 
 export function createMcpServer(service) {
   const server = new McpServer(
-    { name: "mql5-chm", version: "1.3.0" },
+    { name: "mql5-chm", version: "1.3.1" },
     { capabilities: { tools: {} } },
   );
 

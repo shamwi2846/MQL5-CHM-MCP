@@ -186,13 +186,28 @@ for (const shell of ["pwsh.exe", "powershell.exe"]) {
       assert.equal(report.mcp.checked_files, Object.keys(packageFiles).length);
       assert.equal(report.mcp.source_comparison.status, "same");
       assert.equal(report.skill.source_comparison.status, "same");
-      assert.equal(report.skill.file_count, 21);
+      assert.equal(report.skill.file_count, Object.keys(originalSkill).length);
       assert.equal(report.skill.declared_version, skillVersion);
       assert.match(report.skill.fingerprint_sha256, /^[0-9a-f]{64}$/u);
       assert.equal(report.skill.fingerprint_sha256, hash(Buffer.from(Object.keys(originalSkill).sort().map(name => `${name}\0${originalSkill[name]}`).join("\n"))), "Inventory fingerprints must agree across PowerShell versions");
       assert.equal(report.metaeditor.candidates[0].build, 6230);
       assert.equal(report.python.available, true);
       assert.equal(report.python.pyyaml_available, true);
+    });
+    await t.test("matching inventories accept an additional skill resource without a fixed file count", async () => {
+      const relative = "assets/health-inventory-fixture.txt";
+      const bytes = Buffer.from("Additional supported asset used only by this fixture.\n");
+      try {
+        for (const root of [skill, sourceSkill]) await writeFile(path.join(root, relative), bytes);
+        const expanded = await inventory(skill);
+        const { report } = run();
+        assert.equal(report.status, "passed");
+        assert.equal(report.skill.file_count, Object.keys(expanded).length);
+        assert.equal(report.skill.source_comparison.status, "same");
+        assert.equal(report.skill.fingerprint_sha256, hash(Buffer.from(Object.keys(expanded).sort().map(name => `${name}\0${expanded[name]}`).join("\n"))));
+      } finally {
+        for (const root of [skill, sourceSkill]) await rm(path.join(root, relative), { force: true });
+      }
     });
     async function withDriveRoot(directory, action) {
       const letter = ["Z", "Y", "X", "W", "V", "U", "T", "S", "R"].find(value => !existsSync(`${value}:\\`));

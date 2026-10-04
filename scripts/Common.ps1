@@ -1730,7 +1730,7 @@ function Invoke-BoundedNodeJsDownload {
     $client = New-Object Net.Http.HttpClient($handler, $true)
     $client.Timeout = [Threading.Timeout]::InfiniteTimeSpan
     $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Get, $Uri)
-    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.3.0')
+    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.3.1')
     $response = $null
     $stream = $null
     $deadline = New-Object Threading.CancellationTokenSource([TimeSpan]::FromSeconds($TimeoutSeconds))
@@ -1810,6 +1810,23 @@ function Assert-InternalNodeRuntimeTestHooks {
     }
 }
 
+function ConvertTo-ExtendedWindowsPath {
+    param([Parameter(Mandatory)][string]$Path)
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    if ($fullPath.StartsWith('\\?\', [StringComparison]::Ordinal)) { return $fullPath }
+    if ($fullPath.StartsWith('\\', [StringComparison]::Ordinal)) { return '\\?\UNC\' + $fullPath.Substring(2) }
+    return '\\?\' + $fullPath
+}
+
+function Get-PinnedNodeFileVersion {
+    param([Parameter(Mandatory)][string]$Path)
+    # FileInfo.VersionInfo can return empty metadata for a valid long path in
+    # PowerShell 7. Query the Windows version resource using its extended path.
+    try {
+        return [string][Diagnostics.FileVersionInfo]::GetVersionInfo((ConvertTo-ExtendedWindowsPath $Path)).FileVersion
+    } catch { return '' }
+}
+
 function Test-PinnedNodeRuntimePair {
     [CmdletBinding()]
     param(
@@ -1829,7 +1846,7 @@ function Test-PinnedNodeRuntimePair {
     if ((Get-FileHash -LiteralPath $node.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -cne $script:PinnedNodeExecutableSha256 -or
         (Get-FileHash -LiteralPath $license.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -cne $script:PinnedNodeLicenseSha256) { return $false }
     $machineType = if ($null -eq $InternalPeMachineTypeProbe) { Get-PeMachineType -Path $node.FullName } else { & $InternalPeMachineTypeProbe $node.FullName }
-    $fileVersion = if ($null -eq $InternalFileVersionProbe) { [string]$node.VersionInfo.FileVersion } else { [string](& $InternalFileVersionProbe $node.FullName) }
+    $fileVersion = if ($null -eq $InternalFileVersionProbe) { Get-PinnedNodeFileVersion -Path $node.FullName } else { [string](& $InternalFileVersionProbe $node.FullName) }
     if ([int]$machineType -ne 0x8664 -or $fileVersion -cne '24.17.0') { return $false }
     $version = if ($null -eq $InternalNativeVersionProbe) {
         Invoke-NativeCapture -FilePath $node.FullName -Arguments @('--version')
@@ -4480,7 +4497,7 @@ function Invoke-OfficialChmDownload {
             try {
                 if ($null -eq $InternalTestHooks) {
                     $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Get, $current)
-                    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp/1.3.0')
+                    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp/1.3.1')
                     try {
                         $httpResponse = $client.SendAsync(
                             $request,

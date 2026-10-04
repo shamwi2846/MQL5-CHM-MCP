@@ -463,7 +463,7 @@ try {
         Assert-Test (
             $selectedNodeFixture -is [string] -and
             [string]$selectedNodeFixture -ceq $expectedFirstNode
-        ) 'Node fixture fallback did not return the first PATH application as one string.'
+        ) "Node fixture fallback did not return the first PATH application as one string. Selected: $selectedNodeFixture; expected: $expectedFirstNode"
         Assert-Test (
             Test-PinnedNodeRuntimePair -NodePath $selectedNodeFixture -LicensePath $nodeFixtureLicense
         ) 'Selected multi-install Node fixture did not preserve pinned runtime validation.'
@@ -750,6 +750,23 @@ try {
         Assert-Test $ordinaryDeviceLikeAccepted "Archive path-node validation rejected ordinary Windows filename '$ordinaryDeviceLikeLeaf'."
     }
 
+    $nodeFullPath = [IO.Path]::GetFullPath($nodeFixtureSource)
+    $extendedNode = '\\?\' + $nodeFullPath
+    Assert-Test ((ConvertTo-ExtendedWindowsPath $nodeFullPath) -ceq $extendedNode) 'Drive metadata paths must use the extended Windows prefix.'
+    Assert-Test ((ConvertTo-ExtendedWindowsPath $extendedNode) -ceq $extendedNode) 'An extended metadata path must not receive another prefix.'
+    Assert-Test ((ConvertTo-ExtendedWindowsPath '\\server\share\node.exe') -ceq '\\?\UNC\server\share\node.exe') 'UNC metadata paths must use the extended UNC form.'
+    Assert-Test ((ConvertTo-ExtendedWindowsPath '\\?\UNC\server\share\node.exe') -ceq '\\?\UNC\server\share\node.exe') 'An extended UNC metadata path must remain unchanged.'
+    Assert-Test ((Get-PinnedNodeFileVersion $extendedNode) -ceq '24.17.0') 'The genuine short-path runtime must retain its pinned file version.'
+    Assert-Test ((Get-PinnedNodeFileVersion (Join-Path $testRoot 'missing-node.exe')) -ceq '') 'Unavailable version metadata must remain unavailable.'
+    Assert-Test ((Get-PinnedNodeFileVersion (Join-Path $projectRoot 'licenses\NODE-LICENSE.txt')) -ceq '') 'A file without a Windows version resource must not invent a version.'
+    $longName = 'long-path-' + ('x' * 80)
+    while ((Join-Path (Join-Path $testRoot $longName) 'runtime\node.exe').Length -le 260) { $longName += 'y' }
+    $longNodeFixture = New-NodeBootstrapFixture -Name $longName
+    $longRepairedNode = Ensure-PinnedNodeRuntime -ProjectRoot $longNodeFixture -InternalTestHooks (New-NodeBootstrapTestHooks)
+    Assert-Test ($longRepairedNode.Length -gt 260 -and (Get-PinnedNodeFileVersion $longRepairedNode) -ceq '24.17.0') 'Repair must preserve genuine version metadata above MAX_PATH.'
+    Assert-Test (Test-PinnedNodeRuntimePair -NodePath $longRepairedNode -LicensePath (Join-Path $longNodeFixture 'runtime\LICENSE')) 'A genuine long-path runtime pair must validate after repair.'
+    Assert-Test (@(Get-ChildItem -LiteralPath (Join-Path $longNodeFixture 'runtime') -Force).Count -eq 2 -and @(Get-ChildItem -LiteralPath (Join-Path $longNodeFixture 'build') -Force).Count -eq 0) 'Long-path repair must clean up transaction and extraction files.'
+
     $successfulNodeFixture = New-NodeBootstrapFixture -Name 'successful-truncated-runtime-repair'
     $repairedNode = Ensure-PinnedNodeRuntime -ProjectRoot $successfulNodeFixture -InternalTestHooks (New-NodeBootstrapTestHooks)
     Assert-Test (Test-PinnedNodeRuntimePair -NodePath $repairedNode -LicensePath (Join-Path $successfulNodeFixture 'runtime\LICENSE')) 'Normal Node bootstrap did not repair a truncated/wrong runtime pair.'
@@ -913,6 +930,9 @@ try {
 
     $wrongVersionFixture = New-NodeBootstrapFixture -Name 'wrong-extracted-version'
     Assert-NodeBootstrapFailurePreservesRuntime -FixtureRoot $wrongVersionFixture -Hooks (New-NodeBootstrapTestHooks -FileVersionProbe { param($Path) return '0.0.0.0' }) -ExpectedMessage 'Extracted Node.js files do not match'
+
+    $missingVersionFixture = New-NodeBootstrapFixture -Name 'missing-extracted-version'
+    Assert-NodeBootstrapFailurePreservesRuntime -FixtureRoot $missingVersionFixture -Hooks (New-NodeBootstrapTestHooks -FileVersionProbe { param($Path) return '' }) -ExpectedMessage 'Extracted Node.js files do not match'
 
     $wrongRuntimeVersionFixture = New-NodeBootstrapFixture -Name 'wrong-runtime-version-output'
     Assert-NodeBootstrapFailurePreservesRuntime -FixtureRoot $wrongRuntimeVersionFixture -Hooks (New-NodeBootstrapTestHooks -NativeVersionProbe {
