@@ -87,7 +87,7 @@ function Test-PinnedSevenZipLicense {
     return Test-FileDescriptorMatch -Path $LicensePath -Bytes 6031 -Sha256 $script:PinnedSevenZipLicenseSha256
 }
 
-function Test-PinnedSevenZipRuntimeFiles {
+function Get-PinnedSevenZipRuntimeAssessment {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$ExePath,
@@ -98,7 +98,7 @@ function Test-PinnedSevenZipRuntimeFiles {
     )
 
     foreach ($path in @($ExePath,$DllPath)) {
-        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return [pscustomobject]@{State='repair_required';Reason='A runtime file is missing.'} }
         $item = Get-Item -LiteralPath $path -Force
         if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
             throw 'Refusing a 7-Zip runtime containing a reparse point.'
@@ -106,28 +106,37 @@ function Test-PinnedSevenZipRuntimeFiles {
     }
     if (-not (Test-FileDescriptorMatch -Path $ExePath -Bytes 576000 -Sha256 $script:PinnedSevenZipExecutableSha256) -or
         -not (Test-FileDescriptorMatch -Path $DllPath -Bytes 1906688 -Sha256 $script:PinnedSevenZipLibrarySha256)) {
-        return $false
+        return [pscustomobject]@{State='repair_required';Reason='A runtime file has the wrong hash or size.'}
     }
 
     $exeMachine = if ($null -eq $InternalPeMachineTypeProbe) { Get-PeMachineType -Path $ExePath } else { & $InternalPeMachineTypeProbe $ExePath }
     $dllMachine = if ($null -eq $InternalPeMachineTypeProbe) { Get-PeMachineType -Path $DllPath } else { & $InternalPeMachineTypeProbe $DllPath }
-    $exeVersion = if ($null -eq $InternalFileVersionProbe) { [string](Get-Item -LiteralPath $ExePath).VersionInfo.FileVersion } else { [string](& $InternalFileVersionProbe $ExePath) }
-    $dllVersion = if ($null -eq $InternalFileVersionProbe) { [string](Get-Item -LiteralPath $DllPath).VersionInfo.FileVersion } else { [string](& $InternalFileVersionProbe $DllPath) }
-    if ([int]$exeMachine -ne 0x8664 -or [int]$dllMachine -ne 0x8664 -or
-        $exeVersion -cne '26.02' -or $dllVersion -cne '26.02') {
-        return $false
+    if ([int]$exeMachine -ne 0x8664 -or [int]$dllMachine -ne 0x8664) {
+        return [pscustomobject]@{State='repair_required';Reason='A runtime file has the wrong architecture.'}
     }
-    $probe = if ($null -eq $InternalNativeInfoProbe) {
-        Invoke-NativeCapture -FilePath $ExePath -Arguments @('i')
-    } else {
-        & $InternalNativeInfoProbe $ExePath
+    try {
+        $exeVersion = if ($null -eq $InternalFileVersionProbe) { [string](Get-WindowsExecutableVersionInfo $ExePath).FileVersion } else { [string](& $InternalFileVersionProbe $ExePath) }
+        $dllVersion = if ($null -eq $InternalFileVersionProbe) { [string](Get-WindowsExecutableVersionInfo $DllPath).FileVersion } else { [string](& $InternalFileVersionProbe $DllPath) }
+        if ([string]::IsNullOrWhiteSpace($exeVersion) -or [string]::IsNullOrWhiteSpace($dllVersion)) { throw 'No readable Windows version resource.' }
+    } catch {
+        return [pscustomobject]@{State='metadata_unavailable';Reason=$_.Exception.Message}
     }
-    if ($null -eq $probe -or $null -eq $probe.PSObject.Properties['ExitCode'] -or
-        $null -eq $probe.PSObject.Properties['Text']) {
-        return $false
+    if ($exeVersion -cne '26.02' -or $dllVersion -cne '26.02') {
+        return [pscustomobject]@{State='repair_required';Reason='A runtime file has the wrong version.'}
     }
-    return [int]$probe.ExitCode -eq 0 -and [string]$probe.Text -match '(?m)^7-Zip 26\.02 \(x64\)' -and
-        [string]$probe.Text -match '(?im)^\s*.*Chm\s+chm\b'
+    return Get-SevenZipNativeCapability -ExePath $ExePath -InternalNativeInfoProbe $InternalNativeInfoProbe
+}
+
+function Test-PinnedSevenZipRuntimeFiles {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ExePath,
+        [Parameter(Mandatory)][string]$DllPath,
+        [scriptblock]$InternalPeMachineTypeProbe,
+        [scriptblock]$InternalFileVersionProbe,
+        [scriptblock]$InternalNativeInfoProbe
+    )
+    return (Get-PinnedSevenZipRuntimeAssessment @PSBoundParameters).State -ceq 'verified'
 }
 
 function Test-PinnedSevenZipRuntimePair {
@@ -178,7 +187,7 @@ function Invoke-BoundedSevenZipDownload {
     try {
         while ($true) {
             $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Get, $current)
-            [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.3.1')
+            [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.3.2')
             $response = $null
             $stream = $null
             try {
@@ -398,10 +407,12 @@ function Repair-SevenZipPreparedOrphans {
     if (($null -ne $writingExe -and $null -ne $preparedExe) -or ($null -ne $writingDll -and $null -ne $preparedDll)) {
         throw 'Tools contain both writing and prepared artifacts for the same 7-Zip transaction item.'
     }
+    $assessment = Get-PinnedSevenZipRuntimeAssessment -ExePath $ExePath -DllPath $DllPath @PairValidationParameters
+    Assert-SevenZipRuntimeAvailability -Assessment $assessment -ExePath $ExePath
     foreach ($writing in @($writingDll,$writingExe)) {
         if ($null -ne $writing) { Remove-Item -LiteralPath $writing -Force }
     }
-    $canonicalValid = Test-PinnedSevenZipRuntimeFiles -ExePath $ExePath -DllPath $DllPath @PairValidationParameters
+    $canonicalValid = $assessment.State -ceq 'verified'
     $invalidPrepared = @(
         if ($null -ne $preparedExe -and -not (Test-FileDescriptorMatch -Path $preparedExe -Bytes 576000 -Sha256 $script:PinnedSevenZipExecutableSha256)) { $preparedExe }
         if ($null -ne $preparedDll -and -not (Test-FileDescriptorMatch -Path $preparedDll -Bytes 1906688 -Sha256 $script:PinnedSevenZipLibrarySha256)) { $preparedDll }
@@ -461,6 +472,11 @@ function Ensure-PinnedSevenZipRuntime {
         if ($InternalTestHooks.ContainsKey('NativeInfoProbe')) { $pairValidationParameters.InternalNativeInfoProbe = $InternalTestHooks.NativeInfoProbe }
     }
 
+    # Check canonical bytes before recovery removes or publishes any pending
+    # evidence. Downloads cannot fix native execution or metadata unavailability
+    # for an already-verified pair.
+    $assessment = Get-PinnedSevenZipRuntimeAssessment -ExePath $exePath -DllPath $dllPath @pairValidationParameters
+    Assert-SevenZipRuntimeAvailability -Assessment $assessment -ExePath $exePath
     if ((Test-Path -LiteralPath $licenseJournalPath) -and -not (Test-Path -LiteralPath $licenseJournalPath -PathType Leaf)) { throw "7-Zip license transaction journal is not a file: $licenseJournalPath" }
     Repair-PreparedFileSetTransaction -Root $licensesRoot -JournalName $licenseJournalName -ExpectedRole sevenzip-license -ExpectedTargetNames @('7ZIP-LICENSE.txt') | Out-Null
     Repair-SevenZipLicensePreparedOrphans -LicensesRoot $licensesRoot -LicensePath $licensePath -NoDownload:$NoDownload | Out-Null
@@ -470,7 +486,9 @@ function Ensure-PinnedSevenZipRuntime {
     Repair-PreparedFileSetTransaction -Root $toolsRoot -JournalName $journalName -ExpectedRole sevenzip-runtime -ExpectedTargetNames @('7z.dll','7z.exe') | Out-Null
     Repair-SevenZipPreparedOrphans -ToolsRoot $toolsRoot -ExePath $exePath -DllPath $dllPath -NoDownload:$NoDownload -PairValidationParameters $pairValidationParameters | Out-Null
     Assert-NoReservedSevenZipRuntimeArtifacts -ToolsRoot $toolsRoot
-    if (Test-PinnedSevenZipRuntimePair -ExePath $exePath -DllPath $dllPath -LicensePath $licensePath @pairValidationParameters) {
+    $assessment = Get-PinnedSevenZipRuntimeAssessment -ExePath $exePath -DllPath $dllPath @pairValidationParameters
+    Assert-SevenZipRuntimeAvailability -Assessment $assessment -ExePath $exePath
+    if ($assessment.State -ceq 'verified' -and (Test-PinnedSevenZipLicense -LicensePath $licensePath)) {
         return [pscustomobject]@{ExeName='7z.exe';DllName='7z.dll';Extractor=(Resolve-FullPath -Path $exePath -MustExist -PathType Leaf);Provenance=[string]$metadata.ProvenancePath}
     }
     if ($NoDownload) { throw 'The bundled 7-Zip 26.02 runtime is missing or invalid; portable repack mode will not download or repair tools.' }
@@ -536,7 +554,9 @@ function Ensure-PinnedSevenZipRuntime {
                 [pscustomobject]@{PreparedPath=$preparedLicense;TargetPath=$licensePath}
             ) @publicationParameters | Out-Null
         }
-        if (-not (Test-PinnedSevenZipRuntimeFiles -ExePath $exePath -DllPath $dllPath @pairValidationParameters)) {
+        $assessment = Get-PinnedSevenZipRuntimeAssessment -ExePath $exePath -DllPath $dllPath @pairValidationParameters
+        Assert-SevenZipRuntimeAvailability -Assessment $assessment -ExePath $exePath
+        if ($assessment.State -cne 'verified') {
             Copy-FileDurable -Source $extractedDll -Destination $writingDll | Out-Null
             if (-not (Test-FileDescriptorMatch -Path $writingDll -Bytes 1906688 -Sha256 $script:PinnedSevenZipLibrarySha256)) { throw 'Prepared 7-Zip library copy failed validation.' }
             [IO.File]::Move($writingDll,$preparedDll)

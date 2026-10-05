@@ -1,4 +1,4 @@
-# Portable Read-Only MQL5 CHM MCP v1.3.1
+# Portable Read-Only MQL5 CHM MCP v1.3.2
 
 ## Value Proposition
 
@@ -58,7 +58,8 @@ Update documentation:
 ## Product Context
 
 - Workspace root: `C:\Users\Shari\Desktop\MQL5 EAS\MQL5 CODEX`
-- Development project root: `C:\Users\Shari\Desktop\MQL5 EAS\MQL5 CODEX\MQL5-CHM-MCP-main\MQL5-CHM-MCP-main`
+- Development project root: the root of the `MQL5-CHM-MCP` repository, containing `package.json`, `src/`, and `scripts/`. Resolve commands relative to that checkout wherever it is stored.
+- Windows version-resource queries use extended drive/UNC paths for Node and both 7-Zip binaries while retaining canonical recorded paths. Exact binary and license identities remain pinned. Metadata unavailability and native execution/CHM-codec failure are diagnosed separately from file damage: intact binaries are not downloaded or replaced, and pending recovery evidence is retained. Native 7-Zip path limits still apply; retry from a shorter package path and supported working directory.
 - Initial trusted sources: `mql5.chm`, `mql5book.chm`, `neuronetworksbook.chm`
 - Initial corpus: 4,134 + 581 + 112 = 4,827 HTML topics
 - Initial searchable sections: 16,261
@@ -172,11 +173,11 @@ HTTP timestamps are labeled as HTTP metadata or retrieval time, never as a CHM b
 
 ## Index and Revision Model
 
-- Server/package version: 1.3.1. Manifest and SQLite schema version: 3. Pointer schema: 2.
+- Server/package version: 1.3.2. Manifest and SQLite schema version: 3. Pointer schema: 2.
 - `corpus_sha256` is the SHA-256 of the UTF-8 concatenation `source_id + NUL + lowercase_chm_sha256 + NUL` for `mql5`, `mql5book`, then `neuronetworksbook`. It intentionally depends only on the downloaded source set so the checker can name a candidate before extraction.
 - `index_revision` is the lowercase SHA-256 of the completed schema-3 SQLite database. The database contains the complete asset catalog and asset-tree digest, so this identity binds text and image metadata without creating a self-hash cycle.
 - SQLite identity-bearing data excludes build/retrieval times, ETags, and HTTP Last-Modified. Those values remain in the manifest. Identical inputs, index contract, and image policy must produce byte-identical databases and index revisions.
-- SQLite metadata includes `index_contract`, the image-policy digest, asset-catalog digest, asset-tree digest, and exact counts. `index_contract` changes whenever extraction or indexing semantics change without a SQL-schema change. v1.3.1 emits `mql5-chm-index-v3-assets-v3` for the revised extraction/indexing semantics. The transitional runtime accepts rollback contracts `mql5-chm-index-v3-assets-v1` and `mql5-chm-index-v3-assets-v2` as well as the current contract, while new candidate activation requires the current contract.
+- SQLite metadata includes `index_contract`, the image-policy digest, asset-catalog digest, asset-tree digest, and exact counts. `index_contract` changes whenever extraction or indexing semantics change without a SQL-schema change. v1.3.2 emits `mql5-chm-index-v3-assets-v3` for the revised extraction/indexing semantics. The transitional runtime accepts rollback contracts `mql5-chm-index-v3-assets-v1` and `mql5-chm-index-v3-assets-v2` as well as the current contract, while new candidate activation requires the current contract.
 - Each immutable revision lives under `revisions/<index_revision>/` and contains its three CHMs, database, manifest, corpus lock, stage report when staged, and the exact `assets/` tree.
 - `data/active.json` is the only activation pointer. Schema 2 retains `active_revision`, `previous_revision`, and `activated_at`; revision fields identify indexes and are replaced atomically.
 - Stage reports, transition journals, and update-status files distinguish index revisions from corpus revisions. `Update-Documentation.ps1 -Apply -Revision` accepts the staged index revision.

@@ -1730,7 +1730,7 @@ function Invoke-BoundedNodeJsDownload {
     $client = New-Object Net.Http.HttpClient($handler, $true)
     $client.Timeout = [Threading.Timeout]::InfiniteTimeSpan
     $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Get, $Uri)
-    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.3.1')
+    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.3.2')
     $response = $null
     $stream = $null
     $deadline = New-Object Threading.CancellationTokenSource([TimeSpan]::FromSeconds($TimeoutSeconds))
@@ -1818,13 +1818,53 @@ function ConvertTo-ExtendedWindowsPath {
     return '\\?\' + $fullPath
 }
 
-function Get-PinnedNodeFileVersion {
+function Get-WindowsExecutableVersionInfo {
     param([Parameter(Mandatory)][string]$Path)
     # FileInfo.VersionInfo can return empty metadata for a valid long path in
     # PowerShell 7. Query the Windows version resource using its extended path.
     try {
-        return [string][Diagnostics.FileVersionInfo]::GetVersionInfo((ConvertTo-ExtendedWindowsPath $Path)).FileVersion
-    } catch { return '' }
+        $info = [Diagnostics.FileVersionInfo]::GetVersionInfo((ConvertTo-ExtendedWindowsPath $Path))
+        if ([string]::IsNullOrWhiteSpace($info.FileVersion)) { throw 'No readable Windows version resource.' }
+        return $info
+    } catch {
+        throw "Windows executable metadata is unavailable for '$Path': $($_.Exception.Message)"
+    }
+}
+
+function Get-PinnedNodeFileVersion {
+    param([Parameter(Mandatory)][string]$Path)
+    try { return [string](Get-WindowsExecutableVersionInfo $Path).FileVersion }
+    catch { return '' }
+}
+
+function Get-SevenZipNativeCapability {
+    param([Parameter(Mandatory)][string]$ExePath, [scriptblock]$InternalNativeInfoProbe)
+    # A verified binary can fail because of native path or DLL-loading limits.
+    # Retain a bounded diagnostic rather than treating that as file damage.
+    try {
+        $probe = if ($null -eq $InternalNativeInfoProbe) { Invoke-NativeCapture -FilePath $ExePath -Arguments @('i') }
+            else { & $InternalNativeInfoProbe $ExePath }
+        if ($null -eq $probe -or $null -eq $probe.PSObject.Properties['ExitCode'] -or
+            $null -eq $probe.PSObject.Properties['Text']) { throw 'The native probe returned no supported result.' }
+        if ([int]$probe.ExitCode -eq 0 -and [string]$probe.Text -match '(?m)^7-Zip 26\.02 \(x64\)' -and
+            [string]$probe.Text -match '(?im)^\s*.*Chm\s+chm\b') {
+            return [pscustomobject]@{State='verified';Reason=$null}
+        }
+        $detail = "Native probe exit code $($probe.ExitCode); version banner or CHM codec unavailable. $($probe.Text)"
+    } catch { $detail = 'Native probe failed: ' + $_.Exception.Message }
+    $detail = $detail -replace '[\x00-\x1f\x7f]', ' '
+    if ($detail.Length -gt 1024) { $detail = $detail.Substring(0,1024) + ' [truncated]' }
+    return [pscustomobject]@{State='execution_unavailable';Reason=$detail}
+}
+
+function Assert-SevenZipRuntimeAvailability {
+    param([Parameter(Mandatory)]$Assessment, [Parameter(Mandatory)][string]$ExePath)
+    if ($Assessment.State -ceq 'metadata_unavailable') {
+        throw "7-Zip files match their pinned hashes but Windows version metadata is unavailable: $($Assessment.Reason). No repair download or replacement is performed for this condition; pending evidence is retained. Check file access and Windows version-resource support, then retry."
+    }
+    if ($Assessment.State -ceq 'execution_unavailable') {
+        throw "Verified 7-Zip binaries cannot complete the native version/CHM codec probe at '$ExePath'. No repair download or replacement is performed for this condition; pending evidence is retained. Retry from a shorter package path and a supported working directory; check DLL loading or execution restrictions if it persists. $($Assessment.Reason)"
+    }
 }
 
 function Test-PinnedNodeRuntimePair {
@@ -2299,17 +2339,14 @@ function Assert-SevenZipProvenance {
             throw "Pinned 7-Zip file failed provenance validation: $filePath"
         }
         if ($expected.Pe) {
-            if ([string]$item.VersionInfo.FileVersion -cne [string]$expected.Version -or (Get-PeMachineType -Path $filePath) -ne 0x8664) {
+            if ([string](Get-WindowsExecutableVersionInfo $filePath).FileVersion -cne [string]$expected.Version -or (Get-PeMachineType -Path $filePath) -ne 0x8664) {
                 throw "Pinned 7-Zip file has the wrong version or architecture: $filePath"
             }
         }
     }
     $extractor = Resolve-FullPath -Path (Join-Path $root 'tools\7z.exe') -MustExist -PathType Leaf
-    $probe = Invoke-NativeCapture -FilePath $extractor -Arguments @('i')
-    if ($probe.ExitCode -ne 0 -or $probe.Text -notmatch '(?m)^7-Zip 26\.02 \(x64\)' -or
-        $probe.Text -notmatch '(?im)^\s*.*Chm\s+chm\b') {
-        throw "Pinned 7-Zip executable failed version or CHM-capability validation: $extractor"
-    }
+    $capability = Get-SevenZipNativeCapability -ExePath $extractor
+    Assert-SevenZipRuntimeAvailability -Assessment $capability -ExePath $extractor
     return [pscustomobject]@{ ExeName='7z.exe'; DllName='7z.dll'; Extractor=$extractor; Provenance=$provenancePath }
 }
 
@@ -4497,7 +4534,7 @@ function Invoke-OfficialChmDownload {
             try {
                 if ($null -eq $InternalTestHooks) {
                     $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Get, $current)
-                    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp/1.3.1')
+                    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp/1.3.2')
                     try {
                         $httpResponse = $client.SendAsync(
                             $request,

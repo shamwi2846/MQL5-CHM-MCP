@@ -58,3 +58,11 @@ jobs:
               throw "Expected Windows PowerShell 5.1, found $($PSVersionTable.PSVersion)."
           }
           & .\scripts\Invoke-PowerShellTestSuite.ps1 -Suite Maintenance
+
+      - name: Test pinned 7-Zip metadata and recovery under PowerShell 7
+        shell: pwsh
+        run: .\scripts\Test-SevenZipRuntime.ps1
+
+      - name: Test pinned 7-Zip metadata and recovery under Windows PowerShell 5.1
+        shell: powershell
+        run: .\scripts\Test-SevenZipRuntime.ps1

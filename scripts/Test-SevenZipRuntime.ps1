@@ -116,6 +116,72 @@ try {
     Assert-Test ([string]$metadata.ArtifactSha256 -ceq 'db407a4f6d4999e5c7bc00ce8a882be94717b56e7fa68140fe3f12605d91643e') 'Pinned 7-Zip MSI hash is wrong.'
     Assert-Test (Test-PinnedSevenZipRuntimePair -ExePath (Join-Path $projectRoot 'tools\7z.exe') -DllPath (Join-Path $projectRoot 'tools\7z.dll') -LicensePath (Join-Path $projectRoot 'licenses\7ZIP-LICENSE.txt')) 'Checked-in 7-Zip runtime is not the pinned pair.'
 
+    # Genuine binaries retain version resources beyond MAX_PATH. Native codec
+    # loading may still fail there; metadata support does not imply execution.
+    $longName='long-metadata'
+    while ((Join-Path (Join-Path $testRoot $longName) 'tools\7z.exe').Length -le 290) {$longName+='\metadata-component'}
+    $fixture=New-SevenZipFixture -Name $longName -WithRuntime
+    $longExe=Join-Path $fixture 'tools\7z.exe';$longDll=Join-Path $fixture 'tools\7z.dll'
+    foreach ($path in @($longExe,$longDll,(ConvertTo-ExtendedWindowsPath $longExe),(ConvertTo-ExtendedWindowsPath $longDll))) {
+        Assert-Test ((Get-WindowsExecutableVersionInfo $path).FileVersion -ceq '26.02') 'Genuine long-path 7-Zip metadata was not recognized.'
+    }
+    Assert-Test ((Get-WindowsExecutableVersionInfo (Join-Path $projectRoot 'tools\7z.exe')).FileVersion -ceq '26.02') 'Short-path 7-Zip metadata changed.'
+    Assert-Test ((ConvertTo-ExtendedWindowsPath '\\server\share\7z.dll') -ceq '\\?\UNC\server\share\7z.dll') 'UNC 7-Zip metadata normalization is incorrect.'
+    Assert-Test ((ConvertTo-ExtendedWindowsPath '\\?\UNC\server\share\7z.dll') -ceq '\\?\UNC\server\share\7z.dll') 'Extended UNC metadata normalization is incorrect.'
+    $unreadable='';try {Get-WindowsExecutableVersionInfo (Join-Path $projectRoot 'licenses\7ZIP-LICENSE.txt') | Out-Null} catch {$unreadable=$_.Exception.Message}
+    Assert-Test ($unreadable -match 'metadata is unavailable') 'Missing version resources must fail explicitly.'
+    $assessment=Get-PinnedSevenZipRuntimeAssessment -ExePath $longExe -DllPath $longDll
+    Assert-Test ($assessment.State -cin @('verified','execution_unavailable')) 'Valid long-path metadata was misclassified as file damage.'
+    if ($assessment.State -ceq 'execution_unavailable') {
+        $observed=@{}
+        $message='';try {Ensure-PinnedSevenZipRuntime -ProjectRoot $fixture -InternalTestHooks (New-SevenZipRepairHooks -Observation $observed) | Out-Null} catch {$message=$_.Exception.Message}
+        Assert-Test ($message -match 'Verified 7-Zip binaries' -and $message -match 'shorter package path' -and $message -match 'Native probe') 'A genuine native path limitation needs an actionable diagnostic.'
+        Assert-Test (-not $observed.ContainsKey('Uri')) 'A genuine native path limitation triggered a repair download.'
+        $message='';try {Assert-SevenZipProvenance -ProjectRoot $fixture | Out-Null} catch {$message=$_.Exception.Message}
+        Assert-Test ($message -match 'Verified 7-Zip binaries') 'Provenance validation must distinguish valid metadata from failed native execution.'
+    }
+    Assert-Test ((Get-FileHash -LiteralPath $longExe).Hash.ToLowerInvariant() -ceq $script:PinnedSevenZipExecutableSha256 -and (Get-FileHash -LiteralPath $longDll).Hash.ToLowerInvariant() -ceq $script:PinnedSevenZipLibrarySha256) 'Genuine long-path probes changed the binaries.'
+
+    # Force native/metadata failures independently of the machine's path policy.
+    # Online and offline paths must preserve pending journals and payloads and
+    # must not attempt a download, extraction, or publication of healthy files.
+    foreach ($case in @(
+        @{Name='native-exit';Version=$null;Native={param($path) [pscustomobject]@{ExitCode=7;Text='native failure'}};State='execution_unavailable'},
+        @{Name='codec';Version=$null;Native={param($path) [pscustomobject]@{ExitCode=0;Text="7-Zip 26.02 (x64)`nCodec Load Error: .\7z.dll"}};State='execution_unavailable'},
+        @{Name='native-throw';Version=$null;Native={param($path) throw 'execution denied'};State='execution_unavailable'},
+        @{Name='probe-malformed';Version=$null;Native={param($path) [pscustomobject]@{Text='no exit code'}};State='execution_unavailable'},
+        @{Name='empty-metadata';Version={param($path) ''};Native=$null;State='metadata_unavailable'},
+        @{Name='metadata-throw';Version={param($path) throw 'metadata access denied'};Native=$null;State='metadata_unavailable'},
+        @{Name='large-probe';Version=$null;Native={param($path) [pscustomobject]@{ExitCode=1;Text=('x'*100000)}};State='execution_unavailable'}
+    )) {
+        $fixture=New-SevenZipFixture -Name ('unavailable-'+$case.Name) -WithRuntime
+        $exe=Join-Path $fixture 'tools\7z.exe';$dll=Join-Path $fixture 'tools\7z.dll'
+        $token='abababababababababababababababab'
+        $evidence=@((Join-Path $fixture "tools\.7z-exe-$token.writing"),(Join-Path $fixture "tools\.7z-dll-$token.prepared"),(Join-Path $fixture 'tools\.7zip-runtime-transaction.json'),(Join-Path $fixture 'licenses\.7zip-license-transaction.json'),(Join-Path $fixture "licenses\.7zip-license-$token.prepared"))
+        foreach ($path in $evidence) {[IO.File]::WriteAllText($path,'pending evidence')}
+        $observed=@{}
+        $hooks=New-SevenZipRepairHooks -Observation $observed -FileVersionProbe $case.Version -NativeInfoProbe $case.Native -PublicationCheckpoint {throw 'Unexpected publication'}
+        $parameters=@{ExePath=$exe;DllPath=$dll;InternalFileVersionProbe=$case.Version;InternalNativeInfoProbe=$case.Native}
+        $assessment=Get-PinnedSevenZipRuntimeAssessment @parameters
+        Assert-Test ($assessment.State -ceq $case.State) "Incorrect failure classification for $($case.Name)."
+        Assert-Test (-not (Test-PinnedSevenZipRuntimeFiles @parameters)) 'Unavailable evidence must not pass the boolean validation interface.'
+        foreach ($offline in @($false,$true)) {
+            $message='';try {Ensure-PinnedSevenZipRuntime -ProjectRoot $fixture -NoDownload:$offline -InternalTestHooks $hooks | Out-Null} catch {$message=$_.Exception.Message}
+            Assert-Test ($message -match 'No repair download or replacement' -and $message -match 'pending evidence is retained' -and $message.Length -lt 4096) "Missing/bounded diagnostic for $($case.Name)."
+            Assert-Test (-not $observed.ContainsKey('Uri') -and -not $observed.ContainsKey('ExtractionTimeoutSeconds')) 'Unavailable verified binaries triggered a repair.'
+            foreach ($path in $evidence) {Assert-Test ((Test-Path -LiteralPath $path -PathType Leaf) -and [IO.File]::ReadAllText($path) -ceq 'pending evidence') 'Unavailable native execution discarded pending evidence.'}
+        }
+        Assert-Test ((Get-FileHash -LiteralPath $exe).Hash.ToLowerInvariant() -ceq $script:PinnedSevenZipExecutableSha256 -and (Get-FileHash -LiteralPath $dll).Hash.ToLowerInvariant() -ceq $script:PinnedSevenZipLibrarySha256) 'Unavailable native execution changed canonical binaries.'
+    }
+
+    foreach ($parameters in @(
+        @{InternalFileVersionProbe={param($path) '25.01'}},
+        @{InternalPeMachineTypeProbe={param($path) 0x014c}}
+    )) {
+        $assessment=Get-PinnedSevenZipRuntimeAssessment -ExePath (Join-Path $projectRoot 'tools\7z.exe') -DllPath (Join-Path $projectRoot 'tools\7z.dll') @parameters
+        Assert-Test ($assessment.State -ceq 'repair_required') 'Wrong version or architecture must remain rejected as an invalid runtime.'
+    }
+
     $badOriginRejected = $false
     try { Invoke-BoundedSevenZipDownload -Uri ([Uri]'https://example.com/7z2602-x64.msi') -Destination (Join-Path $testRoot 'unexpected.msi') | Out-Null }
     catch { $badOriginRejected = $true }
