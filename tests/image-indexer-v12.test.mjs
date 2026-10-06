@@ -13,6 +13,8 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { deflateSync } from "node:zlib";
 import jpeg from "jpeg-js";
@@ -798,3 +800,42 @@ test("schema-3 builds are reproducible and externalize a closed immutable asset 
     await rm(root, { recursive: true, force: true });
   }
 });
+
+
+for (const version of [1, 2, 3, 4]) for (const mode of ["internal", "cli"]) {
+  test(`contract v${version} owned output rebuilds with the ${mode} indexer`, async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "mql5-contract-rebuild-"));
+    try {
+      await createMiniCorpus(root);
+      const options = miniCorpusBuildOptions({ outputDirectory: "output" });
+      await buildIndex(root, options);
+      const databasePath = path.join(root, "output", "mql5-docs.sqlite");
+      const manifestPath = path.join(root, "output", "manifest.json");
+      const original = JSON.parse(await readFile(manifestPath, "utf8"));
+      const database = new DatabaseSync(databasePath);
+      database.prepare("UPDATE metadata SET value=? WHERE key='index_contract'").run(`mql5-chm-index-v3-assets-v${version}`);
+      database.close();
+      const bytes = await readFile(databasePath);
+      const legacy = { ...original, index_contract: `mql5-chm-index-v3-assets-v${version}`,
+        index_revision: createHash("sha256").update(bytes).digest("hex"),
+        database: { ...original.database, bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") } };
+      await writeFile(manifestPath, JSON.stringify(legacy));
+      if (mode === "internal") await buildIndex(root, options);
+      else {
+        const child = spawnSync(process.execPath, ["--disable-warning=ExperimentalWarning",
+          fileURLToPath(new URL("../src/indexer.mjs", import.meta.url)), "--root", root,
+          "--source-directory", "sources", "--extracted-directory", "extracted", "--output-directory", "output"],
+          { encoding: "utf8", timeout: 30_000 });
+        assert.equal(child.status, 0, child.stderr);
+        JSON.parse(child.stdout);
+      }
+      const rebuilt = JSON.parse(await readFile(manifestPath, "utf8"));
+      assert.equal(rebuilt.index_contract, INDEX_CONTRACT);
+      assert.equal(rebuilt.index_revision, original.index_revision);
+      assert.equal(rebuilt.assets.catalog_sha256, original.assets.catalog_sha256);
+      assert.equal(rebuilt.assets.tree_sha256, original.assets.tree_sha256);
+      await buildIndex(root, options);
+      assert.equal(JSON.parse(await readFile(manifestPath, "utf8")).index_revision, original.index_revision);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+}

@@ -24,6 +24,7 @@ import { spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { inflateSync } from "node:zlib";
+import { validatePngScanlines } from "./png-scanlines.mjs";
 
 // The slim entry point is sufficient for already-decoded strings and avoids
 // Cheerio's stream/encoding-sniffer dependency in the portable ESM bundle.
@@ -33,6 +34,12 @@ import jpeg from "jpeg-js";
 
 export const SCHEMA_VERSION = 3;
 export const INDEX_CONTRACT = "mql5-chm-index-v3-assets-v4";
+const ACCEPTED_INDEX_CONTRACTS = new Set([
+  "mql5-chm-index-v3-assets-v1",
+  "mql5-chm-index-v3-assets-v2",
+  "mql5-chm-index-v3-assets-v3",
+  INDEX_CONTRACT,
+]);
 export const ASSET_ID_PATTERN = /^(?:mql5|mql5book|neuronetworksbook):asset:[0-9a-f]{24}$/u;
 
 const DEFAULT_IMAGE_POLICY_RELATIVE_PATH = path.join("config", "mql5-image-policy.json");
@@ -376,6 +383,7 @@ function inspectPng(bytes, limits = {}) {
   let interlace = 0;
   let sawHeader = false;
   let sawPalette = false;
+  let paletteEntries = 0;
   let sawData = false;
   let sawEnd = false;
   let leftDataSequence = false;
@@ -424,6 +432,7 @@ function inspectPng(bytes, limits = {}) {
     } else if (type === "PLTE") {
       if (sawPalette || sawData || !length || length > 768 || length % 3 !== 0 || [0, 4].includes(colorType)) throw new Error("Malformed or misplaced PNG palette.");
       if (colorType === 3 && length / 3 > 2 ** bitDepth) throw new Error("PNG palette exceeds its indexed bit depth.");
+      paletteEntries = length / 3;
       sawPalette = true;
     } else if (type === "IDAT") {
       if (!sawHeader || sawEnd || leftDataSequence) throw new Error("PNG IDAT is out of order.");
@@ -469,14 +478,7 @@ function inspectPng(bytes, limits = {}) {
     throw new Error("PNG image data is not a valid bounded zlib stream.");
   }
   if (inflated.length !== expectedInflatedBytes) throw new Error("PNG image data length does not match its dimensions.");
-  let inflatedOffset = 0;
-  for (const [passWidth, passHeight] of passes) {
-    const rowBytes = scanlineBytes(passWidth);
-    for (let row = 0; row < passHeight; row += 1) {
-      if (inflated[inflatedOffset] > 4) throw new Error("PNG scanline uses an invalid filter type.");
-      inflatedOffset += rowBytes;
-    }
-  }
+  validatePngScanlines(inflated, passes, { bitsPerPixel, bitDepth, colorType, paletteEntries });
   return { mimeType: "image/png", width, height };
 }
 
@@ -1655,7 +1657,7 @@ async function assertPreparedOutputDirectory(outputDirectory, sourceFilenames) {
   }
   if (
     Number(manifest?.schema_version) !== SCHEMA_VERSION ||
-    !["mql5-chm-index-v3-assets-v1", "mql5-chm-index-v3-assets-v2", "mql5-chm-index-v3-assets-v3", INDEX_CONTRACT].includes(manifest?.index_contract) ||
+    !ACCEPTED_INDEX_CONTRACTS.has(manifest?.index_contract) ||
     manifest?.database?.filename !== "mql5-docs.sqlite" ||
     manifest?.assets?.directory !== "assets"
   ) {
@@ -3078,7 +3080,10 @@ async function describeAssetTree(assetsPath) {
   };
 }
 
-export async function describeIndexArtifactSet({ databasePath, manifestPath, assetsPath }) {
+export async function describeIndexArtifactSet({
+  databasePath, manifestPath, assetsPath, requireCurrentContract = true,
+}) {
+  if (typeof requireCurrentContract !== "boolean") throw new Error("Index contract policy must be boolean.");
   const database = await describeFile(databasePath, "Index artifact database");
   const manifestFile = await describeFile(manifestPath, "Index artifact manifest");
   let manifest;
@@ -3092,7 +3097,9 @@ export async function describeIndexArtifactSet({ databasePath, manifestPath, ass
   const corpusRevision = requireSha256(manifest?.corpus_revision, "Index artifact corpus revision");
   if (
     Number(manifest?.schema_version) !== SCHEMA_VERSION ||
-    manifest?.index_contract !== INDEX_CONTRACT ||
+    !(requireCurrentContract
+      ? manifest?.index_contract === INDEX_CONTRACT
+      : ACCEPTED_INDEX_CONTRACTS.has(manifest?.index_contract)) ||
     manifest?.database?.filename !== "mql5-docs.sqlite" ||
     Number(manifest?.database?.bytes) !== database.bytes ||
     manifest?.database?.sha256 !== database.sha256 ||
@@ -3103,6 +3110,19 @@ export async function describeIndexArtifactSet({ databasePath, manifestPath, ass
     manifest?.assets?.tree_sha256 !== assets.tree_sha256
   ) {
     throw new Error("Index artifact set does not form a valid database/manifest/assets closure.");
+  }
+  let connection;
+  try {
+    connection = new DatabaseSync(databasePath, { readOnly: true, allowExtension: false });
+    connection.enableLoadExtension(false);
+    const databaseContract = connection.prepare("SELECT value FROM metadata WHERE key='index_contract'").get()?.value;
+    if (databaseContract !== manifest.index_contract) {
+      throw new Error("Index artifact database contract does not match its manifest.");
+    }
+  } catch (error) {
+    throw new Error(`Index artifact database contract validation failed: ${error.message}`, { cause: error });
+  } finally {
+    connection?.close();
   }
   return {
     index_revision: indexRevision,
@@ -3261,11 +3281,12 @@ function parseBuildTransaction(raw) {
   return value;
 }
 
-async function assertCanonicalMatches(outputDirectory, descriptor) {
+async function assertCanonicalMatches(outputDirectory, descriptor, { requireCurrentContract = true } = {}) {
   const actual = await describeIndexArtifactSet({
     databasePath: path.join(outputDirectory, "mql5-docs.sqlite"),
     manifestPath: path.join(outputDirectory, "manifest.json"),
     assetsPath: path.join(outputDirectory, "assets"),
+    requireCurrentContract,
   });
   if (!artifactSetDescriptorsEqual(actual, descriptor)) {
     throw new Error("Published canonical index set does not match its transaction descriptor.");
@@ -3397,6 +3418,25 @@ async function assertCanonicalArtifactsAbsent(items) {
   }
 }
 
+async function assertRecoveryArtifactSetMatches(items, states, descriptor, role) {
+  const selected = new Map(items.map((item) => {
+    const state = states.get(item.key);
+    const location = role === "candidate"
+      ? (state.candidate.candidate ? item.candidate : item.target)
+      : (state.backup.old ? item.backup : item.target);
+    return [item.key, location];
+  }));
+  const actual = await describeIndexArtifactSet({
+    databasePath: selected.get("database"),
+    manifestPath: selected.get("manifest"),
+    assetsPath: selected.get("assets"),
+    requireCurrentContract: role === "candidate",
+  });
+  if (!artifactSetDescriptorsEqual(actual, descriptor)) {
+    throw new Error("Recovered index artifact set does not match its transaction descriptor.");
+  }
+}
+
 export async function recoverIndexBuildTransaction(outputDirectoryInput, options = {}) {
   const outputDirectory = path.resolve(outputDirectoryInput);
   const onCutPoint = options.onCutPoint ?? null;
@@ -3437,6 +3477,8 @@ export async function recoverIndexBuildTransaction(outputDirectoryInput, options
   });
 
   if (candidateComplete) {
+    await assertRecoveryArtifactSetMatches(items, states, journal.candidate, "candidate");
+    if (oldComplete) await assertRecoveryArtifactSetMatches(items, states, journal.old, "old");
     for (const item of items) {
       const state = states.get(item.key);
       assertOnlyAllowedAssetDisposals(state, ["backup"]);
@@ -3487,6 +3529,7 @@ export async function recoverIndexBuildTransaction(outputDirectoryInput, options
   }
 
   if (oldComplete) {
+    await assertRecoveryArtifactSetMatches(items, states, journal.old, "old");
     for (const item of items) {
       const state = states.get(item.key);
       assertOnlyAllowedAssetDisposals(state, ["target", "candidate"]);
@@ -3518,7 +3561,7 @@ export async function recoverIndexBuildTransaction(outputDirectoryInput, options
       }
       await rename(item.backup, item.target);
     }
-    await assertCanonicalMatches(outputDirectory, journal.old);
+    await assertCanonicalMatches(outputDirectory, journal.old, { requireCurrentContract: false });
     for (const item of items) {
       const candidate = await inspectArtifact(item, item.candidate, journal.candidate, journal.old);
       if (candidate.present) {
@@ -3536,7 +3579,7 @@ export async function recoverIndexBuildTransaction(outputDirectoryInput, options
       await unlink(journalTemporary);
       await onCutPoint?.("journal:temporary-removed");
     }
-    await assertCanonicalMatches(outputDirectory, journal.old);
+    await assertCanonicalMatches(outputDirectory, journal.old, { requireCurrentContract: false });
     await assertTransactionEphemeralAbsent(items, journalTemporary);
     await unlink(journalPath);
     await onCutPoint?.("journal:removed");
@@ -3628,6 +3671,7 @@ export async function publishIndexBuildTransaction({
       databasePath: items[0].target,
       manifestPath: items[1].target,
       assetsPath: items[2].target,
+      requireCurrentContract: false,
     })
     : null;
   const candidateDescriptor = await describeIndexArtifactSet({ databasePath, manifestPath, assetsPath });

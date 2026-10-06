@@ -26,6 +26,7 @@ function corpusRevision(sources) {
 }
 
 export async function buildFixture({
+  pngBytes = PNG,
   schemaVersion = 3,
   compatibilityTopics = false,
   indexContract = "mql5-chm-index-v3-assets-v1",
@@ -159,8 +160,8 @@ export async function buildFixture({
     }
 
     const assetDefinitions = (schemaVersion === 3 ? [
-      { internalPath: "images/diagram-a.png", bytes: PNG, mime: "image/png", exposure: "exposed", reason: "technical-in-help", caption: "Technical diagram A" },
-      { internalPath: "images/icon-b.png", bytes: PNG, mime: "image/png", exposure: "exposed", reason: "technical-in-help", caption: "Technical icon B" },
+      { internalPath: "images/diagram-a.png", bytes: pngBytes, mime: "image/png", exposure: "exposed", reason: "technical-in-help", caption: "Technical diagram A" },
+      { internalPath: "images/icon-b.png", bytes: pngBytes, mime: "image/png", exposure: "exposed", reason: "technical-in-help", caption: "Technical icon B" },
       { internalPath: "copyright.gif", bytes: GIF, mime: "image/gif", exposure: "excluded", reason: "decorative-denylist", caption: "Copyright" },
     ] : []).map((asset) => {
       const pathDigest = sha256(asset.internalPath.toLowerCase());

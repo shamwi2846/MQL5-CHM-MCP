@@ -15,6 +15,7 @@ import { dirname, extname, isAbsolute, parse, relative, resolve, sep } from "nod
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { inflateSync } from "node:zlib";
+import { validatePngScanlines } from "./png-scanlines.mjs";
 import expansionConfig from "../config/mql5-query-expansions.json" with { type: "json" };
 import jpeg from "jpeg-js";
 var MODULE_PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -628,6 +629,7 @@ function inspectPng(buffer) {
   let interlace = 0;
   let sawHeader = false;
   let sawPalette = false;
+  let paletteEntries = 0;
   let sawData = false;
   let sawEnd = false;
   let leftDataSequence = false;
@@ -664,6 +666,7 @@ function inspectPng(buffer) {
     if (type === "PLTE") {
       if (sawPalette || sawData || !length || length > 768 || length % 3 !== 0 || [0, 4].includes(colorType)) throw new Error("Malformed or misplaced PNG palette.");
       if (colorType === 3 && length / 3 > 2 ** bitDepth) throw new Error("PNG palette exceeds its indexed bit depth.");
+      paletteEntries = length / 3;
       sawPalette = true;
     }
     if (type === "IDAT") {
@@ -709,14 +712,7 @@ function inspectPng(buffer) {
     throw new Error("PNG image data is not a valid bounded zlib stream.");
   }
   if (inflated.length !== expectedInflatedBytes) throw new Error("PNG image data length does not match its dimensions.");
-  let inflatedOffset = 0;
-  for (const [passWidth, passHeight] of passes) {
-    const rowBytes = scanlineBytes(passWidth);
-    for (let row = 0; row < passHeight; row += 1) {
-      if (inflated[inflatedOffset] > 4) throw new Error("PNG scanline uses an invalid filter type.");
-      inflatedOffset += rowBytes;
-    }
-  }
+  validatePngScanlines(inflated, passes, { bitsPerPixel, bitDepth, colorType, paletteEntries });
   return { mime: "image/png", width, height };
 }
 function inspectJpeg(buffer) {

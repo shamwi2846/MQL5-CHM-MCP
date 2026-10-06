@@ -121,6 +121,32 @@ function Assert-InvalidJournalNumberRejected {
 }
 
 try {
+    foreach ($rootKind in @('singleton-array','multiple-array','empty-array','null','boolean','number','string')) {
+        $case = New-TestCaseDirectory -Name "journal-root-$rootKind"
+        $items = @((New-TestJournalItem 'a.txt' '.a.new' '.a.backup' 'old-a' 'new-a'))
+        Write-TestFile (Join-Path $case 'a.txt') 'old-a'
+        Write-TestFile (Join-Path $case '.a.new') 'new-a'
+        Write-TestJournal -Root $case -Items $items
+        $journalPath = Join-Path $case '.transaction.json'
+        $validRoot = Get-Content -LiteralPath $journalPath -Raw -Encoding UTF8
+        $invalidRoot = switch ($rootKind) {
+            'singleton-array' { "[$validRoot]" }
+            'multiple-array' { "[$validRoot,$validRoot]" }
+            'empty-array' { '[]' }
+            'null' { 'null' }
+            'boolean' { 'true' }
+            'number' { '1' }
+            'string' { '"text"' }
+        }
+        Write-TestFile $journalPath $invalidRoot
+        $rootRejected = $false
+        try { Repair-PreparedFileSetTransaction -Root $case -JournalName '.transaction.json' | Out-Null }
+        catch { $rootRejected = $_.Exception.Message -match 'must be a JSON object' }
+        Assert-Test $rootRejected "Prepared transaction accepted the non-object $rootKind root."
+        Assert-Test ((Get-Content -LiteralPath (Join-Path $case 'a.txt') -Raw) -ceq 'old-a') 'Rejected journal root changed the canonical target.'
+        Assert-Test ((Get-Content -LiteralPath (Join-Path $case '.a.new') -Raw) -ceq 'new-a') 'Rejected journal root changed prepared evidence.'
+        Assert-Test ((Get-Content -LiteralPath $journalPath -Raw) -ceq $invalidRoot) 'Rejected journal root changed recovery evidence.'
+    }
     # Lexical root checks must not depend on the process's current directory.
     $filesystemRoot = Get-FilesystemRootPath -Path $testRoot
     $allowedRoot = Assert-PathWithin -Root $filesystemRoot -Path $filesystemRoot -AllowRoot

@@ -339,10 +339,8 @@ test("portable stdio MCP resists ambient root redirection and calls the four v1.
 });
 
 test("runtime source has no network, process-spawn, or write capability", async () => {
-  const source = `${await readFile(path.join(root, "src", "server.mjs"), "utf8")}\n${await readFile(
-    path.join(root, "src", "search-service.mjs"),
-    "utf8",
-  )}`;
+  const source = (await Promise.all(["server.mjs", "search-service.mjs", "png-scanlines.mjs"]
+    .map((name) => readFile(path.join(root, "src", name), "utf8")))).join("\n");
   for (const forbidden of [
     "node:child_process",
     "node:http",

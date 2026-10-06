@@ -1730,7 +1730,7 @@ function Invoke-BoundedNodeJsDownload {
     $client = New-Object Net.Http.HttpClient($handler, $true)
     $client.Timeout = [Threading.Timeout]::InfiniteTimeSpan
     $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Get, $Uri)
-    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.3.3')
+    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.3.4')
     $response = $null
     $stream = $null
     $deadline = New-Object Threading.CancellationTokenSource([TimeSpan]::FromSeconds($TimeoutSeconds))
@@ -2812,7 +2812,7 @@ function Assert-PortableZipSidecar {
     )
     $zipFull = Resolve-FullPath -Path $ZipPath -MustExist -PathType Leaf
     $manifestFull = Resolve-FullPath -Path $ManifestPath -MustExist -PathType Leaf
-    $manifest = Read-JsonFile -Path $manifestFull -Context 'portable ZIP sidecar manifest'
+    $manifest = Read-JsonFile -Path $manifestFull -Context 'portable ZIP sidecar manifest' -RequireObject
     Assert-ExactJsonProperties -Object $manifest -Names @('schema_version','file','bytes','sha256') -Context 'portable ZIP sidecar manifest'
     $numericManifest = Get-TransactionJsonNumericView -Path $manifestFull -Parsed $manifest -Context 'portable ZIP sidecar manifest'
     $numericSchemaVersion = Get-TransactionJsonValue -Object $numericManifest -Name 'schema_version'
@@ -2875,7 +2875,7 @@ function Assert-PortableTransactionPairSemantics {
         throw "Portable transaction $SetKind pair does not match its journal descriptors."
     }
     Assert-PortableZipInternalChecksumClosure -ZipPath $zipPath | Out-Null
-    $sidecar = Read-JsonFile -Path $manifestPath -Context "portable transaction $SetKind sidecar"
+    $sidecar = Read-JsonFile -Path $manifestPath -Context "portable transaction $SetKind sidecar" -RequireObject
     Assert-ExactJsonProperties -Object $sidecar -Names @('schema_version','file','bytes','sha256') -Context "portable transaction $SetKind sidecar"
     $numericSidecar = Get-TransactionJsonNumericView -Path $manifestPath -Parsed $sidecar -Context "portable transaction $SetKind sidecar"
     $numericSchemaVersion = Get-TransactionJsonValue -Object $numericSidecar -Name 'schema_version'
@@ -2902,7 +2902,7 @@ function Get-PreparedFileSetTransactionDefinition {
     $sourcePath = Assert-PathWithin -Root $rootFull -Path $JournalPath
     Assert-NoReparsePoint -Root $rootFull -Path $sourcePath
     if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) { throw 'Prepared file-set transaction journal is not a regular file.' }
-    $journal = Read-JsonFile -Path $sourcePath -Context 'prepared file-set transaction journal'
+    $journal = Read-JsonFile -Path $sourcePath -Context 'prepared file-set transaction journal' -RequireObject
     $numericJournal = Get-TransactionJsonNumericView -Path $sourcePath -Parsed $journal
     $numericSchemaVersion = Get-TransactionJsonValue -Object $numericJournal -Name 'schema_version'
     if (-not (Test-TransactionJsonInteger $numericSchemaVersion)) {
@@ -4534,7 +4534,7 @@ function Invoke-OfficialChmDownload {
             try {
                 if ($null -eq $InternalTestHooks) {
                     $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Get, $current)
-                    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp/1.3.3')
+                    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp/1.3.4')
                     try {
                         $httpResponse = $client.SendAsync(
                             $request,

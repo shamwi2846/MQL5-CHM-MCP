@@ -646,6 +646,17 @@ try {
     $strictDescriptor = Get-Descriptor -Path $strictZipPath
     Assert-PortableZipSidecar -ZipPath $strictZipPath -ManifestPath $strictSidecarPath -ExpectedFile 'strict-portable.zip' | Out-Null
     Assert-Test $true 'Strict portable ZIP sidecar validation rejected a valid descriptor.'
+    $validRoot = Get-Content -LiteralPath $strictSidecarPath -Raw -Encoding UTF8
+    foreach ($invalidRoot in @("[$validRoot]", "[$validRoot,$validRoot]", '[]', 'null', 'true', '1', '"text"')) {
+        [IO.File]::WriteAllText($strictSidecarPath,$invalidRoot,$utf8)
+        $rootRejected = $false
+        try { Assert-PortableZipSidecar -ZipPath $strictZipPath -ManifestPath $strictSidecarPath -ExpectedFile 'strict-portable.zip' | Out-Null }
+        catch { $rootRejected = $_.Exception.Message -match 'must be a JSON object' }
+        Assert-Test $rootRejected 'Portable ZIP sidecar accepted a non-object serialized root.'
+        Assert-Test ((Get-Descriptor $strictZipPath).Sha256 -ceq $strictDescriptor.Sha256) 'Non-object sidecar rejection changed the ZIP.'
+        Assert-Test ((Get-Content -LiteralPath $strictSidecarPath -Raw -Encoding UTF8) -ceq $invalidRoot) 'Non-object sidecar rejection changed its evidence.'
+    }
+    [IO.File]::WriteAllText($strictSidecarPath,$validRoot,$utf8)
     foreach ($typedMutation in @('schema_version','bytes')) {
         $invalidSidecar = [ordered]@{
             schema_version=if ($typedMutation -ceq 'schema_version') { '1' } else { 1 }
@@ -694,6 +705,22 @@ try {
         catch { $decimalTransactionSidecarRejected = $true }
         Assert-Test $decimalTransactionSidecarRejected "Portable transaction recovery accepted decimal-encoded sidecar $decimalMutation."
     }
+    $validTransactionRoot = "{`"schema_version`":1,`"file`":`"transaction-portable.zip`",`"bytes`":$($transactionZipDescriptor.Bytes),`"sha256`":`"$($transactionZipDescriptor.Sha256)`"}"
+    foreach ($invalidRoot in @("[$validTransactionRoot]", "[$validTransactionRoot,$validTransactionRoot]", '[]', 'null', 'true', '1', '"text"')) {
+        [IO.File]::WriteAllText($transactionSidecarPath,$invalidRoot,$utf8)
+        $sidecarDescriptor = Get-Descriptor $transactionSidecarPath
+        foreach ($setKind in @('candidate','prior')) {
+            $zipState = [pscustomobject]@{CandidateSource=$transactionZipPath;PriorSource=$transactionZipPath;Item=[pscustomobject]@{target='transaction-portable.zip';old_present=$true;new_bytes=$transactionZipDescriptor.Bytes;new_sha256=$transactionZipDescriptor.Sha256;old_bytes=$transactionZipDescriptor.Bytes;old_sha256=$transactionZipDescriptor.Sha256}}
+            $sidecarState = [pscustomobject]@{CandidateSource=$transactionSidecarPath;PriorSource=$transactionSidecarPath;Item=[pscustomobject]@{target='transaction-portable.zip.manifest.json';old_present=$true;new_bytes=$sidecarDescriptor.Bytes;new_sha256=$sidecarDescriptor.Sha256;old_bytes=$sidecarDescriptor.Bytes;old_sha256=$sidecarDescriptor.Sha256}}
+            $rootRejected = $false
+            try { Assert-PortableTransactionPairSemantics -States @($zipState,$sidecarState) -SetKind $setKind }
+            catch { $rootRejected = $_.Exception.Message -match 'must be a JSON object' }
+            Assert-Test $rootRejected "Portable transaction $setKind accepted a non-object sidecar root."
+            Assert-Test ((Get-Descriptor $transactionZipPath).Sha256 -ceq $transactionZipDescriptor.Sha256) 'Non-object recovery sidecar changed its ZIP.'
+            Assert-Test ((Get-Content -LiteralPath $transactionSidecarPath -Raw -Encoding UTF8) -ceq $invalidRoot) 'Non-object recovery sidecar changed its evidence.'
+        }
+    }
+    [IO.File]::WriteAllText($transactionSidecarPath,$validTransactionRoot,$utf8)
     $canonicalArchive = [IO.Compression.ZipFile]::OpenRead($reproducibleRoots[0].Zip)
     try {
         Assert-Test ((@($canonicalArchive.Entries | ForEach-Object FullName) -join '|') -ceq 'portable/alpha.txt|portable/Beta.txt|portable/nested/payload.txt') 'Canonical ZIP entry ordering changed.'

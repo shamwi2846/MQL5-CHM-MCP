@@ -5,6 +5,7 @@ import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node
 import { hostname as systemHostname, tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { DatabaseSync } from "node:sqlite";
 
 import {
   INDEX_CONTRACT,
@@ -24,13 +25,17 @@ async function exists(target) {
   return stat(target).then(() => true, (error) => error?.code === "ENOENT" ? false : Promise.reject(error));
 }
 
-async function writeArtifactSet({ databasePath, manifestPath, assetsPath, label }) {
-  const databaseBytes = Buffer.from(`database:${label}\n`, "utf8");
+async function writeArtifactSet({ databasePath, manifestPath, assetsPath, label, contract = INDEX_CONTRACT }) {
   const assetBytes = Buffer.from(`asset:${label}\n`, "utf8");
   const assetRelativePath = "mql5/asset.bin";
   await mkdir(path.dirname(databasePath), { recursive: true });
   await mkdir(path.join(assetsPath, "mql5"), { recursive: true });
-  await writeFile(databasePath, databaseBytes);
+  const connection = new DatabaseSync(databasePath);
+  connection.exec("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT");
+  connection.prepare("INSERT INTO metadata VALUES (?,?)").run("index_contract", contract);
+  connection.prepare("INSERT INTO metadata VALUES (?,?)").run("fixture_label", `database:${label}\n`);
+  connection.close();
+  const databaseBytes = await readFile(databasePath);
   await writeFile(path.join(assetsPath, ...assetRelativePath.split("/")), assetBytes);
   const databaseSha256 = sha256(databaseBytes);
   const assetSha256 = sha256(assetBytes);
@@ -42,7 +47,7 @@ async function writeArtifactSet({ databasePath, manifestPath, assetsPath, label 
   const corpusRevision = sha256(Buffer.from(`corpus:${label}`, "utf8"));
   const manifest = {
     schema_version: SCHEMA_VERSION,
-    index_contract: INDEX_CONTRACT,
+    index_contract: contract,
     index_revision: databaseSha256,
     corpus_revision: corpusRevision,
     corpus_sha256: corpusRevision,
@@ -59,29 +64,135 @@ async function writeArtifactSet({ databasePath, manifestPath, assetsPath, label 
   return { databaseSha256, corpusRevision, assetTreeSha256 };
 }
 
-async function createCandidate(outputDirectory, token, label) {
+async function createCandidate(outputDirectory, token, label, contract = INDEX_CONTRACT) {
   const candidate = {
     databasePath: path.join(outputDirectory, `.mql5-docs.sqlite.candidate-${token}`),
     manifestPath: path.join(outputDirectory, `.manifest.json.candidate-${token}`),
     assetsPath: path.join(outputDirectory, `.assets.candidate-${token}`),
   };
-  await writeArtifactSet({ ...candidate, label });
+  await writeArtifactSet({ ...candidate, label, contract });
   return candidate;
 }
 
-async function createCanonical(outputDirectory, label) {
+async function createCanonical(outputDirectory, label, contract = INDEX_CONTRACT) {
   const canonical = {
     databasePath: path.join(outputDirectory, "mql5-docs.sqlite"),
     manifestPath: path.join(outputDirectory, "manifest.json"),
     assetsPath: path.join(outputDirectory, "assets"),
   };
-  const identity = await writeArtifactSet({ ...canonical, label });
+  const identity = await writeArtifactSet({ ...canonical, label, contract });
   return { ...canonical, ...identity };
 }
 
 async function readCanonicalLabel(outputDirectory) {
-  return readFile(path.join(outputDirectory, "mql5-docs.sqlite"), "utf8");
+  const connection = new DatabaseSync(path.join(outputDirectory, "mql5-docs.sqlite"), { readOnly: true });
+  try { return connection.prepare("SELECT value FROM metadata WHERE key='fixture_label'").get().value; }
+  finally { connection.close(); }
 }
+
+for (const version of [1, 2, 3, 4]) {
+  test(`prior contract v${version} upgrades, resumes and restores with unchanged journal schema`, async () => {
+    for (const outcome of ["publish", "resume", "restore"]) {
+      const root = await mkdtemp(path.join(tmpdir(), "mql5-contract-recovery-"));
+      try {
+        const contract = `mql5-chm-index-v3-assets-v${version}`;
+        await createCanonical(root, "prior", contract);
+        const token = randomUUID();
+        const candidate = await createCandidate(root, token, "candidate");
+        if (outcome === "publish") await publishIndexBuildTransaction({ outputDirectory: root, ...candidate, transactionToken: token });
+        else {
+          await assert.rejects(publishIndexBuildTransaction({ outputDirectory: root, ...candidate, transactionToken: token,
+            onCutPoint(name) { if (name === "install:database") throw new Error("crash"); },
+          }), /crash/);
+          const journal = JSON.parse(await readFile(path.join(root, ".index-build-transaction.json"), "utf8"));
+          assert.equal(journal.schema_version, 1);
+          if (outcome === "restore") await rm(candidate.assetsPath, { recursive: true, force: true });
+          assert.deepEqual(await recoverIndexBuildTransaction(root), { action: outcome === "restore" ? "restored" : "committed" });
+        }
+        const manifest = JSON.parse(await readFile(path.join(root, "manifest.json"), "utf8"));
+        assert.equal(manifest.index_contract, outcome === "restore" ? contract : INDEX_CONTRACT);
+        assert.equal(await readCanonicalLabel(root), `database:${outcome === "restore" ? "prior" : "candidate"}\n`);
+        assert.deepEqual(await recoverIndexBuildTransaction(root), { action: "none" });
+        assert.deepEqual((await readdir(root)).sort(), ["assets", "manifest.json", "mql5-docs.sqlite"]);
+      } finally { await rm(root, { recursive: true, force: true }); }
+    }
+  });
+}
+
+test("publication refuses unsupported prior contracts and every non-current candidate without mutation", async () => {
+  for (const [role, contract] of [["prior", "mql5-chm-index-v3-assets-v0"], ["prior", "unknown"],
+    ["candidate", "mql5-chm-index-v3-assets-v1"], ["candidate", "mql5-chm-index-v3-assets-v3"], ["candidate", "mql5-chm-index-v3-assets-v5"]]) {
+    const root = await mkdtemp(path.join(tmpdir(), "mql5-contract-reject-"));
+    try {
+      await createCanonical(root, "prior", role === "prior" ? contract : INDEX_CONTRACT);
+      const token = randomUUID();
+      const candidate = await createCandidate(root, token, "candidate", role === "candidate" ? contract : INDEX_CONTRACT);
+      const before = await treeSnapshot(root);
+      await assert.rejects(publishIndexBuildTransaction({ outputDirectory: root, ...candidate, transactionToken: token }), /closure/);
+      assert.deepEqual(await treeSnapshot(root), before);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }
+});
+
+test("contract metadata mismatch is rejected even when file hashes and sizes match", async () => {
+  for (const role of ["prior", "candidate"]) {
+    const root = await mkdtemp(path.join(tmpdir(), "mql5-contract-mismatch-"));
+    try {
+      const prior = await createCanonical(root, "prior");
+      const token = randomUUID();
+      const candidate = await createCandidate(root, token, "candidate");
+      const selected = role === "prior" ? prior : candidate;
+      const database = new DatabaseSync(selected.databasePath);
+      database.prepare("UPDATE metadata SET value=? WHERE key='index_contract'").run("mql5-chm-index-v3-assets-v3");
+      database.close();
+      const bytes = await readFile(selected.databasePath);
+      const manifest = JSON.parse(await readFile(selected.manifestPath, "utf8"));
+      manifest.database = { ...manifest.database, bytes: bytes.length, sha256: sha256(bytes) };
+      manifest.index_revision = sha256(bytes);
+      await writeFile(selected.manifestPath, JSON.stringify(manifest));
+      const before = await treeSnapshot(root);
+      await assert.rejects(publishIndexBuildTransaction({ outputDirectory: root, ...candidate, transactionToken: token }), /database contract.*manifest/);
+      assert.deepEqual(await treeSnapshot(root), before);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }
+});
+
+test("recovery checks contract semantics before moving or deleting hash-matching artifacts", async () => {
+  for (const role of ["candidate", "old"]) {
+    const root = await mkdtemp(path.join(tmpdir(), "mql5-contract-preflight-"));
+    try {
+      await createCanonical(root, "prior");
+      const token = randomUUID();
+      const candidate = await createCandidate(root, token, "candidate");
+      await assert.rejects(publishIndexBuildTransaction({ outputDirectory: root, ...candidate, transactionToken: token,
+        onCutPoint(name) { if (name === "install:database") throw new Error("crash"); },
+      }), /crash/);
+      const journalPath = path.join(root, ".index-build-transaction.json");
+      const journal = JSON.parse(await readFile(journalPath, "utf8"));
+      const dbPath = role === "candidate" ? path.join(root, "mql5-docs.sqlite") : path.join(root, `.mql5-docs.sqlite.backup-${token}`);
+      const manifestPath = role === "candidate" ? candidate.manifestPath : path.join(root, `.manifest.json.backup-${token}`);
+      const contract = role === "candidate" ? "mql5-chm-index-v3-assets-v3" : "unsupported";
+      const database = new DatabaseSync(dbPath);
+      database.prepare("UPDATE metadata SET value=? WHERE key='index_contract'").run(contract);
+      database.close();
+      const bytes = await readFile(dbPath);
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+      manifest.index_contract = contract;
+      manifest.index_revision = sha256(bytes);
+      manifest.database.bytes = bytes.length;
+      manifest.database.sha256 = sha256(bytes);
+      await writeFile(manifestPath, JSON.stringify(manifest));
+      const manifestBytes = await readFile(manifestPath);
+      journal[role].index_revision = sha256(bytes);
+      journal[role].database = { bytes: bytes.length, sha256: sha256(bytes) };
+      journal[role].manifest = { bytes: manifestBytes.length, sha256: sha256(manifestBytes) };
+      await writeFile(journalPath, JSON.stringify(journal));
+      const before = await treeSnapshot(root);
+      await assert.rejects(recoverIndexBuildTransaction(root), /closure/);
+      assert.deepEqual(await treeSnapshot(root), before);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }
+});
 
 async function treeSnapshot(root) {
   const output = [];
