@@ -130,3 +130,7 @@ try {
     if (-not $full.StartsWith($temporaryParent.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase)) {throw 'Test cleanup escaped its temporary parent.'}
     if (Test-Path -LiteralPath $full) {Remove-Item -LiteralPath $full -Recurse -Force}
 }
+# Public recovery refusal is an expected native exit in the fixtures above.
+# Publish success only after every assertion and cleanup completed, so a shell
+# wrapper does not mistake the last negative test for this script's result.
+$global:LASTEXITCODE=0
