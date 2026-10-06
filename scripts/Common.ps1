@@ -1730,7 +1730,7 @@ function Invoke-BoundedNodeJsDownload {
     $client = New-Object Net.Http.HttpClient($handler, $true)
     $client.Timeout = [Threading.Timeout]::InfiniteTimeSpan
     $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Get, $Uri)
-    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.3.4')
+    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.3.5')
     $response = $null
     $stream = $null
     $deadline = New-Object Threading.CancellationTokenSource([TimeSpan]::FromSeconds($TimeoutSeconds))
@@ -2309,7 +2309,7 @@ function Assert-SevenZipProvenance {
 
     $root = Resolve-FullPath -Path $ProjectRoot -MustExist -PathType Container
     $provenancePath = Join-Path $root 'tools\7zip.provenance.json'
-    $provenance = Read-JsonFile -Path $provenancePath -Context '7-Zip provenance manifest'
+    $provenance = Read-JsonFile -Path $provenancePath -Context '7-Zip provenance manifest' -RequireObject
     Assert-ExactJsonProperties -Object $provenance -Names @('schema_version','distribution','version','architecture','upstream_url','artifact_bytes','artifact_sha256','files','required_format') -Context '7-Zip provenance manifest'
     if ([int]$provenance.schema_version -ne 1 -or [string]$provenance.distribution -cne 'official-windows-x64-msi' -or
         [string]$provenance.version -cne $script:PinnedSevenZipVersion -or [string]$provenance.architecture -cne 'x64' -or
@@ -3583,7 +3583,7 @@ function Get-RevisionStageReportRepairContext {
     $manifestPath = Join-Path $revisionRoot 'manifest.json'
     Assert-NoReparsePoint -Root $revisionsRoot -Path $manifestPath
     if ((Get-FileSystemItemOrFallback -Path $manifestPath).Length -gt 2097152) { throw "Revision manifest is unexpectedly large during stage-report repair: $manifestPath" }
-    $manifest = Read-JsonFile -Path $manifestPath -Context 'revision manifest for stage-report repair'
+    $manifest = Read-JsonFile -Path $manifestPath -Context 'revision manifest for stage-report repair' -RequireObject
     $schema = [int](Get-RequiredJsonProperty $manifest 'schema_version' 'revision manifest for stage-report repair')
     $database = Get-RequiredJsonProperty $manifest 'database' 'revision manifest for stage-report repair'
     $databaseHash = [string](Get-RequiredJsonProperty $database 'sha256' 'revision manifest database for stage-report repair')
@@ -3647,7 +3647,7 @@ function Repair-InterruptedMaintenanceArtifacts {
     }
     Repair-TargetSpecificAtomicFile -ConfinementRoot $root -TargetPath (Join-Path $maintenanceRoot 'revision-stage.json') -MaximumArtifactBytes 2097152 -ValidateCanonical {
         param($canonicalPath)
-        $journal = Read-JsonFile -Path $canonicalPath -Context 'revision stage journal'
+        $journal = Read-JsonFile -Path $canonicalPath -Context 'revision stage journal' -RequireObject
         Assert-ExactJsonProperties -Object $journal -Names @('schema_version','operation','index_revision','corpus_revision','base_index_revision','base_corpus_revision','candidate_tree_sha256','json_digest_contract','stage_report_canonical_sha256','stage_report_file_sha256','destination_existed','prior_stage_report_canonical_sha256','prior_stage_report_file_sha256','allow_legacy_active','started_at','stage_report') -Context 'revision stage journal'
         if ([int]$journal.schema_version -ne 1 -or @('rebuild','documentation-update') -cnotcontains [string]$journal.operation) { throw 'Revision stage journal schema or operation is invalid.' }
         if ([string]$journal.json_digest_contract -cne 'powershell-json-compress-depth20-v1') { throw 'Revision stage journal digest contract is invalid.' }
@@ -3987,7 +3987,7 @@ function Assert-Revision {
     $databasePath = Join-Path $revisionRoot 'mql5-docs.sqlite'
     $corpusLockPath = Join-Path $revisionRoot 'corpus.lock.json'
     foreach ($immutablePath in @($manifestPath,$databasePath,$corpusLockPath)) { Assert-NoReparsePoint -Root $revisionConfinement -Path $immutablePath }
-    $corpusLock = Read-JsonFile -Path $corpusLockPath -Context 'revision corpus lock'
+    $corpusLock = Read-JsonFile -Path $corpusLockPath -Context 'revision corpus lock' -RequireObject
     if ($null -eq $corpusLock.sources -or @($corpusLock.sources).Count -ne 3) { throw 'Revision corpus lock must describe exactly three sources.' }
     $manifest = Read-JsonFile -Path $manifestPath -Context 'revision manifest' -RequireObject
     Assert-RevisionManifestTypes -Manifest $manifest
@@ -4194,7 +4194,7 @@ function Get-UpdateStatus {
     $root = Resolve-FullPath -Path $ProjectRoot -MustExist -PathType Container
     $path = Join-Path $root 'maintenance\update-status.json'
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { if ($AllowMissing) { return $null }; throw "Update status is missing: $path" }
-    $status = Read-JsonFile -Path $path -Context 'update status'
+    $status = Read-JsonFile -Path $path -Context 'update status' -RequireObject
     $schemaVersion = [int](Get-RequiredJsonProperty $status 'schema_version' 'update status')
     if ($schemaVersion -eq 1) {
         Assert-ExactJsonProperties -Object $status -Names @('schema_version','checked_at','status','active_revision','candidate_revision','message') -Context 'legacy update status'
@@ -4265,7 +4265,7 @@ function Set-StagedRevisionReport {
     }
     $path = Join-Path $revisionRoot 'stage-report.json'
     Write-JsonAtomic -Path $path -Value $value -ConfinementRoot $revisionRoot
-    return Read-JsonFile -Path $path -Context 'stage report'
+    return Read-JsonFile -Path $path -Context 'stage report' -RequireObject
 }
 
 function Assert-StagedRevisionReport {
@@ -4274,7 +4274,7 @@ function Assert-StagedRevisionReport {
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedRevision
     )
-    $report = Read-JsonFile -Path $Path -Context 'stage report'
+    $report = Read-JsonFile -Path $Path -Context 'stage report' -RequireObject
     Assert-ExactJsonProperties -Object $report -Names @('schema_version','index_revision','corpus_revision','base_index_revision','base_corpus_revision','staged_at','validation_passed','source_topic_counts','changes','asset_changes','required_rankings') -Context 'stage report'
     if ([int]$report.schema_version -ne 3 -or [string]$report.index_revision -cne $ExpectedRevision -or $report.validation_passed -isnot [bool] -or -not [bool]$report.validation_passed) { throw 'Stage report is not approved for this index revision.' }
     if ([string]$report.corpus_revision -cnotmatch '^[0-9a-f]{64}$') { throw 'Stage report corpus_revision is invalid.' }
@@ -4298,7 +4298,7 @@ function Assert-LegacyStagedRevisionReport {
     )
     $full = Resolve-FullPath -Path $Path -MustExist -PathType Leaf
     if ((Get-FileSystemItemOrFallback -Path $full).Length -gt 2097152) { throw 'Legacy stage report exceeds the 2 MiB validation limit.' }
-    $report = Read-JsonFile -Path $full -Context 'legacy stage report'
+    $report = Read-JsonFile -Path $full -Context 'legacy stage report' -RequireObject
     Assert-ExactJsonProperties -Object $report -Names @('schema_version','revision','base_revision','staged_at','validation_passed','source_topic_counts','changes','required_rankings') -Context 'legacy stage report'
     if ([int]$report.schema_version -ne 1 -or [string]$report.revision -cne $ExpectedCorpusRevision -or $report.validation_passed -isnot [bool] -or -not [bool]$report.validation_passed) { throw 'Legacy stage report is not approved for this corpus revision.' }
     if ([string]$report.base_revision -cnotmatch '^[0-9a-f]{64}$' -or [string]$report.base_revision -ceq $ExpectedCorpusRevision) { throw 'Legacy stage report base_revision is invalid.' }
@@ -4337,7 +4337,7 @@ function Get-RevisionTransition {
         if ($AllowMissing) { return $null }
         throw "Revision transition journal is missing: $path"
     }
-    $transition = Read-JsonFile -Path $path -Context 'revision transition journal'
+    $transition = Read-JsonFile -Path $path -Context 'revision transition journal' -RequireObject
     $schemaVersion = [int](Get-RequiredJsonProperty $transition 'schema_version' 'revision transition journal')
     if ($schemaVersion -eq 1) {
         Assert-ExactJsonProperties -Object $transition -Names @('schema_version','operation','from_revision','to_revision','started_at') -Context 'legacy revision transition journal'
@@ -4534,7 +4534,7 @@ function Invoke-OfficialChmDownload {
             try {
                 if ($null -eq $InternalTestHooks) {
                     $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Get, $current)
-                    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp/1.3.4')
+                    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp/1.3.5')
                     try {
                         $httpResponse = $client.SendAsync(
                             $request,

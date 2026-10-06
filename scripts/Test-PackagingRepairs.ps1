@@ -1149,6 +1149,46 @@ try {
     Assert-Test ($completeResult.ExitCode -ne 0) 'Complete pre-journal ZIP fixture unexpectedly completed packaging.'
     Assert-Test ((Test-Path -LiteralPath $completeZip -PathType Leaf) -and (Test-Path -LiteralPath $completeManifest -PathType Leaf)) 'A complete recoverable pre-journal ZIP pair was discarded before rebuildability was proven.'
 
+    foreach ($kind in @('singleton','multiple','empty','null','boolean','number','string')) {
+        $root=Join-Path $testRoot ('orphan-root-'+$kind)
+        New-Item -ItemType Directory -Path $root | Out-Null
+        $name='orphan-root-'+$kind
+        $canonicalZip=Join-Path $root ($name+'.zip')
+        $canonicalManifest=$canonicalZip+'.manifest.json'
+        New-TestZipAndSidecar -Root $root -ZipPath $canonicalZip -ManifestPath $canonicalManifest -ExpectedFile ($name+'.zip')
+        $token='1234567890abcdef1234567890abcdef'
+        $preparedZip=Join-Path $root ('.package-'+$token+'.prepared.zip')
+        $preparedManifest=Join-Path $root ('.package-'+$token+'.prepared.manifest.json')
+        Copy-Item -LiteralPath $canonicalZip -Destination $preparedZip
+        $objectText=Get-Content -LiteralPath $canonicalManifest -Raw -Encoding UTF8
+        $text=switch ($kind) {
+            'singleton' {'['+$objectText+']'}
+            'multiple' {'['+$objectText+','+$objectText+']'}
+            'empty' {'[]'}
+            'null' {'null'}
+            'boolean' {'true'}
+            'number' {'1'}
+            'string' {'"record"'}
+        }
+        [IO.File]::WriteAllText($preparedManifest,$text,(New-Object Text.UTF8Encoding($false)))
+        $backup=Join-Path $root 'retained.backup'
+        [IO.File]::WriteAllText($backup,'retained backup evidence')
+        $before=@{}
+        foreach ($path in @($canonicalZip,$canonicalManifest,$preparedZip,$preparedManifest,$backup)) {$before[$path]=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash}
+        $result=Invoke-ExpectedPortablePackagingFailure -OutputDirectory $root -ReleaseName $name
+        Assert-Test ($result.ExitCode -ne 0) ('Public packaging accepted the '+$kind+' orphan sidecar root.')
+        # Public preflight defers orphan disposal until rebuildability is
+        # proven. Exercise that later boundary with the same retained files,
+        # including a valid canonical pair and an explicit rebuild guarantee.
+        $message=''
+        try {Repair-PackageZipPublicationContext -ReleaseRoot $root -ZipPath $canonicalZip -ManifestPath $canonicalManifest -CanRebuildPreparedOrphans | Out-Null}
+        catch {$message=$_.Exception.Message}
+        Assert-Test ($message -match 'must be a JSON object') ('Rebuildable orphan recovery accepted the '+$kind+' root: '+$message)
+        foreach ($entry in $before.GetEnumerator()) {
+            Assert-Test ((Test-Path -LiteralPath $entry.Key -PathType Leaf) -and (Get-FileHash -LiteralPath $entry.Key -Algorithm SHA256).Hash -ceq $entry.Value) ('Malformed orphan sidecar changed recovery evidence: '+$entry.Key)
+        }
+    }
+
     # Compress-Archive and sidecar bytes are first written under .writing
     # names. Early preflight preserves a hard-kill pair; proven rebuildability
     # reclaims it and publishes a fresh, fully verified ZIP/sidecar pair.
@@ -1190,9 +1230,20 @@ try {
     $invalidPreparedEarlyRejected=$false
     try{Repair-PackageZipPublicationContext -ReleaseRoot $preparedCompatRoot -ZipPath $preparedCompatZip -ManifestPath $preparedCompatManifest|Out-Null}catch{$invalidPreparedEarlyRejected=$true}
     Assert-Test ($invalidPreparedEarlyRejected -and (Test-Path -LiteralPath $invalidPreparedZip) -and (Test-Path -LiteralPath $invalidPreparedManifest)) 'Early portable recovery discarded malformed prepared evidence without rebuild proof.'
+    $invalidPreparedDescriptors=@(Get-Descriptor $invalidPreparedZip; Get-Descriptor $invalidPreparedManifest)
+    $invalidPreparedRebuildRejected=$false
+    try{Publish-PackageZipAtomically -ReleaseRoot $preparedCompatRoot -StageRoot $preparedCompatStage -ZipPath $preparedCompatZip -ManifestPath $preparedCompatManifest|Out-Null}catch{$invalidPreparedRebuildRejected=$true}
+    Assert-Test $invalidPreparedRebuildRejected 'A proven rebuild accepted malformed prepared recovery metadata.'
+    Assert-Test (((Get-Descriptor $invalidPreparedZip).Sha256 -ceq $invalidPreparedDescriptors[0].Sha256) -and ((Get-Descriptor $invalidPreparedManifest).Sha256 -ceq $invalidPreparedDescriptors[1].Sha256)) 'Malformed prepared recovery rejection changed the retained evidence.'
+    Assert-Test (-not (Test-Path -LiteralPath $preparedCompatZip) -and -not (Test-Path -LiteralPath $preparedCompatManifest)) 'Malformed prepared recovery rejection created canonical targets.'
+
+    # A valid recovery record may still describe a damaged, app-owned payload.
+    # Reset the fixture record explicitly to exercise the retained repair path.
+    $invalidPreparedDescriptor=Get-Descriptor $invalidPreparedZip
+    Write-JsonAtomic -Path $invalidPreparedManifest -ConfinementRoot $preparedCompatRoot -Value ([ordered]@{schema_version=1;file='prepared-recovery.zip';bytes=$invalidPreparedDescriptor.Bytes;sha256=$invalidPreparedDescriptor.Sha256})
     $preparedCompatPublication=Publish-PackageZipAtomically -ReleaseRoot $preparedCompatRoot -StageRoot $preparedCompatStage -ZipPath $preparedCompatZip -ManifestPath $preparedCompatManifest
-    Assert-Test ((Test-Path -LiteralPath $preparedCompatPublication.ZipPath -PathType Leaf) -and (Test-Path -LiteralPath $preparedCompatPublication.ManifestPath -PathType Leaf)) 'Proven portable rebuild did not replace malformed prepared remnants.'
-    Assert-Test (@(Get-ChildItem -LiteralPath $preparedCompatRoot -Force|Where-Object Name -like '.package-*').Count -eq 0) 'Portable malformed-prepared recovery retained reserved debris.'
+    Assert-Test ((Test-Path -LiteralPath $preparedCompatPublication.ZipPath -PathType Leaf) -and (Test-Path -LiteralPath $preparedCompatPublication.ManifestPath -PathType Leaf)) 'Proven portable rebuild did not replace the damaged payload with a valid recovery record.'
+    Assert-Test (@(Get-ChildItem -LiteralPath $preparedCompatRoot -Force|Where-Object Name -like '.package-*').Count -eq 0) 'Portable damaged-payload recovery retained reserved debris.'
 
     $corruptPairRoot = Join-Path $testRoot 'portable-hash-consistent-corrupt-pair'
     New-Item -ItemType Directory -Path $corruptPairRoot | Out-Null

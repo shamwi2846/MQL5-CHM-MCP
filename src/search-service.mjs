@@ -16,6 +16,7 @@ import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { inflateSync } from "node:zlib";
 import { validatePngScanlines } from "./png-scanlines.mjs";
+import { createPngTransparencyValidator } from "./png-transparency.mjs";
 import expansionConfig from "../config/mql5-query-expansions.json" with { type: "json" };
 import jpeg from "jpeg-js";
 var MODULE_PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -633,6 +634,7 @@ function inspectPng(buffer) {
   let sawData = false;
   let sawEnd = false;
   let leftDataSequence = false;
+  const validateTransparency = createPngTransparencyValidator();
   const compressedChunks = [];
   while (offset + 12 <= buffer.length) {
     const length = buffer.readUInt32BE(offset);
@@ -644,6 +646,7 @@ function inspectPng(buffer) {
     const data = buffer.subarray(offset + 8, offset + 8 + length);
     const declaredCrc = buffer.readUInt32BE(offset + 8 + length);
     if (crc32(Buffer.concat([typeBytes, data])) !== declaredCrc) throw new Error("Invalid PNG chunk CRC.");
+    validateTransparency(type, length, { colorType, paletteEntries, sawPalette, sawData });
     if (!sawHeader) {
       if (type !== "IHDR" || length !== 13) throw new Error("PNG IHDR is missing.");
       width = data.readUInt32BE(0);

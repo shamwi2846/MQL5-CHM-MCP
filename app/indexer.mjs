@@ -6617,6 +6617,32 @@ function validatePngScanlines(inflated, passes, { bitsPerPixel, bitDepth, colorT
   }
 }
 
+// src/png-transparency.mjs
+function createPngTransparencyValidator() {
+  let sawTransparency = false;
+  return (type, length, { colorType, paletteEntries, sawPalette, sawData }) => {
+    if (type === "PLTE" && sawTransparency) {
+      throw new Error("PNG palette follows its transparency chunk.");
+    }
+    if (type !== "tRNS") return;
+    if (sawTransparency || sawData) {
+      throw new Error("PNG transparency chunk is duplicated or follows image data.");
+    }
+    if (colorType === 3) {
+      if (!sawPalette || length > paletteEntries) {
+        throw new Error("PNG indexed transparency exceeds or precedes its palette.");
+      }
+    } else if (colorType === 0 || colorType === 2) {
+      if (length !== (colorType === 0 ? 2 : 6)) {
+        throw new Error("PNG transparency chunk has an invalid sample length.");
+      }
+    } else {
+      throw new Error("PNG transparency chunk is forbidden for this color type.");
+    }
+    sawTransparency = true;
+  };
+}
+
 // node_modules/cheerio/dist/esm/options.js
 var defaultOpts = {
   _useHtmlParser2: false
@@ -13003,6 +13029,7 @@ function inspectPng(bytes, limits = {}) {
   let sawData = false;
   let sawEnd = false;
   let leftDataSequence = false;
+  const validateTransparency = createPngTransparencyValidator();
   const compressedChunks = [];
   while (offset < bytes.length) {
     if (offset + 12 > bytes.length) throw new Error("Truncated PNG chunk header.");
@@ -13018,6 +13045,7 @@ function inspectPng(bytes, limits = {}) {
     const expectedCrc = bytes.readUInt32BE(dataEnd);
     const actualCrc = crc32(bytes.subarray(offset + 4, dataEnd));
     if (actualCrc !== expectedCrc) throw new Error(`PNG CRC mismatch in ${type}.`);
+    validateTransparency(type, length, { colorType, paletteEntries, sawPalette, sawData });
     if (!sawHeader && type !== "IHDR") throw new Error("PNG IHDR must be the first chunk.");
     if (type === "IHDR") {
       if (sawHeader || length !== 13) throw new Error("Malformed or duplicate PNG IHDR.");

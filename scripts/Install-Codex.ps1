@@ -48,7 +48,7 @@ try {
     Assert-NoReservedNodeRuntimeArtifacts -RuntimeRoot (Join-Path $root 'runtime')
     $server = Resolve-FullPath -Path (Join-Path $root 'app\server.mjs') -MustExist -PathType Leaf
     $smokeTest = Resolve-FullPath -Path (Join-Path $root 'scripts\Smoke-Test-McpServer.mjs') -MustExist -PathType Leaf
-    $packageManifest = Read-JsonFile -Path (Join-Path $root 'package.json') -Context 'package manifest'
+    $packageManifest = Read-JsonFile -Path (Join-Path $root 'package.json') -Context 'package manifest' -RequireObject
     $expectedServerVersion = [string](Get-RequiredJsonProperty $packageManifest 'version' 'package manifest')
     if ([string]::IsNullOrWhiteSpace($expectedServerVersion)) {
         throw 'Package manifest version must not be empty.'

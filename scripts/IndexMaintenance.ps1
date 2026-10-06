@@ -108,7 +108,7 @@ function Get-ChmIndexInputExtensions {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$ProjectRoot)
     $root = Resolve-FullPath -Path $ProjectRoot -MustExist -PathType Container
-    $policy = Read-JsonFile -Path (Join-Path $root 'config\mql5-image-policy.json') -Context 'MQL5 image policy'
+    $policy = Read-JsonFile -Path (Join-Path $root 'config\mql5-image-policy.json') -Context 'MQL5 image policy' -RequireObject
     $catalogProperty = $policy.PSObject.Properties['catalog_extensions']
     if ($null -eq $catalogProperty -or $catalogProperty.Value -is [string] -or -not ($catalogProperty.Value -is [Collections.IEnumerable])) {
         throw 'MQL5 image policy catalog_extensions must be an array.'
@@ -702,7 +702,7 @@ function New-RevisionCandidate {
     $node = Resolve-NodeExecutable -ProjectRoot $root; $indexer = Resolve-Indexer -ProjectRoot $root
     Invoke-NativeChecked -FilePath $node -Arguments @($indexer,'--root',$root,'--workspace-root',$work,'--source-directory',$sourceRoot.FullName,'--extracted-directory',$extractedRoot.FullName,'--output-directory',$candidateRoot.FullName,'--corpus-lock',$lockPath) -FailureMessage 'MQL5 CHM indexing failed.'
     Copy-Item -LiteralPath $lockPath -Destination (Join-Path $candidateRoot.FullName 'corpus.lock.json')
-    $candidateManifest = Read-JsonFile -Path (Join-Path $candidateRoot.FullName 'manifest.json') -Context 'candidate manifest'
+    $candidateManifest = Read-JsonFile -Path (Join-Path $candidateRoot.FullName 'manifest.json') -Context 'candidate manifest' -RequireObject
     $indexRevision = [string](Get-RequiredJsonProperty $candidateManifest 'index_revision' 'candidate manifest')
     if ($indexRevision -cnotmatch '^[0-9a-f]{64}$') { throw 'Candidate manifest index_revision is invalid.' }
     $validated = Assert-Revision -ProjectRoot $root -Revision $indexRevision -RevisionRoot $candidateRoot.FullName -RevisionConfinementRoot $work -IdentityMode Index -RequireCurrent

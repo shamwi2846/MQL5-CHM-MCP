@@ -33193,6 +33193,32 @@ function validatePngScanlines(inflated, passes, { bitsPerPixel, bitDepth, colorT
   }
 }
 
+// src/png-transparency.mjs
+function createPngTransparencyValidator() {
+  let sawTransparency = false;
+  return (type, length, { colorType, paletteEntries, sawPalette, sawData }) => {
+    if (type === "PLTE" && sawTransparency) {
+      throw new Error("PNG palette follows its transparency chunk.");
+    }
+    if (type !== "tRNS") return;
+    if (sawTransparency || sawData) {
+      throw new Error("PNG transparency chunk is duplicated or follows image data.");
+    }
+    if (colorType === 3) {
+      if (!sawPalette || length > paletteEntries) {
+        throw new Error("PNG indexed transparency exceeds or precedes its palette.");
+      }
+    } else if (colorType === 0 || colorType === 2) {
+      if (length !== (colorType === 0 ? 2 : 6)) {
+        throw new Error("PNG transparency chunk has an invalid sample length.");
+      }
+    } else {
+      throw new Error("PNG transparency chunk is forbidden for this color type.");
+    }
+    sawTransparency = true;
+  };
+}
+
 // config/mql5-query-expansions.json
 var mql5_query_expansions_default = {
   schema_version: 1,
@@ -33819,6 +33845,7 @@ function inspectPng(buffer) {
   let sawData = false;
   let sawEnd = false;
   let leftDataSequence = false;
+  const validateTransparency = createPngTransparencyValidator();
   const compressedChunks = [];
   while (offset + 12 <= buffer.length) {
     const length = buffer.readUInt32BE(offset);
@@ -33830,6 +33857,7 @@ function inspectPng(buffer) {
     const data = buffer.subarray(offset + 8, offset + 8 + length);
     const declaredCrc = buffer.readUInt32BE(offset + 8 + length);
     if (crc32(Buffer.concat([typeBytes, data])) !== declaredCrc) throw new Error("Invalid PNG chunk CRC.");
+    validateTransparency(type, length, { colorType, paletteEntries, sawPalette, sawData });
     if (!sawHeader) {
       if (type !== "IHDR" || length !== 13) throw new Error("PNG IHDR is missing.");
       width = data.readUInt32BE(0);
@@ -35574,7 +35602,7 @@ function toolFailure(error51) {
 }
 function createMcpServer(service) {
   const server = new McpServer(
-    { name: "mql5-chm", version: "1.3.4" },
+    { name: "mql5-chm", version: "1.3.5" },
     { capabilities: { tools: {} } }
   );
   server.registerTool(

@@ -30,7 +30,7 @@ function Compare-OfficialDocumentationHashes {
     try {
         $lockPath = Resolve-FullPath -Path (Join-Path $root 'corpus.lock.json') -MustExist -PathType Leaf
         Assert-NoReparsePoint -Root $root -Path $lockPath
-        $lock = Read-JsonFile -Path $lockPath -Context 'tracked corpus lock'
+        $lock = Read-JsonFile -Path $lockPath -Context 'tracked corpus lock' -RequireObject
         Assert-ExactJsonProperties -Object $lock -Names @('schema_version','sources','expected_total_topics') -Context 'tracked corpus lock'
         if ([string]$lock.schema_version -cne '1.0' -or @($lock.sources).Count -ne 3) {
             throw 'Tracked corpus lock must use schema 1.0 and describe exactly three sources.'

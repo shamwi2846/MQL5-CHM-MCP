@@ -19,7 +19,7 @@ function Get-PinnedSevenZipMetadata {
     $root = Resolve-FullPath -Path $ProjectRoot -MustExist -PathType Container
     $provenancePath = Resolve-FullPath -Path (Join-Path $root 'tools\7zip.provenance.json') -MustExist -PathType Leaf
     Assert-NoReparsePoint -Root $root -Path $provenancePath
-    $provenance = Read-JsonFile -Path $provenancePath -Context '7-Zip provenance manifest'
+    $provenance = Read-JsonFile -Path $provenancePath -Context '7-Zip provenance manifest' -RequireObject
     Assert-ExactJsonProperties -Object $provenance -Names @(
         'schema_version','distribution','version','architecture','upstream_url',
         'artifact_bytes','artifact_sha256','files','required_format'
@@ -187,7 +187,7 @@ function Invoke-BoundedSevenZipDownload {
     try {
         while ($true) {
             $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Get, $current)
-            [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.3.4')
+            [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.3.5')
             $response = $null
             $stream = $null
             try {

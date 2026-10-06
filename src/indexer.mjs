@@ -25,6 +25,7 @@ import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { inflateSync } from "node:zlib";
 import { validatePngScanlines } from "./png-scanlines.mjs";
+import { createPngTransparencyValidator } from "./png-transparency.mjs";
 
 // The slim entry point is sufficient for already-decoded strings and avoids
 // Cheerio's stream/encoding-sniffer dependency in the portable ESM bundle.
@@ -387,6 +388,7 @@ function inspectPng(bytes, limits = {}) {
   let sawData = false;
   let sawEnd = false;
   let leftDataSequence = false;
+  const validateTransparency = createPngTransparencyValidator();
   const compressedChunks = [];
   while (offset < bytes.length) {
     if (offset + 12 > bytes.length) throw new Error("Truncated PNG chunk header.");
@@ -402,6 +404,7 @@ function inspectPng(bytes, limits = {}) {
     const expectedCrc = bytes.readUInt32BE(dataEnd);
     const actualCrc = crc32(bytes.subarray(offset + 4, dataEnd));
     if (actualCrc !== expectedCrc) throw new Error(`PNG CRC mismatch in ${type}.`);
+    validateTransparency(type, length, { colorType, paletteEntries, sawPalette, sawData });
     if (!sawHeader && type !== "IHDR") throw new Error("PNG IHDR must be the first chunk.");
     if (type === "IHDR") {
       if (sawHeader || length !== 13) throw new Error("Malformed or duplicate PNG IHDR.");

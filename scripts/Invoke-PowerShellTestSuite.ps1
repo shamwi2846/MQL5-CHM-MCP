@@ -8,6 +8,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $maintenance = @(
+    'Test-JsonObjectRoots.ps1',
     'Test-CodexRegistration.ps1',
     'Test-FileSetTransaction.ps1',
     'Test-GlobalMutex.ps1',

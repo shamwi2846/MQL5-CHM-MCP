@@ -231,7 +231,7 @@ function Get-RevisionStageJournal {
     }
     Assert-NoReparsePoint -Root $root -Path $path
     if ((Get-Item -LiteralPath $path).Length -gt 2097152) { throw 'Revision stage journal is unexpectedly large.' }
-    $journal = Read-JsonFile -Path $path -Context 'revision stage journal'
+    $journal = Read-JsonFile -Path $path -Context 'revision stage journal' -RequireObject
     Assert-ExactJsonProperties -Object $journal -Names @('schema_version','operation','index_revision','corpus_revision','base_index_revision','base_corpus_revision','candidate_tree_sha256','json_digest_contract','stage_report_canonical_sha256','stage_report_file_sha256','destination_existed','prior_stage_report_canonical_sha256','prior_stage_report_file_sha256','allow_legacy_active','started_at','stage_report') -Context 'revision stage journal'
     if ([int]$journal.schema_version -ne 1) { throw 'Revision stage journal schema_version must be 1.' }
     if (@('rebuild','documentation-update') -cnotcontains [string]$journal.operation) { throw 'Revision stage journal operation is invalid.' }

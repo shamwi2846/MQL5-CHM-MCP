@@ -649,7 +649,7 @@ function Assert-PreparedPackageManifestShape {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$ManifestPath, [Parameter(Mandatory)][string]$ExpectedFile)
     $manifestFull = Resolve-FullPath -Path $ManifestPath -MustExist -PathType Leaf
-    $manifest = Read-JsonFile -Path $manifestFull -Context 'orphaned portable ZIP sidecar manifest'
+    $manifest = Read-JsonFile -Path $manifestFull -Context 'orphaned portable ZIP sidecar manifest' -RequireObject
     Assert-ExactJsonProperties -Object $manifest -Names @('schema_version','file','bytes','sha256') -Context 'orphaned portable ZIP sidecar manifest'
     if (-not (Test-JsonIntegerValue $manifest.schema_version) -or [int64]$manifest.schema_version -ne 1 -or
         -not ($manifest.file -is [string]) -or [string]$manifest.file -cne $ExpectedFile -or
@@ -716,8 +716,10 @@ function Repair-PackagePreparedOrphans {
         throw 'Incomplete portable payload writes were preserved until package rebuildability is proven.'
     }
     $preparedValid = $true
+    # A malformed recovery record is not proven disposable payload debris.
+    # Keep it (and its paired ZIP) even when a canonical pair is valid.
+    if ($null -ne $preparedManifest) { Assert-PreparedPackageManifestShape -ManifestPath $preparedManifest -ExpectedFile $zipLeaf | Out-Null }
     try {
-        if ($null -ne $preparedManifest) { Assert-PreparedPackageManifestShape -ManifestPath $preparedManifest -ExpectedFile $zipLeaf | Out-Null }
         if ($null -ne $preparedZip) { Assert-PortableZipInternalChecksumClosure -ZipPath $preparedZip | Out-Null }
         if ($null -ne $preparedZip -and $null -ne $preparedManifest) {
             Assert-PackageZipSidecar -ZipPath $preparedZip -ManifestPath $preparedManifest -ExpectedFile $zipLeaf | Out-Null
