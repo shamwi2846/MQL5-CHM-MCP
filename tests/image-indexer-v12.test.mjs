@@ -221,6 +221,45 @@ test("topic parsing records caption provenance, section, and offsets without cha
   }
 });
 
+for (const [name, body, expectedSections, expectedOffsets, expectedContent] of [
+  ["image-only paragraph before a heading", '<h1>First</h1><p>Hello</p><p><img src="a.png"></p><h2>Second</h2><p>Later</p>', [0], [12], "First\nHello\nSecond\nLater"],
+  ["trailing space in normal text", '<h1>First</h1><p>Hello <img src="a.png"></p><h2>Second</h2><p>Later</p>', [0], [11], "First\nHello\nSecond\nLater"],
+  ["trailing spaces in code", '<h1>First</h1><pre>A    <img src="a.png"></pre><h2>Second</h2><p>Later</p>', [0], [7], "First\nA\nSecond\nLater"],
+  ["consecutive zero-width images", '<h1>First</h1><p>Hello</p><p><img src="a.png"><img src="b.png"></p><h2>Second</h2><p>Later</p>', [0, 0], [12, 12], "First\nHello\nSecond\nLater"],
+  ["nested styled heading and its image", '<h1>First</h1><p class="p_H2"><span class="f_H2">Second<img src="a.png"></span></p><p>Later</p>', [1], [12], "First\nSecond\nLater"],
+  ["discarded multiline heading", '<h1>First</h1><h2>Discarded<br>heading <img src="a.png"></h2><h2>Second</h2><p>Later</p>', [0], [23], "First\nDiscarded\nheading\nSecond\nLater"],
+  ["duplicate heading", '<h1>First</h1><h2>First</h2><img src="a.png"><h2>Second</h2><p>Later</p>', [0], [12], "First\nFirst\nSecond\nLater"],
+  ["document boundaries", '<img src="a.png"><h1>First</h1><p>Hello</p><h2>Second</h2><p>Later</p><img src="b.png">', [0, 1], [0, 24], "First\nHello\nSecond\nLater"],
+  ["heading-free topic", '<img src="a.png"><p>Hello <img src="b.png"></p>', [0, 0], [0, 5], "Hello"],
+  ["supplementary Unicode and trimmed code", '<h1>😀 First</h1><pre>😀    <img src="a.png"></pre><h2>Next</h2><p>Later</p>', [0], [11], "😀 First\n😀\nNext\nLater"],
+]) {
+  test(`image DOM association preserves text and real offsets: ${name}`, () => {
+    const html = `<title>Fixture</title><div id="help">${body}</div>`;
+    const options = { source: "mql5", internalPath: "fixture.htm" };
+    const topic = parseHtmlTopic(html, options);
+    const textOnly = parseHtmlTopic(html.replace(/<img\b[^>]*>/gu, ""), options);
+    assert.equal(topic.content, expectedContent);
+    assert.equal(topic.contentSha256, textOnly.contentSha256);
+    assert.deepEqual(topic.sections, textOnly.sections);
+    assert.deepEqual(topic.imageReferences.map((image) => image.sectionOrdinal), expectedSections);
+    assert.deepEqual(topic.imageReferences.map((image) => image.textOffset), expectedOffsets);
+  });
+}
+
+test("genuine CButton excerpt assigns ControlsButton to inheritance, preserving the boundary offset", async () => {
+  const bytes = await readFile(new URL("./fixtures/cbutton-image-boundary.htm", import.meta.url));
+  const provenance = JSON.parse(await readFile(new URL("./fixtures/cbutton-image-boundary.provenance.json", import.meta.url), "utf8"));
+  assert.equal(createHash("sha256").update(bytes).digest("hex"), provenance.fixture_sha256);
+  const topic = parseHtmlTopic(bytes.toString("utf8"), { source: "mql5", internalPath: "cbutton.htm" });
+  assert.equal(topic.sections[4].heading, "Inheritance hierarchy");
+  assert.equal(topic.sections[5].heading, "Class Methods by Groups");
+  assert.equal(topic.imageReferences.length, 1);
+  assert.equal(topic.imageReferences[0].altText, "ControlsButton");
+  assert.equal(topic.imageReferences[0].sectionOrdinal, 4);
+  assert.equal(topic.imageReferences[0].textOffset, 327);
+  assert.equal(topic.imageReferences[0].textOffset, topic.sections[5].startOffset);
+});
+
 test("caption precedence, normalization, and filename fallback are deterministic and bounded", () => {
   const longTitle = `  ${"X".repeat(520)}\tignored  `;
   const topic = parseHtmlTopic(`<div id="help"><h1>Captions</h1>

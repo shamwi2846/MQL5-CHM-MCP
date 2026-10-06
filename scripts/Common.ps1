@@ -14,8 +14,8 @@ $script:PinnedSevenZipLicenseSha256 = '519ac0a4bded9c18ea02e0afb71f663d8c47373bd
 $script:ManifestSchemaVersion = 3
 $script:LegacyManifestSchemaVersion = 2
 $script:ActivePointerSchemaVersion = 2
-$script:IndexContract = 'mql5-chm-index-v3-assets-v3'
-$script:SupportedIndexContracts = @('mql5-chm-index-v3-assets-v1','mql5-chm-index-v3-assets-v2','mql5-chm-index-v3-assets-v3')
+$script:IndexContract = 'mql5-chm-index-v3-assets-v4'
+$script:SupportedIndexContracts = @('mql5-chm-index-v3-assets-v1','mql5-chm-index-v3-assets-v2','mql5-chm-index-v3-assets-v3','mql5-chm-index-v3-assets-v4')
 $script:ExpectedTotalTopics = 4827
 $script:MaximumStatusMessageChars = 500
 
@@ -1730,7 +1730,7 @@ function Invoke-BoundedNodeJsDownload {
     $client = New-Object Net.Http.HttpClient($handler, $true)
     $client.Timeout = [Threading.Timeout]::InfiniteTimeSpan
     $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Get, $Uri)
-    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.3.2')
+    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.3.3')
     $response = $null
     $stream = $null
     $deadline = New-Object Threading.CancellationTokenSource([TimeSpan]::FromSeconds($TimeoutSeconds))
@@ -4534,7 +4534,7 @@ function Invoke-OfficialChmDownload {
             try {
                 if ($null -eq $InternalTestHooks) {
                     $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Get, $current)
-                    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp/1.3.2')
+                    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp/1.3.3')
                     try {
                         $httpResponse = $client.SendAsync(
                             $request,

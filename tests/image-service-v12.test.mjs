@@ -7,6 +7,21 @@ import { createSearchService, encodeImageCursor } from "../src/search-service.mj
 
 import { buildFixture, sha256, PNG } from "./helpers/runtime-fixture.mjs";
 
+for (const version of [1, 2, 3, 4]) {
+  test(`schema-3 runtime opens image contract v${version} for current use or rollback`, async () => {
+    const fixture = await buildFixture({ indexContract: `mql5-chm-index-v3-assets-v${version}` });
+    let service;
+    try {
+      service = await createSearchService({ root: fixture.root });
+      assert.equal(service.status().index_revision, fixture.databaseHash);
+      assert.equal(service.readImage({ asset_id: fixture.assets[0].assetId }).metadata.sha256, sha256(PNG));
+    } finally {
+      service?.close();
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+}
+
 test("schema-3 service validates assets and serves bounded metadata then one verified image", async () => {
   const fixture = await buildFixture();
   let service;

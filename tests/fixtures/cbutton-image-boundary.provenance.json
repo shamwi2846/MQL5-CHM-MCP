@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "source": "mql5",
+  "source_file": "mql5.chm",
+  "source_sha256": "b6b3338a985e1efedc2c87fa478f648d7de53e1daa6d2a8a9e5359b8878e23fa",
+  "internal_path": "cbutton.htm",
+  "original_html_sha256": "7ca183ff9e8abef1641cdc2ab6e5505c6861da590171f52b11515704eeff7259",
+  "original_lines": [
+    47,
+    80
+  ],
+  "fixture_sha256": "ec2e4303ac3b89ed0529e440db2026b3bd680909a537bca74e8a9ddfe00b962c",
+  "transformation": "Unmodified native HTML lines 47 through 80, enclosed in a minimal document and div#help; the image remains an external reference. Full-corpus tests use the original HTML and original image bytes.",
+  "expected_section_id": "mql5:2aa5ef52b8cdbcc34818dad8:s004",
+  "image_internal_path": "controlsbutton.png",
+  "expected_asset_id": "mql5:asset:d14a48c98078df9ad0edb943"
+}

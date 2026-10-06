@@ -636,10 +636,13 @@ try {
         if (-not $Condition) { throw $Message }
     }
 
-    Assert-Fixture -Condition ($script:IndexContract -ceq 'mql5-chm-index-v3-assets-v3') -Message 'The current schema-3 index contract is not v3.'
+    Assert-Fixture -Condition ($script:IndexContract -ceq 'mql5-chm-index-v3-assets-v4') -Message 'The current schema-3 index contract is not v4.'
     Assert-IndexContract -Contract 'mql5-chm-index-v3-assets-v1'
     Assert-IndexContract -Contract 'mql5-chm-index-v3-assets-v2'
-    Assert-IndexContract -Contract 'mql5-chm-index-v3-assets-v3' -RequireCurrent
+    Assert-IndexContract -Contract 'mql5-chm-index-v3-assets-v3'
+    Assert-IndexContract -Contract 'mql5-chm-index-v3-assets-v4' -RequireCurrent
+    $headingContractRejected=$false;try{Assert-IndexContract -Contract 'mql5-chm-index-v3-assets-v3' -RequireCurrent}catch{$headingContractRejected=$true}
+    Assert-Fixture -Condition $headingContractRejected -Message 'RequireCurrent accepted the rollback-only schema-3 v3 contract.'
     $legacyCurrentContractRejected=$false;try{Assert-IndexContract -Contract 'mql5-chm-index-v3-assets-v1' -RequireCurrent}catch{$legacyCurrentContractRejected=$true}
     Assert-Fixture -Condition $legacyCurrentContractRejected -Message 'RequireCurrent accepted the rollback-only schema-3 v1 contract.'
     $previousCurrentContractRejected=$false;try{Assert-IndexContract -Contract 'mql5-chm-index-v3-assets-v2' -RequireCurrent}catch{$previousCurrentContractRejected=$true}

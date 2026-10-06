@@ -12676,7 +12676,7 @@ var load = getLoad(getParse(parseDocument), esm_default);
 var import_iconv_lite = __toESM(require_lib(), 1);
 var import_jpeg_js = __toESM(require_jpeg_js(), 1);
 var SCHEMA_VERSION = 3;
-var INDEX_CONTRACT = "mql5-chm-index-v3-assets-v3";
+var INDEX_CONTRACT = "mql5-chm-index-v3-assets-v4";
 var ASSET_ID_PATTERN = /^(?:mql5|mql5book|neuronetworksbook):asset:[0-9a-f]{24}$/u;
 var DEFAULT_IMAGE_POLICY_RELATIVE_PATH = path.join("config", "mql5-image-policy.json");
 var SOURCE_DEFINITIONS = Object.freeze([
@@ -13354,8 +13354,17 @@ function renderHelpContentDetailed($, rootNode) {
   let output = "";
   const imageEvents = [];
   const headingEvents = [];
+  let nextDomOrder = 0;
   const newline = () => {
-    output = output.replace(/[ \t]+$/u, "");
+    const trimmed = output.replace(/[ \t]+$/u, "");
+    if (trimmed.length < output.length) {
+      for (const event of imageEvents) event.rawOffset = Math.min(event.rawOffset, trimmed.length);
+      for (const event of headingEvents) {
+        event.rawOffset = Math.min(event.rawOffset, trimmed.length);
+        event.rawEndOffset = Math.min(event.rawEndOffset, trimmed.length);
+      }
+      output = trimmed;
+    }
     if (output && !output.endsWith("\n")) output += "\n";
   };
   const appendNormal = (value) => {
@@ -13384,7 +13393,7 @@ function renderHelpContentDetailed($, rootNode) {
     const tag = elementName(current);
     if (SKIPPED_ELEMENTS.has(tag)) return;
     if (tag === "img") {
-      imageEvents.push({ element: current, rawOffset: output.length });
+      imageEvents.push({ element: current, rawOffset: output.length, domOrder: nextDomOrder++ });
       return;
     }
     if (tag === "br") {
@@ -13402,7 +13411,7 @@ function renderHelpContentDetailed($, rootNode) {
     const heading = headingTextForElement($, current, node);
     let headingEvent;
     if (heading && headingEvents.at(-1)?.heading !== heading) {
-      headingEvent = { heading, rawOffset: output.length, rawEndOffset: output.length };
+      headingEvent = { heading, rawOffset: output.length, rawEndOffset: output.length, domOrder: nextDomOrder++ };
       headingEvents.push(headingEvent);
     }
     if (tag === "li") appendNormal("- ");
@@ -13427,12 +13436,12 @@ function renderHelpContentDetailed($, rootNode) {
   const headingEndOffsetIndex = headingStartOffsetIndex + headingEvents.length;
   return {
     content: normalized.content,
-    images: imageEvents.map((event, index2) => ({ element: event.element, textOffset: normalized.offsets[index2] })),
+    images: imageEvents.map((event, index2) => ({ element: event.element, textOffset: normalized.offsets[index2], domOrder: event.domOrder })),
     headings: headingEvents.flatMap((event, index2) => {
       const startOffset = normalized.offsets[headingStartOffsetIndex + index2];
       const endOffset = normalized.offsets[headingEndOffsetIndex + index2];
       if (normalized.content.slice(startOffset, endOffset).trim() !== event.heading) return [];
-      return [{ heading: event.heading, startOffset }];
+      return [{ heading: event.heading, startOffset, domOrder: event.domOrder }];
     })
   };
 }
@@ -13829,7 +13838,13 @@ function extractImageReferences($, helpRoot, sourceInternalPath, sections, {
   const rootNode = helpRoot?.cheerio ? helpRoot.get(0) : helpRoot;
   const rendered = renderedHelp ?? renderHelpContentDetailed($, rootNode);
   const meaningless = new Set(meaninglessCaptions.map((value) => normalizeText(value)).filter(Boolean));
-  return rendered.images.map(({ element, textOffset }, occurrenceOrdinal) => {
+  const retainedHeadings = sections.flatMap((section) => {
+    const heading = rendered.headings.find(
+      (event) => event.startOffset === section.startOffset && event.heading === section.heading
+    );
+    return heading ? [{ domOrder: heading.domOrder, section }] : [];
+  });
+  return rendered.images.map(({ element, textOffset, domOrder }, occurrenceOrdinal) => {
     const image = $(element);
     const rawReference = String(image.attr("src") ?? "");
     const resolvedInternalPath = resolveInternalAssetPath(sourceInternalPath, rawReference);
@@ -13855,9 +13870,7 @@ function extractImageReferences($, helpRoot, sourceInternalPath, sections, {
         break;
       }
     }
-    const section = sections.find(
-      (candidate) => textOffset >= candidate.startOffset && textOffset < candidate.endOffset
-    ) ?? sections.at(-1);
+    const section = retainedHeadings.findLast((heading) => heading.domOrder < domOrder)?.section ?? sections[0];
     const presentationOnly = presentationAncestorSelectors.some((selector) => {
       try {
         return image.closest(selector).length > 0;
@@ -14053,7 +14066,7 @@ async function assertPreparedOutputDirectory(outputDirectory, sourceFilenames) {
   } catch (error) {
     throw new Error(`Output directory has an unreadable ownership manifest: ${error.message}`);
   }
-  if (Number(manifest?.schema_version) !== SCHEMA_VERSION || !["mql5-chm-index-v3-assets-v1", "mql5-chm-index-v3-assets-v2", INDEX_CONTRACT].includes(manifest?.index_contract) || manifest?.database?.filename !== "mql5-docs.sqlite" || manifest?.assets?.directory !== "assets") {
+  if (Number(manifest?.schema_version) !== SCHEMA_VERSION || !["mql5-chm-index-v3-assets-v1", "mql5-chm-index-v3-assets-v2", "mql5-chm-index-v3-assets-v3", INDEX_CONTRACT].includes(manifest?.index_contract) || manifest?.database?.filename !== "mql5-docs.sqlite" || manifest?.assets?.directory !== "assets") {
     throw new Error("Output directory manifest does not identify a compatible owned index build.");
   }
   const databaseInfo = await stat(databasePath);

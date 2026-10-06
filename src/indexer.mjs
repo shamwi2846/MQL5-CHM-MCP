@@ -32,7 +32,7 @@ import iconv from "iconv-lite";
 import jpeg from "jpeg-js";
 
 export const SCHEMA_VERSION = 3;
-export const INDEX_CONTRACT = "mql5-chm-index-v3-assets-v3";
+export const INDEX_CONTRACT = "mql5-chm-index-v3-assets-v4";
 export const ASSET_ID_PATTERN = /^(?:mql5|mql5book|neuronetworksbook):asset:[0-9a-f]{24}$/u;
 
 const DEFAULT_IMAGE_POLICY_RELATIVE_PATH = path.join("config", "mql5-image-policy.json");
@@ -802,9 +802,20 @@ export function renderHelpContentDetailed($, rootNode) {
   let output = "";
   const imageEvents = [];
   const headingEvents = [];
+  let nextDomOrder = 0;
 
   const newline = () => {
-    output = output.replace(/[ \t]+$/u, "");
+    const trimmed = output.replace(/[ \t]+$/u, "");
+    if (trimmed.length < output.length) {
+      // These positions describe the mutable buffer, before the final offset
+      // normalization. A zero-width image can sit inside the removed suffix.
+      for (const event of imageEvents) event.rawOffset = Math.min(event.rawOffset, trimmed.length);
+      for (const event of headingEvents) {
+        event.rawOffset = Math.min(event.rawOffset, trimmed.length);
+        event.rawEndOffset = Math.min(event.rawEndOffset, trimmed.length);
+      }
+      output = trimmed;
+    }
     if (output && !output.endsWith("\n")) output += "\n";
   };
 
@@ -844,7 +855,7 @@ export function renderHelpContentDetailed($, rootNode) {
     const tag = elementName(current);
     if (SKIPPED_ELEMENTS.has(tag)) return;
     if (tag === "img") {
-      imageEvents.push({ element: current, rawOffset: output.length });
+      imageEvents.push({ element: current, rawOffset: output.length, domOrder: nextDomOrder++ });
       return;
     }
     if (tag === "br") {
@@ -863,7 +874,7 @@ export function renderHelpContentDetailed($, rootNode) {
     const heading = headingTextForElement($, current, node);
     let headingEvent;
     if (heading && headingEvents.at(-1)?.heading !== heading) {
-      headingEvent = { heading, rawOffset: output.length, rawEndOffset: output.length };
+      headingEvent = { heading, rawOffset: output.length, rawEndOffset: output.length, domOrder: nextDomOrder++ };
       headingEvents.push(headingEvent);
     }
     if (tag === "li") appendNormal("- ");
@@ -891,7 +902,7 @@ export function renderHelpContentDetailed($, rootNode) {
   const headingEndOffsetIndex = headingStartOffsetIndex + headingEvents.length;
   return {
     content: normalized.content,
-    images: imageEvents.map((event, index) => ({ element: event.element, textOffset: normalized.offsets[index] })),
+    images: imageEvents.map((event, index) => ({ element: event.element, textOffset: normalized.offsets[index], domOrder: event.domOrder })),
     headings: headingEvents.flatMap((event, index) => {
       const startOffset = normalized.offsets[headingStartOffsetIndex + index];
       const endOffset = normalized.offsets[headingEndOffsetIndex + index];
@@ -899,7 +910,7 @@ export function renderHelpContentDetailed($, rootNode) {
       // node text contains structural line breaks were never section anchors.
       // Eligible starts still come exclusively from the actual DOM node.
       if (normalized.content.slice(startOffset, endOffset).trim() !== event.heading) return [];
-      return [{ heading: event.heading, startOffset }];
+      return [{ heading: event.heading, startOffset, domOrder: event.domOrder }];
     }),
   };
 }
@@ -1384,7 +1395,16 @@ export function extractImageReferences($, helpRoot, sourceInternalPath, sections
   const rootNode = helpRoot?.cheerio ? helpRoot.get(0) : helpRoot;
   const rendered = renderedHelp ?? renderHelpContentDetailed($, rootNode);
   const meaningless = new Set(meaninglessCaptions.map((value) => normalizeText(value)).filter(Boolean));
-  return rendered.images.map(({ element, textOffset }, occurrenceOrdinal) => {
+  // Bind only the headings that survived section selection. In particular, an
+  // image-only block can share the following heading's text offset while still
+  // preceding that heading in the DOM. Offsets remain real buffer positions.
+  const retainedHeadings = sections.flatMap((section) => {
+    const heading = rendered.headings.find((event) =>
+      event.startOffset === section.startOffset && event.heading === section.heading,
+    );
+    return heading ? [{ domOrder: heading.domOrder, section }] : [];
+  });
+  return rendered.images.map(({ element, textOffset, domOrder }, occurrenceOrdinal) => {
     const image = $(element);
     const rawReference = String(image.attr("src") ?? "");
     const resolvedInternalPath = resolveInternalAssetPath(sourceInternalPath, rawReference);
@@ -1410,9 +1430,7 @@ export function extractImageReferences($, helpRoot, sourceInternalPath, sections
         break;
       }
     }
-    const section = sections.find((candidate) =>
-      textOffset >= candidate.startOffset && textOffset < candidate.endOffset,
-    ) ?? sections.at(-1);
+    const section = retainedHeadings.findLast((heading) => heading.domOrder < domOrder)?.section ?? sections[0];
     const presentationOnly = presentationAncestorSelectors.some((selector) => {
       try {
         return image.closest(selector).length > 0;
@@ -1637,7 +1655,7 @@ async function assertPreparedOutputDirectory(outputDirectory, sourceFilenames) {
   }
   if (
     Number(manifest?.schema_version) !== SCHEMA_VERSION ||
-    !["mql5-chm-index-v3-assets-v1", "mql5-chm-index-v3-assets-v2", INDEX_CONTRACT].includes(manifest?.index_contract) ||
+    !["mql5-chm-index-v3-assets-v1", "mql5-chm-index-v3-assets-v2", "mql5-chm-index-v3-assets-v3", INDEX_CONTRACT].includes(manifest?.index_contract) ||
     manifest?.database?.filename !== "mql5-docs.sqlite" ||
     manifest?.assets?.directory !== "assets"
   ) {

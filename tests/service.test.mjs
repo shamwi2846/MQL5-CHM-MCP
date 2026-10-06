@@ -6,6 +6,7 @@ import test, { after, before } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import * as searchServiceModule from "../src/search-service.mjs";
+import { parseHtmlTopic } from "../src/indexer.mjs";
 
 const { SUPPORTED_INDEX_CONTRACT, createSearchService, encodeCursor } = searchServiceModule;
 
@@ -34,7 +35,8 @@ test("exact API names rank the MQL5 reference first", () => {
 });
 
 test("runtime accepts the current and rollback-compatible schema-3 index contracts", () => {
-  assert.equal(SUPPORTED_INDEX_CONTRACT, "mql5-chm-index-v3-assets-v3");
+  assert.equal(SUPPORTED_INDEX_CONTRACT, "mql5-chm-index-v3-assets-v4");
+  assert.equal(searchServiceModule.isSupportedIndexContract("mql5-chm-index-v3-assets-v3"), true);
   assert.equal(searchServiceModule.isSupportedIndexContract("mql5-chm-index-v3-assets-v2"), true);
   assert.equal(searchServiceModule.isSupportedIndexContract("mql5-chm-index-v3-assets-v1"), true);
   assert.equal(searchServiceModule.isSupportedIndexContract("mql5-chm-index-v3-assets-v999"), false);
@@ -225,6 +227,53 @@ test("read supports focus and opaque continuation", () => {
     () => service.read({ topic_id: missingTopicId, cursor: staleCursor, max_chars: 500 }),
     (error) => error?.code === "INVALID_CURSOR" && /different index revision/i.test(error.message),
   );
+});
+
+test("CButton image associations survive section reads, focus, image retrieval, and pagination", async () => {
+  const topicId = "mql5:2aa5ef52b8cdbcc34818dad8";
+  const sectionId = `${topicId}:s004`;
+  const assetId = "mql5:asset:d14a48c98078df9ad0edb943";
+  const provenance = JSON.parse(await readFile(new URL("./fixtures/cbutton-image-boundary.provenance.json", import.meta.url), "utf8"));
+  const html = await readFile(path.join(root, "build", "extracted", "mql5", "cbutton.htm"));
+  assert.equal(createHash("sha256").update(html).digest("hex"), provenance.original_html_sha256);
+  const parsed = parseHtmlTopic(html.toString("utf8"), { source: "mql5", internalPath: "cbutton.htm" });
+  assert.equal(parsed.imageReferences[0].sectionOrdinal, 4);
+  assert.equal(parsed.imageReferences[0].textOffset, 327);
+  const row = service.database.prepare(
+    "SELECT section_id,text_offset FROM topic_assets WHERE topic_id=? AND asset_id=?",
+  ).get(topicId, assetId);
+  assert.equal(row.section_id, sectionId);
+  assert.equal(row.text_offset, 327);
+  assert.equal(service.database.prepare("SELECT start_offset FROM sections WHERE section_id=?").get(`${topicId}:s005`).start_offset, 327);
+  const section = service.read({ topic_id: topicId, section_id: sectionId, max_chars: 500, image_limit: 1 });
+  assert.equal(section.image_count, 1);
+  assert.equal(section.images[0].asset_id, assetId);
+  assert.equal(section.images[0].citation.section_id, sectionId);
+  assert.equal(section.next_image_cursor, null);
+  const following = service.read({ topic_id: topicId, section_id: `${topicId}:s005`, max_chars: 500 });
+  assert.equal(following.image_count, 0);
+  const focused = service.read({ topic_id: topicId, focus: "Inheritance hierarchy", max_chars: 500 });
+  assert.equal(focused.section_id, sectionId);
+  assert.equal(focused.images[0].asset_id, assetId);
+  assert.equal(focused.images[0].citation.section_id, sectionId);
+  const image = service.readImage({ asset_id: assetId });
+  assert.equal(image.metadata.primary_topic_citation.section_id, sectionId);
+  assert.equal(image.metadata.bytes, 8719);
+  assert.equal(createHash("sha256").update(Buffer.from(image.data, "base64")).digest("hex"), image.metadata.sha256);
+  const originalImage = await readFile(path.join(root, "build", "extracted", "mql5", "controlsbutton.png"));
+  assert.deepEqual(Buffer.from(image.data, "base64"), originalImage);
+  let page = service.read({ topic_id: topicId, max_chars: 500, image_limit: 1 });
+  const seen = new Set();
+  for (let count = 0; ; count += 1) {
+    assert.ok(count < 30, "CButton text pagination did not terminate");
+    for (const reference of page.images) {
+      seen.add(reference.asset_id);
+      if (reference.asset_id === assetId) assert.equal(reference.citation.section_id, sectionId);
+    }
+    if (!page.next_cursor) break;
+    page = service.read({ topic_id: topicId, cursor: page.next_cursor, max_chars: 500, image_limit: 1 });
+  }
+  assert.ok(seen.has(assetId));
 });
 
 test("read supports focus on API names and aliases without selecting unrelated sections", () => {

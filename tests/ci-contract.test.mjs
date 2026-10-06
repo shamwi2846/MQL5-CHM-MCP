@@ -271,10 +271,10 @@ test("release version remains consistent across package, runtime, documentation,
     ],
     [
       "SPEC.md",
-      `v${version} emits \`mql5-chm-index-v3-assets-v3\``,
+      `v${version} emits \`mql5-chm-index-v3-assets-v4\``,
       releaseIdentityPattern(
         String.raw`\bv`,
-        "\\s+emits\\s+`mql5-chm-index-v3-assets-v3`",
+        "\\s+emits\\s+`mql5-chm-index-v3-assets-v4`",
       ),
     ],
     [
@@ -560,6 +560,20 @@ test("release validation rejects a prior-release corpus stale for the current so
 
   const packageScript = await text("scripts/Package-Portable.ps1");
   assert.match(packageScript, /Assert-Revision[^\r\n]*-RequireCurrentPolicy/gu);
+});
+
+test("release validation verifies older corpus evidence before rebuilding and enforcing the current contract", async () => {
+  const workflow = await text(".github/workflows/release-validation.yml");
+  const restored = workflow.indexOf("$restored = Assert-ManifestAndCorpus");
+  const build = workflow.indexOf("npm run build", restored);
+  const stage = workflow.indexOf("Rebuild-Index.ps1 -Stage", build);
+  const apply = workflow.indexOf("Rebuild-Index.ps1 -Apply", stage);
+  const current = workflow.indexOf("Assert-ManifestAndCorpus -ProjectRoot $PWD.Path -RequireCurrent ", apply);
+  assert.ok(restored >= 0 && build > restored && stage > build && apply > stage && current > apply);
+  const restoreGate = workflow.slice(restored, workflow.indexOf("\n", restored));
+  assert.match(restoreGate, /-RequireCurrentSources.*-RequireCurrentPolicy/u);
+  assert.doesNotMatch(restoreGate, /-RequireCurrent(?:\s|$)/u);
+  assert.match(workflow.slice(stage, current), /Assert-Revision.*-RequireCurrent /u);
 });
 
 test("release validation treats a downloaded release as corpus data, never executable runtime", async () => {

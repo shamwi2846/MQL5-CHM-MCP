@@ -470,6 +470,7 @@ exit /b 7
     Assert-RepairFixture -Condition (-not (Assert-DeterministicRebuildResult -BaseRevision $base -CandidateRevision (New-RebuildFixture -CorpusRevision ('f' * 64)))) -Message 'A corpus change was incorrectly treated as deterministic drift.'
     Assert-RepairFixture -Condition (-not (Assert-DeterministicRebuildResult -BaseRevision $base -CandidateRevision (New-RebuildFixture -Policy $policyB))) -Message 'A policy change was incorrectly treated as deterministic drift.'
     Assert-RepairFixture -Condition (-not (Assert-DeterministicRebuildResult -BaseRevision (New-RebuildFixture -Contract 'mql5-chm-index-v3-assets-v1') -CandidateRevision (New-RebuildFixture))) -Message 'A contract upgrade was incorrectly treated as deterministic drift.'
+    Assert-RepairFixture -Condition (-not (Assert-DeterministicRebuildResult -BaseRevision (New-RebuildFixture -Contract 'mql5-chm-index-v3-assets-v3') -CandidateRevision (New-RebuildFixture))) -Message 'The v3-to-v4 contract upgrade was incorrectly treated as deterministic drift.'
     Assert-RepairFixture -Condition (-not (Assert-DeterministicRebuildResult -BaseRevision (New-RebuildFixture -SchemaVersion $script:LegacyManifestSchemaVersion) -CandidateRevision (New-RebuildFixture))) -Message 'A schema upgrade was incorrectly treated as deterministic drift.'
 
     $activationBase = [pscustomobject]@{
@@ -628,7 +629,7 @@ exit /b 7
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 $script:ManifestSchemaVersion=3
-$script:IndexContract='mql5-chm-index-v3-assets-v3'
+$script:IndexContract='mql5-chm-index-v3-assets-v4'
 function Resolve-FullPath { param([string]$Path,[switch]$MustExist,[string]$PathType) return [IO.Path]::GetFullPath($Path) }
 function Assert-NoReparsePoint { param([string]$Root,[string]$Path) }
 function Enter-ExclusiveFileLock { param([string]$Path,[string]$IdentityRoot,[int]$TimeoutSeconds) $lease=[pscustomobject]@{};$lease|Add-Member ScriptMethod Dispose {};return $lease }
@@ -639,9 +640,9 @@ function Get-RevisionTransition { param([string]$ProjectRoot,[switch]$AllowMissi
 function Assert-MaintenancePackageIntegrity { param([string]$ProjectRoot,[switch]$AllowPendingTransition) return $true }
 function Get-ActiveRevisionPointer { param([string]$ProjectRoot,[switch]$AllowMissing) return [pscustomobject]@{schema_version=2;active_revision=('a'*64)} }
 function Assert-NoPendingRevisionTransition { param([string]$ProjectRoot) }
-function Assert-ManifestAndCorpus { param([string]$ProjectRoot) return [pscustomobject]@{IndexRevision=('a'*64);CorpusRevision=('c'*64);ManifestSchemaVersion=3;Manifest=[pscustomobject]@{index_contract='mql5-chm-index-v3-assets-v3';assets=[pscustomobject]@{policy_sha256=('d'*64)}}} }
+function Assert-ManifestAndCorpus { param([string]$ProjectRoot) return [pscustomobject]@{IndexRevision=('a'*64);CorpusRevision=('c'*64);ManifestSchemaVersion=3;Manifest=[pscustomobject]@{index_contract='mql5-chm-index-v3-assets-v4';assets=[pscustomobject]@{policy_sha256=('d'*64)}}} }
 function Get-SourceRecordsFromActiveRevision { param([string]$ProjectRoot) return @([pscustomobject]@{Id='fixture'}) }
-function New-RevisionCandidate { param([string]$ProjectRoot,[object[]]$SourceRecords,[string]$WorkingRoot,[int]$ExtractionTimeoutSeconds,[int]$HhTimeoutSeconds) return [pscustomobject]@{IndexRevision=('b'*64);CorpusRevision=('c'*64);ManifestSchemaVersion=3;Manifest=[pscustomobject]@{index_contract='mql5-chm-index-v3-assets-v3';assets=[pscustomobject]@{policy_sha256=('d'*64)}};Inspection=[pscustomobject]@{}} }
+function New-RevisionCandidate { param([string]$ProjectRoot,[object[]]$SourceRecords,[string]$WorkingRoot,[int]$ExtractionTimeoutSeconds,[int]$HhTimeoutSeconds) return [pscustomobject]@{IndexRevision=('b'*64);CorpusRevision=('c'*64);ManifestSchemaVersion=3;Manifest=[pscustomobject]@{index_contract='mql5-chm-index-v3-assets-v4';assets=[pscustomobject]@{policy_sha256=('d'*64)}};Inspection=[pscustomobject]@{}} }
 function Resolve-NodeExecutable { param([string]$ProjectRoot) [IO.File]::AppendAllText((Join-Path $ProjectRoot 'maintenance\update-status.json'),'MUTATED');throw 'determinism gate was bypassed' }
 function Remove-SafeDirectory { param([string]$ConfinementRoot,[string]$Path) }
 '@

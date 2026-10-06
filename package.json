@@ -1,6 +1,6 @@
 {
   "name": "mql5-chm-mcp",
-  "version": "1.3.2",
+  "version": "1.3.3",
   "private": true,
   "type": "module",
   "description": "Portable read-only MCP server for the official local MQL5 CHM corpus.",
@@ -19,7 +19,7 @@
     "test:release:powershell": "pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/Invoke-PowerShellTestSuite.ps1 -Suite Release",
     "test:release:windows-powershell": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File ./scripts/Invoke-PowerShellTestSuite.ps1 -Suite Release",
     "test:prepare-corpus": "pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/Prepare-CorpusTestFixtures.ps1",
-    "test:corpus": "node --test --test-concurrency=1 --test-name-pattern=\"^(the one official trailing-PNG exception|signature extraction returns only|signature extraction trusts|exact API names rank|runtime accepts|topic content validation|source filters|v1\\.1 expansions|status and related|raw FTS|read supports focus|service handlers|database is read-only|portable stdio MCP)\" tests/image-indexer-v12.test.mjs tests/indexer-v11.test.mjs tests/service.test.mjs tests/mcp.test.mjs",
+    "test:corpus": "node --test --test-concurrency=1 --test-name-pattern=\"^(the one official trailing-PNG exception|signature extraction returns only|signature extraction trusts|exact API names rank|runtime accepts|topic content validation|source filters|v1\\.1 expansions|status and related|raw FTS|read supports focus|service handlers|database is read-only|CButton image associations|portable stdio MCP)\" tests/image-indexer-v12.test.mjs tests/indexer-v11.test.mjs tests/service.test.mjs tests/mcp.test.mjs",
     "test:release": "npm run test:fast && npm run test:release:powershell && npm run test:release:windows-powershell && npm run test:prepare-corpus && npm run test:corpus && npm run test:app-mcp",
     "rebuild-index": "powershell -NoProfile -ExecutionPolicy Bypass -File ./Rebuild-Index.ps1",
     "check-updates": "powershell -NoProfile -ExecutionPolicy Bypass -File ./Check-DocumentationUpdates.ps1",

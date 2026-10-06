@@ -202,7 +202,7 @@ test("schema v3 keeps deterministic source identity and adds the image catalog",
     database.close();
   }
   assert.equal(SCHEMA_VERSION, 3);
-  assert.equal(INDEX_CONTRACT, "mql5-chm-index-v3-assets-v3");
+  assert.equal(INDEX_CONTRACT, "mql5-chm-index-v3-assets-v4");
 });
 
 test("topic schema stores JavaScript UTF-16 content lengths for supplementary Unicode", () => {

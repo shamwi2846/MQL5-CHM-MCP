@@ -135,6 +135,21 @@ jobs:
         shell: pwsh
         run: |
           . .\scripts\Common.ps1
+          # Verify the restored evidence before running the trusted current
+          # indexer. Older supported contracts are rollback-compatible inputs.
+          $restored = Assert-ManifestAndCorpus -ProjectRoot $PWD.Path -RequireCurrentSources -RequireCurrentPolicy
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'Current application bundle build failed.' }
+          & .\scripts\Rebuild-Index.ps1 -Stage -ProjectRoot $PWD.Path
+          if ([string]$restored.Manifest.index_contract -cne $script:IndexContract) {
+              $status = Get-UpdateStatus -ProjectRoot $PWD.Path
+              $candidate = [string]$status.candidate_revision
+              if ($candidate -cnotmatch '^[0-9a-f]{64}$' -or $candidate -ceq [string]$restored.IndexRevision) {
+                  throw 'The current indexer did not stage a distinct contract-upgrade candidate.'
+              }
+              Assert-Revision -ProjectRoot $PWD.Path -Revision $candidate -IdentityMode Index -RequireCurrent -RequireCurrentSources -RequireCurrentPolicy | Out-Null
+              & .\scripts\Rebuild-Index.ps1 -Apply -ProjectRoot $PWD.Path -Revision $candidate
+          }
           Assert-ManifestAndCorpus -ProjectRoot $PWD.Path -RequireCurrent -RequireCurrentSources -RequireCurrentPolicy | Out-Null
 
       - name: Run full release suite under PowerShell 7 and Windows PowerShell 5.1

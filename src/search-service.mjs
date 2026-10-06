@@ -26,10 +26,12 @@ var LEGACY_SCHEMA_VERSION = 2;
 var IMAGE_SCHEMA_VERSION = 3;
 var LEGACY_INDEX_CONTRACT = "mql5-chm-index-v3-assets-v1";
 var PREVIOUS_INDEX_CONTRACT = "mql5-chm-index-v3-assets-v2";
-export const SUPPORTED_INDEX_CONTRACT = "mql5-chm-index-v3-assets-v3";
+var PREVIOUS_HEADING_INDEX_CONTRACT = "mql5-chm-index-v3-assets-v3";
+export const SUPPORTED_INDEX_CONTRACT = "mql5-chm-index-v3-assets-v4";
 var ACCEPTED_INDEX_CONTRACTS = /* @__PURE__ */ new Set([
   LEGACY_INDEX_CONTRACT,
   PREVIOUS_INDEX_CONTRACT,
+  PREVIOUS_HEADING_INDEX_CONTRACT,
   SUPPORTED_INDEX_CONTRACT
 ]);
 var CURSOR_DOMAIN = "mql5-chm-read-cursor-v2\0";
