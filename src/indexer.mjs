@@ -26,6 +26,7 @@ import { fileURLToPath } from "node:url";
 import { inflateSync } from "node:zlib";
 import { validatePngScanlines } from "./png-scanlines.mjs";
 import { createPngTransparencyValidator } from "./png-transparency.mjs";
+import { hasGifHeader, readPngChunkType } from "./raster-identifiers.mjs";
 
 // The slim entry point is sufficient for already-decoded strings and avoids
 // Cheerio's stream/encoding-sniffer dependency in the portable ESM bundle.
@@ -398,8 +399,7 @@ function inspectPng(bytes, limits = {}) {
     const chunkEnd = dataEnd + 4;
     if (chunkEnd > bytes.length) throw new Error("Truncated PNG chunk data.");
     const typeBytes = bytes.subarray(offset + 4, offset + 8);
-    const type = typeBytes.toString("ascii");
-    if (!/^[A-Za-z]{4}$/u.test(type)) throw new Error("Malformed PNG chunk type.");
+    const type = readPngChunkType(typeBytes);
     if (!/[A-Z]/u.test(type[2])) throw new Error("PNG chunk type uses a reserved lowercase bit.");
     const expectedCrc = bytes.readUInt32BE(dataEnd);
     const actualCrc = crc32(bytes.subarray(offset + 4, dataEnd));
@@ -579,7 +579,7 @@ function inspectJpeg(bytes, limits = {}) {
 }
 
 function inspectGif(bytes) {
-  if (bytes.length < 13 || !["GIF87a", "GIF89a"].includes(bytes.subarray(0, 6).toString("ascii"))) {
+  if (bytes.length < 13 || !hasGifHeader(bytes)) {
     throw new Error("Malformed GIF signature or header.");
   }
   const width = bytes.readUInt16LE(6);
@@ -646,7 +646,7 @@ export function inspectRasterAsset(buffer, internalPath, limits = {}) {
     if (extension !== ".jpg" && extension !== ".jpeg") {
       throw new Error("Image extension/signature mismatch: expected .jpg or .jpeg.");
     }
-  } else if (bytes.length >= 6 && ["GIF87a", "GIF89a"].includes(bytes.subarray(0, 6).toString("ascii"))) {
+  } else if (hasGifHeader(bytes)) {
     inspected = inspectGif(bytes);
     if (extension !== ".gif") throw new Error("Image extension/signature mismatch: expected .gif.");
   } else {

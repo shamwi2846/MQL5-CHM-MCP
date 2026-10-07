@@ -196,17 +196,23 @@ async function runReleaseVersionCheck({
   rootLockVersion = lockVersion,
   refType = "tag",
   refName = `v${packageVersion}`,
+  packageRoot = value => value,
+  lockRoot = value => value,
+  packageText,
+  lockText,
+  missingFile,
 } = {}) {
   const fixture = await mkdtemp(path.join(tmpdir(), "mql5-chm-release-version-"));
   const packageJson = path.join(fixture, "package.json");
   const packageLock = path.join(fixture, "package-lock.json");
-  await writeFile(packageJson, `${JSON.stringify({ name: "fixture", version: packageVersion })}\n`, "utf8");
-  await writeFile(packageLock, `${JSON.stringify({
+  await writeFile(packageJson, packageText ?? `${JSON.stringify(packageRoot({ name: "fixture", version: packageVersion }))}\n`, "utf8");
+  await writeFile(packageLock, lockText ?? `${JSON.stringify(lockRoot({
     name: "fixture",
     version: lockVersion,
     lockfileVersion: 3,
     packages: { "": { name: "fixture", version: rootLockVersion } },
-  })}\n`, "utf8");
+  }))}\n`, "utf8");
+  if (missingFile) await rm(path.join(fixture, missingFile));
   try {
     return spawnSync(
       "pwsh",
@@ -544,6 +550,42 @@ test("release validation binds tag and lockfile versions before downloading a co
     refName: "definitely-wrong",
   });
   assert.notEqual(mixedCaseRefType.status, 0, "release identity bypassed tag binding for mixed-case ref type");
+});
+
+test("release identity rejects serialized non-object roots before pipeline enumeration", async () => {
+  const invalidRoots = [
+    ["singleton array", value => [value]], ["multiple array", value => [value, value]],
+    ["empty array", () => []], ["string", () => "fixture"], ["number", () => 1],
+    ["boolean", () => true], ["null", () => null],
+  ];
+  for (const [label, transform] of invalidRoots) {
+    for (const file of ["packageRoot", "lockRoot"]) {
+      const result = await runReleaseVersionCheck({ [file]: transform });
+      assert.notEqual(result.status, 0, `${file} accepted ${label}`);
+      assert.match(`${result.stderr}\n${result.stdout}`, /JSON object root/i, `${file} ${label} diagnostic`);
+    }
+  }
+  const both = await runReleaseVersionCheck({ packageRoot: value => [value], lockRoot: value => [value] });
+  assert.notEqual(both.status, 0);
+  for (const refType of ["branch", "tag"]) {
+    const valid = await runReleaseVersionCheck({ refType,
+      packageRoot: value => ({ ...value, nested: [1, { samples: [] }] }),
+      lockRoot: value => ({ ...value, nested: [1, { samples: [] }] }) });
+    assert.equal(valid.status, 0, `${refType} object with legitimate nested arrays: ${valid.stderr}`);
+  }
+});
+
+test("release identity retains malformed JSON and missing-file failures", async () => {
+  for (const file of ["packageText", "lockText"]) {
+    const invalid = await runReleaseVersionCheck({ [file]: '{"version":' });
+    assert.notEqual(invalid.status, 0);
+    assert.match(`${invalid.stderr}\n${invalid.stdout}`, /not valid JSON/i);
+  }
+  for (const missingFile of ["package.json", "package-lock.json"]) {
+    const missing = await runReleaseVersionCheck({ missingFile });
+    assert.notEqual(missing.status, 0);
+    assert.match(`${missing.stderr}\n${missing.stdout}`, /not found/i);
+  }
 });
 
 test("release validation rejects a prior-release corpus stale for the current source definition", async () => {

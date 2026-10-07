@@ -1,4 +1,4 @@
-# Portable Read-Only MQL5 CHM MCP v1.3.5
+# Portable Read-Only MQL5 CHM MCP v1.3.6
 
 ## Value Proposition
 
@@ -173,11 +173,11 @@ HTTP timestamps are labeled as HTTP metadata or retrieval time, never as a CHM b
 
 ## Index and Revision Model
 
-- Server/package version: 1.3.5. Manifest and SQLite schema version: 3. Pointer schema: 2.
+- Server/package version: 1.3.6. Manifest and SQLite schema version: 3. Pointer schema: 2.
 - `corpus_sha256` is the SHA-256 of the UTF-8 concatenation `source_id + NUL + lowercase_chm_sha256 + NUL` for `mql5`, `mql5book`, then `neuronetworksbook`. It intentionally depends only on the downloaded source set so the checker can name a candidate before extraction.
 - `index_revision` is the lowercase SHA-256 of the completed schema-3 SQLite database. The database contains the complete asset catalog and asset-tree digest, so this identity binds text and image metadata without creating a self-hash cycle.
 - SQLite identity-bearing data excludes build/retrieval times, ETags, and HTTP Last-Modified. Those values remain in the manifest. Identical inputs, index contract, and image policy must produce byte-identical databases and index revisions.
-- SQLite metadata includes `index_contract`, the image-policy digest, asset-catalog digest, asset-tree digest, and exact counts. `index_contract` changes whenever extraction or indexing semantics change without a SQL-schema change. v1.3.5 emits `mql5-chm-index-v3-assets-v4`, introduced in v1.3.3 for DOM-ordered image associations and offset-aware trailing-whitespace trimming. The transitional runtime accepts rollback contracts `mql5-chm-index-v3-assets-v1` and `mql5-chm-index-v3-assets-v2`, and `mql5-chm-index-v3-assets-v3` as well as the current contract, while new candidate activation requires the current contract.
+- SQLite metadata includes `index_contract`, the image-policy digest, asset-catalog digest, asset-tree digest, and exact counts. `index_contract` changes whenever extraction or indexing semantics change without a SQL-schema change. v1.3.6 emits `mql5-chm-index-v3-assets-v4`, introduced in v1.3.3 for DOM-ordered image associations and offset-aware trailing-whitespace trimming. The transitional runtime accepts rollback contracts `mql5-chm-index-v3-assets-v1` and `mql5-chm-index-v3-assets-v2`, and `mql5-chm-index-v3-assets-v3` as well as the current contract, while new candidate activation requires the current contract.
 - Image occurrences use the latest preceding retained heading in source DOM order; occurrences before the first retained heading or in heading-free topics use the first section. An image may legitimately share the following heading's text offset while belonging to the preceding section. Trailing-whitespace removal updates recorded heading and image positions before final normalization, without inserting markers or changing rendered text.
 - Each immutable revision lives under `revisions/<index_revision>/` and contains its three CHMs, database, manifest, corpus lock, stage report when staged, and the exact `assets/` tree.
 - `data/active.json` is the only activation pointer. Schema 2 retains `active_revision`, `previous_revision`, and `activated_at`; revision fields identify indexes and are replaced atomically.
@@ -215,6 +215,7 @@ Identity and storage rules:
 - All 798 raster files are catalogued and externally preserved, including non-exposed artwork. Extracted HTML, CSS, JavaScript, XML, fonts, and other source artifacts are not shipped.
 - The deterministic HTML-to-text pass records image offsets without inserting markers. Existing topic text and content hashes remain unchanged.
 - v1.3.5 validation leaves the v4 extraction contract and existing genuine index identity unchanged. Prior schema-3 build descriptors and restored prior sets may use supported contracts v1–v4; new and recovered candidate sets require v4. Database and manifest contracts must agree, and complete recovery sets are semantically checked before any canonical rename or deletion.
+- v1.3.6 shares raw-byte identifier checks between indexing and runtime validation: PNG chunk names contain four original ASCII letters, with the reserved third-byte rule retained, and GIF signatures match exactly `GIF87a` or `GIF89a`. The standalone release-identity checker requires serialized object roots in package.json and package-lock.json before pipeline enumeration; legitimate arrays inside objects remain valid. These checks preserve public interfaces, image policy and existing genuine corpus/index identities.
 - Indexed PNG validation reverses all five filter types for each non-interlaced or Adam7 pass and checks actual 1/2/4/8-bit pixel indices against the palette. Row-padding bits are ignored, previous rows reset at each pass, and working row buffers remain bounded.
 - The shared transparency validator follows [PNG tRNS rules](https://www.w3.org/TR/png-3/#11tRNS): grayscale requires two bytes, truecolor requires six, and indexed alpha tables may be shorter than the palette but never longer. Color types 4/6 forbid tRNS. Duplicates, transparency after image data, and transparency before a present palette are rejected. Sample high bits are not an additional rejection rule.
 

@@ -24,10 +24,14 @@ function Read-ReleaseJson {
         throw "$Label was not found: $Path"
     }
     try {
-        return Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable
+        $parsed = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable -NoEnumerate
     } catch {
         throw "$Label is not valid JSON: $($_.Exception.Message)"
     }
+    if (-not ($parsed -is [Collections.IDictionary])) {
+        throw "$Label must contain a JSON object root."
+    }
+    return $parsed
 }
 
 $package = Read-ReleaseJson -Path $PackageJsonPath -Label 'package.json'

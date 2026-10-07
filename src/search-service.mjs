@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url";
 import { inflateSync } from "node:zlib";
 import { validatePngScanlines } from "./png-scanlines.mjs";
 import { createPngTransparencyValidator } from "./png-transparency.mjs";
+import { hasGifHeader, readPngChunkType } from "./raster-identifiers.mjs";
 import expansionConfig from "../config/mql5-query-expansions.json" with { type: "json" };
 import jpeg from "jpeg-js";
 var MODULE_PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -641,8 +642,8 @@ function inspectPng(buffer) {
     const end = offset + 12 + length;
     if (end > buffer.length) throw new Error("Truncated PNG chunk.");
     const typeBytes = buffer.subarray(offset + 4, offset + 8);
-    const type = typeBytes.toString("ascii");
-    if (!/^[A-Za-z]{4}$/u.test(type) || !/[A-Z]/u.test(type[2])) throw new Error("Invalid PNG chunk type.");
+    const type = readPngChunkType(typeBytes);
+    if (!/[A-Z]/u.test(type[2])) throw new Error("Invalid PNG chunk type.");
     const data = buffer.subarray(offset + 8, offset + 8 + length);
     const declaredCrc = buffer.readUInt32BE(offset + 8 + length);
     if (crc32(Buffer.concat([typeBytes, data])) !== declaredCrc) throw new Error("Invalid PNG chunk CRC.");
@@ -802,7 +803,7 @@ function inspectJpeg(buffer) {
   return { mime: "image/jpeg", width, height };
 }
 function inspectGif(buffer) {
-  if (buffer.length < 13 || !["GIF87a", "GIF89a"].includes(buffer.subarray(0, 6).toString("ascii"))) {
+  if (buffer.length < 13 || !hasGifHeader(buffer)) {
     throw new Error("Invalid GIF signature.");
   }
   const width = buffer.readUInt16LE(6);
@@ -858,7 +859,7 @@ function inspectRasterImage(buffer) {
   let inspected;
   if (buffer[0] === 0x89 && buffer[1] === 0x50) inspected = inspectPng(buffer);
   else if (buffer[0] === 0xff && buffer[1] === 0xd8) inspected = inspectJpeg(buffer);
-  else if (buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46) inspected = inspectGif(buffer);
+  else if (hasGifHeader(buffer)) inspected = inspectGif(buffer);
   else throw new Error("Unsupported raster signature.");
   assertRasterBounds(buffer.length, inspected.width, inspected.height);
   return inspected;

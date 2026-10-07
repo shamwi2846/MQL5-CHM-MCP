@@ -33219,6 +33219,21 @@ function createPngTransparencyValidator() {
   };
 }
 
+// src/raster-identifiers.mjs
+function readPngChunkType(bytes) {
+  if (bytes.length !== 4 || !bytes.every((byte) => byte >= 65 && byte <= 90 || byte >= 97 && byte <= 122)) {
+    throw new Error("Invalid PNG chunk type.");
+  }
+  return bytes.toString("latin1");
+}
+var GIF87_HEADER = Buffer.from("GIF87a", "ascii");
+var GIF89_HEADER = Buffer.from("GIF89a", "ascii");
+function hasGifHeader(bytes) {
+  if (bytes.length < 6) return false;
+  const header = bytes.subarray(0, 6);
+  return header.equals(GIF87_HEADER) || header.equals(GIF89_HEADER);
+}
+
 // config/mql5-query-expansions.json
 var mql5_query_expansions_default = {
   schema_version: 1,
@@ -33852,8 +33867,8 @@ function inspectPng(buffer) {
     const end = offset + 12 + length;
     if (end > buffer.length) throw new Error("Truncated PNG chunk.");
     const typeBytes = buffer.subarray(offset + 4, offset + 8);
-    const type = typeBytes.toString("ascii");
-    if (!/^[A-Za-z]{4}$/u.test(type) || !/[A-Z]/u.test(type[2])) throw new Error("Invalid PNG chunk type.");
+    const type = readPngChunkType(typeBytes);
+    if (!/[A-Z]/u.test(type[2])) throw new Error("Invalid PNG chunk type.");
     const data = buffer.subarray(offset + 8, offset + 8 + length);
     const declaredCrc = buffer.readUInt32BE(offset + 8 + length);
     if (crc32(Buffer.concat([typeBytes, data])) !== declaredCrc) throw new Error("Invalid PNG chunk CRC.");
@@ -34013,7 +34028,7 @@ function inspectJpeg(buffer) {
   return { mime: "image/jpeg", width, height };
 }
 function inspectGif(buffer) {
-  if (buffer.length < 13 || !["GIF87a", "GIF89a"].includes(buffer.subarray(0, 6).toString("ascii"))) {
+  if (buffer.length < 13 || !hasGifHeader(buffer)) {
     throw new Error("Invalid GIF signature.");
   }
   const width = buffer.readUInt16LE(6);
@@ -34069,7 +34084,7 @@ function inspectRasterImage(buffer) {
   let inspected;
   if (buffer[0] === 137 && buffer[1] === 80) inspected = inspectPng(buffer);
   else if (buffer[0] === 255 && buffer[1] === 216) inspected = inspectJpeg(buffer);
-  else if (buffer[0] === 71 && buffer[1] === 73 && buffer[2] === 70) inspected = inspectGif(buffer);
+  else if (hasGifHeader(buffer)) inspected = inspectGif(buffer);
   else throw new Error("Unsupported raster signature.");
   assertRasterBounds(buffer.length, inspected.width, inspected.height);
   return inspected;
@@ -35602,7 +35617,7 @@ function toolFailure(error51) {
 }
 function createMcpServer(service) {
   const server = new McpServer(
-    { name: "mql5-chm", version: "1.3.5" },
+    { name: "mql5-chm", version: "1.3.6" },
     { capabilities: { tools: {} } }
   );
   server.registerTool(
