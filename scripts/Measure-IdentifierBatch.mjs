@@ -7,20 +7,24 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { median } from "./IdentifierBenchmarkStatistics.mjs";
+import { measureQuality } from "./DocumentationQualityBenchmark.mjs";
 
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const names = ["OnTick", "CopyBuffer", "PositionSelectByTicket", "OrderSend", "SymbolInfoDouble", "IndicatorRelease", "SYMBOL_VOLUME_STEP", "BarsCalculated", "OnInit", "OnDeinit", "SymbolInfoInteger", "AccountInfoDouble", "CopyRates", "iMA", "OnTikk", "zzzz_nonexistent_7391"];
 const sha256 = bytes => createHash("sha256").update(bytes).digest("hex");
-const options = { packageRoot: repository, serverPath: path.join(repository, "build/candidate-v12/app/server.mjs"), samples: 9, report: null };
+const options = { packageRoot: repository, serverPath: path.join(repository, "build/candidate-v12/app/server.mjs"), samples: 9, report: null, qualityCases: null, qualityOutput: null };
 for (let i = 2; i < process.argv.length; i += 2) {
   const key = process.argv[i], value = process.argv[i+1];
   assert.ok(value && !value.startsWith("--"), `${key} requires a value`);
   if (key === "--package-root") options.packageRoot = path.resolve(value);
   else if (key === "--server-path") options.serverPath = path.resolve(value);
+  else if (key === "--quality-cases") options.qualityCases = path.resolve(value);
+  else if (key === "--quality-output") options.qualityOutput = path.resolve(value);
   else if (key === "--report") options.report = path.resolve(value);
   else if (key === "--samples") { options.samples = Number(value); assert.ok(Number.isInteger(options.samples) && options.samples >= 3 && options.samples <= 21, "samples must be an integer from 3 to 21"); }
   else throw new Error(`Unknown option ${key}`);
 }
+assert.equal(Boolean(options.qualityCases), Boolean(options.qualityOutput), "Select both --quality-cases and --quality-output");
 const bootstrap = `import { main } from ${JSON.stringify(pathToFileURL(options.serverPath).href)}; await main({ root: ${JSON.stringify(options.packageRoot)} });`;
 const transport = new StdioClientTransport({ command: process.execPath, args: ["--input-type=module", "--eval", bootstrap], cwd: options.packageRoot, stderr: "pipe" });
 const client = new Client({ name: "mql5-identifier-batch-benchmark", version: "1.0.0" });
@@ -102,6 +106,16 @@ try {
       }
     }
     measurements.push({ identifiers: size, requests: { sequential: size, parallel: size, batch: 1 }, median_ms: Object.fromEntries(Object.entries(samples).map(([mode,values])=>[mode,Number(median(values).toFixed(3))])), response_bytes: sizes, response_byte_reduction_percent: Number(((1-sizes.batch/sizes.sequential)*100).toFixed(2)), result_metadata_equal: true });
+  }
+  if (options.qualityCases) {
+    const input = await readFile(options.qualityCases);
+    assert.ok(input.length <= 2 * 1024 * 1024, "Quality case file exceeds the supported limit");
+    const quality = await measureQuality(client, JSON.parse(input.toString("utf8").replace(/^\uFEFF/u, "")));
+    quality.artifact_integrity = { server_unchanged: sha256(await readFile(options.serverPath)) === beforeBundle, pointer_unchanged: sha256(await readFile(path.join(options.packageRoot, "data/active.json"))) === beforePointer };
+    if (!quality.artifact_integrity.server_unchanged || !quality.artifact_integrity.pointer_unchanged) { quality.status = "failed"; quality.issues = ["Measured server or active pointer changed"]; }
+    Object.assign(quality, { case_manifest_sha256: sha256(input), server_sha256: beforeBundle, server_version: client.getServerVersion(), package_root: options.packageRoot });
+    await writeFile(options.qualityOutput, `${JSON.stringify(quality,null,2)}\n`, { flag: "wx" });
+    assert.equal(quality.status, "passed", "Documentation quality cases failed; retained full evidence in quality output");
   }
   assert.equal(sha256(await readFile(options.serverPath)),beforeBundle,"Server bytes changed during measurement");
   assert.equal(sha256(await readFile(path.join(options.packageRoot,"data/active.json"))),beforePointer,"Active pointer changed during measurement");

@@ -1,0 +1,686 @@
+{
+  "schema_version": 1,
+  "generator": "manual-source-review-v1",
+  "provenance": "Expectations chosen from original English CHM HTML before querying either server. Stable IDs calculated from documented path SHA-256; passage checks use Python HTMLParser, without production rendering or search. CButton inheritance is the fifth retained heading in DOM order (ordinal 4).",
+  "corpus_revision": "8d058569d975ec5b5ec419770d952757acd0ea51ad8b63fe78eb49fb00751adc",
+  "index_revision": "2987a6f58601d54743077096476aab82e22d19917f26430b035f7baf3d7b6ddd",
+  "sources": {
+    "mql5": {
+      "filename": "mql5.chm",
+      "sha256": "b6b3338a985e1efedc2c87fa478f648d7de53e1daa6d2a8a9e5359b8878e23fa"
+    },
+    "mql5book": {
+      "filename": "mql5book.chm",
+      "sha256": "4c0d0e6ce858b410f63969fc5d6b64076da73ae7f4c010c212b6993d018a1f17"
+    },
+    "neuronetworksbook": {
+      "filename": "neuronetworksbook.chm",
+      "sha256": "fe9470e6ac9452e34ecc54cd80dddf59475c8ae23cac7b5ef071b17f1c32d8f5"
+    }
+  },
+  "cases": [
+    {
+      "id": "exact-OnTick",
+      "category": "exact",
+      "operation": "search",
+      "arguments": {
+        "query": "OnTick",
+        "source": "mql5",
+        "limit": 8,
+        "expand": false
+      },
+      "expected": {
+        "source": "mql5",
+        "path": "ontick.htm",
+        "title": "OnTick",
+        "topic_id": "mql5:88cfa0c6607b1dc2827dc4ff",
+        "html_sha256": "14274b5ecded20d192c0b367548fe46591ff352f3f021b062212da890833b473",
+        "source_revision": "b6b3338a985e1efedc2c87fa478f648d7de53e1daa6d2a8a9e5359b8878e23fa",
+        "max_rank": 1,
+        "exact_required": true
+      }
+    },
+    {
+      "id": "exact-CopyBuffer",
+      "category": "exact",
+      "operation": "search",
+      "arguments": {
+        "query": "CopyBuffer",
+        "source": "mql5",
+        "limit": 8,
+        "expand": false
+      },
+      "expected": {
+        "source": "mql5",
+        "path": "copybuffer.htm",
+        "title": "CopyBuffer",
+        "topic_id": "mql5:a781b9698a284ee42633665f",
+        "html_sha256": "c954fe101e9503b91c6cb24433924b3cd88663e1263100bdc6bf56a362cb9b18",
+        "source_revision": "b6b3338a985e1efedc2c87fa478f648d7de53e1daa6d2a8a9e5359b8878e23fa",
+        "max_rank": 1,
+        "exact_required": true
+      }
+    },
+    {
+      "id": "exact-PositionSelectByTicket",
+      "category": "exact",
+      "operation": "search",
+      "arguments": {
+        "query": "PositionSelectByTicket",
+        "source": "mql5",
+        "limit": 8,
+        "expand": false
+      },
+      "expected": {
+        "source": "mql5",
+        "path": "positionselectbyticket.htm",
+        "title": "PositionSelectByTicket",
+        "topic_id": "mql5:317220fffc831a69d7f0cfe5",
+        "html_sha256": "3bb4c07373b258055d72560587725586165db697b6c4bcd5f96be07da68b5d2f",
+        "source_revision": "b6b3338a985e1efedc2c87fa478f648d7de53e1daa6d2a8a9e5359b8878e23fa",
+        "max_rank": 1,
+        "exact_required": true
+      }
+    },
+    {
+      "id": "exact-OrderSend",
+      "category": "exact",
+      "operation": "search",
+      "arguments": {
+        "query": "OrderSend",
+        "source": "mql5",
+        "limit": 8,
+        "expand": false
+      },
+      "expected": {
+        "source": "mql5",
+        "path": "ordersend.htm",
+        "title": "OrderSend",
+        "topic_id": "mql5:97448830fb7a699ce8db9b3c",
+        "html_sha256": "fa9bdfc2bd12e0c4c6833eb7cbb897aff19bd1ed26b49d7fab8e02044c5d81de",
+        "source_revision": "b6b3338a985e1efedc2c87fa478f648d7de53e1daa6d2a8a9e5359b8878e23fa",
+        "max_rank": 1,
+        "exact_required": true
+      }
+    },
+    {
+      "id": "exact-SymbolInfoDouble",
+      "category": "exact",
+      "operation": "search",
+      "arguments": {
+        "query": "SymbolInfoDouble",
+        "source": "mql5",
+        "limit": 8,
+        "expand": false
+      },
+      "expected": {
+        "source": "mql5",
+        "path": "symbolinfodouble.htm",
+        "title": "SymbolInfoDouble",
+        "topic_id": "mql5:577d642e2b6a4bae453deca2",
+        "html_sha256": "9c59a42bafd96d79a74d617e9b551474d0b8fe1c8a0a1cf0ffcea490e8f39094",
+        "source_revision": "b6b3338a985e1efedc2c87fa478f648d7de53e1daa6d2a8a9e5359b8878e23fa",
+        "max_rank": 1,
+        "exact_required": true
+      }
+    },
+    {
+      "id": "exact-IndicatorRelease",
+      "category": "exact",
+      "operation": "search",
+      "arguments": {
+        "query": "IndicatorRelease",
+        "source": "mql5",
+        "limit": 8,
+        "expand": false
+      },
+      "expected": {
+        "source": "mql5",
+        "path": "indicatorrelease.htm",
+        "title": "IndicatorRelease",
+        "topic_id": "mql5:a7aa9ec4f54258fe799874dd",
+        "html_sha256": "55a19d6007f9b7e3c1752ea8a65a17d6da9d28bd56a816e9bb5fb6b00a9cf22d",
+        "source_revision": "b6b3338a985e1efedc2c87fa478f648d7de53e1daa6d2a8a9e5359b8878e23fa",
+        "max_rank": 1,
+        "exact_required": true
+      }
+    },
+    {
+      "id": "exact-SYMBOL_VOLUME_STEP",
+      "category": "exact",
+      "operation": "search",
+      "arguments": {
+        "query": "SYMBOL_VOLUME_STEP",
+        "source": "mql5",
+        "limit": 8,
+        "expand": false
+      },
+      "expected": {
+        "source": "mql5",
+        "path": "marketinfoconstants.htm",
+        "title": "Symbol Properties",
+        "topic_id": "mql5:1c60a5c25161a36756763f2d",
+        "html_sha256": "6d465de06ed85977cb7415be679d86e24105ce7d5d1e2650ff93da86e38ce517",
+        "source_revision": "b6b3338a985e1efedc2c87fa478f648d7de53e1daa6d2a8a9e5359b8878e23fa",
+        "max_rank": 1,
+        "exact_required": true
+      }
+    },
+    {
+      "id": "exact-BarsCalculated",
+      "category": "exact",
+      "operation": "search",
+      "arguments": {
+        "query": "BarsCalculated",
+        "source": "mql5",
+        "limit": 8,
+        "expand": false
+      },
+      "expected": {
+        "source": "mql5",
+        "path": "barscalculated.htm",
+        "title": "BarsCalculated",
+        "topic_id": "mql5:b1c7800d62507d3cd42957ed",
+        "html_sha256": "39ba75f1fed05250be0967ff901394b8dfc624df1522df6f2b971ad8a0113067",
+        "source_revision": "b6b3338a985e1efedc2c87fa478f648d7de53e1daa6d2a8a9e5359b8878e23fa",
+        "max_rank": 1,
+        "exact_required": true
+      }
+    },
+    {
+      "id": "concept-1",
+      "category": "concept",
+      "operation": "search",
+      "arguments": {
+        "query": "trade opening",
+        "source": "mql5",
+        "limit": 8,
+        "expand": true
+      },
+      "expected": {
+        "source": "mql5",
+        "path": "ordersend.htm",
+        "title": "OrderSend",
+        "topic_id": "mql5:97448830fb7a699ce8db9b3c",
+        "html_sha256": "fa9bdfc2bd12e0c4c6833eb7cbb897aff19bd1ed26b49d7fab8e02044c5d81de",
+        "source_revision": "b6b3338a985e1efedc2c87fa478f648d7de53e1daa6d2a8a9e5359b8878e23fa",
+        "max_rank": 8,
+        "exact_required": false
+      }
+    },
+    {
+      "id": "concept-2",
+      "category": "concept",
+      "operation": "search",
+      "arguments": {
+        "query": "open a trade",
+        "source": "mql5",
+        "limit": 8,
+        "expand": true
+      },
+      "expected": {
+        "source": "mql5",
+        "path": "ordersend.htm",
+        "title": "OrderSend",
+        "topic_id": "mql5:97448830fb7a699ce8db9b3c",
+        "html_sha256": "fa9bdfc2bd12e0c4c6833eb7cbb897aff19bd1ed26b49d7fab8e02044c5d81de",
+        "source_revision": "b6b3338a985e1efedc2c87fa478f648d7de53e1daa6d2a8a9e5359b8878e23fa",
+        "max_rank": 8,
+        "exact_required": false
+      }
+    },
+    {
+      "id": "concept-3",
+      "category": "concept",
+      "operation": "search",
+      "arguments": {
+        "query": "position tickets",
+        "source": "mql5",
+        "limit": 8,
+        "expand": true
+      },
+      "expected": {
+        "source": "mql5",
+        "path": "positionselectbyticket.htm",
+        "title": "PositionSelectByTicket",
+        "topic_id": "mql5:317220fffc831a69d7f0cfe5",
+        "html_sha256": "3bb4c07373b258055d72560587725586165db697b6c4bcd5f96be07da68b5d2f",
+        "source_revision": "b6b3338a985e1efedc2c87fa478f648d7de53e1daa6d2a8a9e5359b8878e23fa",
+        "max_rank": 8,
+        "exact_required": false
+      }
+    },
+    {
+      "id": "concept-4",
+      "category": "concept",
+      "operation": "search",
+      "arguments": {
+        "query": "position by ticket",
+        "source": "mql5",
+        "limit": 8,
+        "expand": true
+      },
+      "expected": {
+        "source": "mql5",
+        "path": "positionselectbyticket.htm",
+        "title": "PositionSelectByTicket",
+        "topic_id": "mql5:317220fffc831a69d7f0cfe5",
+        "html_sha256": "3bb4c07373b258055d72560587725586165db697b6c4bcd5f96be07da68b5d2f",
+        "source_revision": "b6b3338a985e1efedc2c87fa478f648d7de53e1daa6d2a8a9e5359b8878e23fa",
+        "max_rank": 8,
+        "exact_required": false
+      }
+    },
+    {
+      "id": "concept-5",
+      "category": "concept",
+      "operation": "search",
+      "arguments": {
+        "query": "indicator buffers",
+        "source": "mql5",
+        "limit": 8,
+        "expand": true
+      },
+      "expected": {
+        "source": "mql5",
+        "path": "copybuffer.htm",
+        "title": "CopyBuffer",
+        "topic_id": "mql5:a781b9698a284ee42633665f",
+        "html_sha256": "c954fe101e9503b91c6cb24433924b3cd88663e1263100bdc6bf56a362cb9b18",
+        "source_revision": "b6b3338a985e1efedc2c87fa478f648d7de53e1daa6d2a8a9e5359b8878e23fa",
+        "max_rank": 8,
+        "exact_required": false
+      }
+    },
+    {
+      "id": "concept-6",
+      "category": "concept",
+      "operation": "search",
+      "arguments": {
+        "query": "indicator buffer values",
+        "source": "mql5",
+        "limit": 8,
+        "expand": true
+      },
+      "expected": {
+        "source": "mql5",
+        "path": "copybuffer.htm",
+        "title": "CopyBuffer",
+        "topic_id": "mql5:a781b9698a284ee42633665f",
+        "html_sha256": "c954fe101e9503b91c6cb24433924b3cd88663e1263100bdc6bf56a362cb9b18",
+        "source_revision": "b6b3338a985e1efedc2c87fa478f648d7de53e1daa6d2a8a9e5359b8878e23fa",
+        "max_rank": 8,
+        "exact_required": false
+      }
+    },
+    {
+      "id": "concept-7",
+      "category": "concept",
+      "operation": "search",
+      "arguments": {
+        "query": "account margin mode",
+        "source": "mql5",
+        "limit": 8,
+        "expand": true
+      },
+      "expected": {
+        "source": "mql5",
+        "path": "accountinformation.htm",
+        "title": "Account Properties",
+        "topic_id": "mql5:61fc9170d1d208cdafd6d298",
+        "html_sha256": "b2e3afd9ff318369de6c5ea4c0b7d1b001ad733f6a90bd6b6f00c8704527e76a",
+        "source_revision": "b6b3338a985e1efedc2c87fa478f648d7de53e1daa6d2a8a9e5359b8878e23fa",
+        "max_rank": 8,
+        "exact_required": false
+      }
+    },
+    {
+      "id": "concept-8",
+      "category": "concept",
+      "operation": "search",
+      "arguments": {
+        "query": "global variables",
+        "source": "mql5",
+        "limit": 8,
+        "expand": true
+      },
+      "expected": {
+        "source": "mql5",
+        "path": "globals.htm",
+        "title": "Global Variables of the Terminal",
+        "topic_id": "mql5:81f5d75036f9f708df3e95ca",
+        "html_sha256": "d27d30f5439a96572053aa63bb3a01d94ea6df061875ea94b470fda0c4ccc626",
+        "source_revision": "b6b3338a985e1efedc2c87fa478f648d7de53e1daa6d2a8a9e5359b8878e23fa",
+        "max_rank": 8,
+        "exact_required": false
+      }
+    },
+    {
+      "id": "concept-9",
+      "category": "concept",
+      "operation": "search",
+      "arguments": {
+        "query": "dynamic array",
+        "source": "mql5",
+        "limit": 8,
+        "expand": true
+      },
+      "expected": {
+        "source": "mql5",
+        "path": "dynamic_array.htm",
+        "title": "Dynamic Array Object",
+        "topic_id": "mql5:384b24a65a93b260a44c747c",
+        "html_sha256": "e6fbbe320d6912a0af850feafc792330be444006d6be6d9a3e2e5b1d3e09b85b",
+        "source_revision": "b6b3338a985e1efedc2c87fa478f648d7de53e1daa6d2a8a9e5359b8878e23fa",
+        "max_rank": 8,
+        "exact_required": false
+      }
+    },
+    {
+      "id": "concept-10",
+      "category": "concept",
+      "operation": "search",
+      "arguments": {
+        "query": "including files",
+        "source": "mql5",
+        "limit": 8,
+        "expand": true
+      },
+      "expected": {
+        "source": "mql5",
+        "path": "include.htm",
+        "title": "Including Files (#include)",
+        "topic_id": "mql5:3d2e853ca7e9b5fc6c2d1c7e",
+        "html_sha256": "d84b60600642d514ed2dcfc5b29c65e14cf3c01cdfd8b46fdf3d0a0f9a03ab61",
+        "source_revision": "b6b3338a985e1efedc2c87fa478f648d7de53e1daa6d2a8a9e5359b8878e23fa",
+        "max_rank": 8,
+        "exact_required": false
+      }
+    },
+    {
+      "id": "concept-11",
+      "category": "concept",
+      "operation": "search",
+      "arguments": {
+        "query": "data input",
+        "source": "mql5book",
+        "limit": 8,
+        "expand": true
+      },
+      "expected": {
+        "source": "mql5book",
+        "path": "1_8_data_input.htm",
+        "title": "1.8 Data input",
+        "topic_id": "mql5book:dcf2412ea8876ddf51d0d1d5",
+        "html_sha256": "319290c6702cd1d961ae6d370a62e7ed1fa9b3c4529724645d6f51d4deb1d6b5",
+        "source_revision": "4c0d0e6ce858b410f63969fc5d6b64076da73ae7f4c010c212b6993d018a1f17",
+        "max_rank": 8,
+        "exact_required": false
+      }
+    },
+    {
+      "id": "concept-12",
+      "category": "concept",
+      "operation": "search",
+      "arguments": {
+        "query": "neural network activation function",
+        "source": "neuronetworksbook",
+        "limit": 8,
+        "expand": true
+      },
+      "expected": {
+        "source": "neuronetworksbook",
+        "path": "1_2_activation.htm",
+        "title": "1.2 Activation functions",
+        "topic_id": "neuronetworksbook:0cc659e4b54771133e7239a5",
+        "html_sha256": "efc2030a07f938df69108958506cad69dc4da7c7ccb40244761c63bc3493188f",
+        "source_revision": "fe9470e6ac9452e34ecc54cd80dddf59475c8ae23cac7b5ef071b17f1c32d8f5",
+        "max_rank": 8,
+        "exact_required": false
+      }
+    },
+    {
+      "id": "typo-OnTikk",
+      "category": "typo",
+      "operation": "search",
+      "arguments": {
+        "query": "OnTikk",
+        "source": "mql5",
+        "limit": 8,
+        "expand": false
+      },
+      "expected": {
+        "source": "mql5",
+        "path": "ontick.htm",
+        "title": "OnTick",
+        "topic_id": "mql5:88cfa0c6607b1dc2827dc4ff",
+        "html_sha256": "14274b5ecded20d192c0b367548fe46591ff352f3f021b062212da890833b473",
+        "source_revision": "b6b3338a985e1efedc2c87fa478f648d7de53e1daa6d2a8a9e5359b8878e23fa",
+        "max_rank": 3,
+        "exact_required": false
+      }
+    },
+    {
+      "id": "typo-PositonSelectByTiket",
+      "category": "typo",
+      "operation": "search",
+      "arguments": {
+        "query": "PositonSelectByTiket",
+        "source": "mql5",
+        "limit": 8,
+        "expand": false
+      },
+      "expected": {
+        "source": "mql5",
+        "path": "positionselectbyticket.htm",
+        "title": "PositionSelectByTicket",
+        "topic_id": "mql5:317220fffc831a69d7f0cfe5",
+        "html_sha256": "3bb4c07373b258055d72560587725586165db697b6c4bcd5f96be07da68b5d2f",
+        "source_revision": "b6b3338a985e1efedc2c87fa478f648d7de53e1daa6d2a8a9e5359b8878e23fa",
+        "max_rank": 3,
+        "exact_required": false
+      }
+    },
+    {
+      "id": "typo-ChatID",
+      "category": "typo",
+      "operation": "search",
+      "arguments": {
+        "query": "ChatID",
+        "source": "mql5",
+        "limit": 8,
+        "expand": false
+      },
+      "expected": {
+        "source": "mql5",
+        "path": "chartid.htm",
+        "title": "ChartID",
+        "topic_id": "mql5:fce8e059aea606be467486b9",
+        "html_sha256": "d2466e625c5e39e37bd712e1922e999da72edb525107647d25d2af2f0e6ed4b5",
+        "source_revision": "b6b3338a985e1efedc2c87fa478f648d7de53e1daa6d2a8a9e5359b8878e23fa",
+        "max_rank": 3,
+        "exact_required": false
+      }
+    },
+    {
+      "id": "typo-Droout",
+      "category": "typo",
+      "operation": "search",
+      "arguments": {
+        "query": "Droout",
+        "source": "neuronetworksbook",
+        "limit": 8,
+        "expand": false
+      },
+      "expected": {
+        "source": "neuronetworksbook",
+        "path": "1_5_2_dropout.htm",
+        "title": "1.5.2 Dropout",
+        "topic_id": "neuronetworksbook:ace37ab66845fe2e832c21f9",
+        "html_sha256": "62f7304492ba9ebcbb351ed8088c332e4a6eaca05a17b647c9264222deb9a6a3",
+        "source_revision": "fe9470e6ac9452e34ecc54cd80dddf59475c8ae23cac7b5ef071b17f1c32d8f5",
+        "max_rank": 3,
+        "exact_required": false
+      }
+    },
+    {
+      "id": "absent-zzzz_nonexistent_7391",
+      "category": "absent",
+      "operation": "search",
+      "arguments": {
+        "query": "zzzz_nonexistent_7391",
+        "source": "all",
+        "limit": 8,
+        "expand": false
+      },
+      "expected": {
+        "forbid_exact": true
+      }
+    },
+    {
+      "id": "absent-PositionSelectByTicketSuffix7391",
+      "category": "absent",
+      "operation": "search",
+      "arguments": {
+        "query": "PositionSelectByTicketSuffix7391",
+        "source": "all",
+        "limit": 8,
+        "expand": false
+      },
+      "expected": {
+        "forbid_exact": true
+      }
+    },
+    {
+      "id": "absent-CopyBufferFake_7391",
+      "category": "absent",
+      "operation": "search",
+      "arguments": {
+        "query": "CopyBufferFake_7391",
+        "source": "all",
+        "limit": 8,
+        "expand": false
+      },
+      "expected": {
+        "forbid_exact": true
+      }
+    },
+    {
+      "id": "absent-OnTickCounterfeit7391",
+      "category": "absent",
+      "operation": "search",
+      "arguments": {
+        "query": "OnTickCounterfeit7391",
+        "source": "all",
+        "limit": 8,
+        "expand": false
+      },
+      "expected": {
+        "forbid_exact": true
+      }
+    },
+    {
+      "id": "focus-button",
+      "category": "focused",
+      "operation": "read",
+      "arguments": {
+        "topic_id": "mql5:2aa5ef52b8cdbcc34818dad8",
+        "focus": "Inheritance hierarchy",
+        "max_chars": 1200,
+        "include_related": false,
+        "include_images": true
+      },
+      "expected": {
+        "source": "mql5",
+        "path": "cbutton.htm",
+        "title": "CButton",
+        "topic_id": "mql5:2aa5ef52b8cdbcc34818dad8",
+        "html_sha256": "7ca183ff9e8abef1641cdc2ab6e5505c6861da590171f52b11515704eeff7259",
+        "source_revision": "b6b3338a985e1efedc2c87fa478f648d7de53e1daa6d2a8a9e5359b8878e23fa",
+        "section_heading": "Inheritance hierarchy",
+        "section_id": "mql5:2aa5ef52b8cdbcc34818dad8:s004",
+        "passage": "CWndObj",
+        "focus_match": "exact",
+        "image": {
+          "asset_id": "mql5:asset:d14a48c98078df9ad0edb943",
+          "sha256": "48f4663901e702cab2518ec26dc137134a58e8a8d6a26b36f3197fcefeecef8c",
+          "bytes": 8719,
+          "section_id": "mql5:2aa5ef52b8cdbcc34818dad8:s004",
+          "absent_section": "mql5:2aa5ef52b8cdbcc34818dad8:s005"
+        }
+      }
+    },
+    {
+      "id": "focus-volume",
+      "category": "focused",
+      "operation": "read",
+      "arguments": {
+        "topic_id": "mql5:1c60a5c25161a36756763f2d",
+        "focus": "SYMBOL_VOLUME_STEP",
+        "max_chars": 1200,
+        "include_related": false,
+        "include_images": false
+      },
+      "expected": {
+        "source": "mql5",
+        "path": "marketinfoconstants.htm",
+        "title": "Symbol Properties",
+        "topic_id": "mql5:1c60a5c25161a36756763f2d",
+        "html_sha256": "6d465de06ed85977cb7415be679d86e24105ce7d5d1e2650ff93da86e38ce517",
+        "source_revision": "b6b3338a985e1efedc2c87fa478f648d7de53e1daa6d2a8a9e5359b8878e23fa",
+        "section_heading": "Symbol Properties",
+        "section_id": "mql5:1c60a5c25161a36756763f2d:s000",
+        "passage": "Minimal volume change step for deal execution",
+        "focus_match": "exact"
+      }
+    },
+    {
+      "id": "focus-copy",
+      "category": "focused",
+      "operation": "read",
+      "arguments": {
+        "topic_id": "mql5:a781b9698a284ee42633665f",
+        "focus": "CopyBuffer",
+        "max_chars": 1200,
+        "include_related": false,
+        "include_images": false
+      },
+      "expected": {
+        "source": "mql5",
+        "path": "copybuffer.htm",
+        "title": "CopyBuffer",
+        "topic_id": "mql5:a781b9698a284ee42633665f",
+        "html_sha256": "c954fe101e9503b91c6cb24433924b3cd88663e1263100bdc6bf56a362cb9b18",
+        "source_revision": "b6b3338a985e1efedc2c87fa478f648d7de53e1daa6d2a8a9e5359b8878e23fa",
+        "section_heading": "CopyBuffer",
+        "section_id": "mql5:a781b9698a284ee42633665f:s000",
+        "passage": "Gets data of a specified buffer",
+        "focus_match": "exact"
+      }
+    },
+    {
+      "id": "focus-ordersend",
+      "category": "focused",
+      "operation": "read",
+      "arguments": {
+        "topic_id": "mql5:97448830fb7a699ce8db9b3c",
+        "focus": "Return Value",
+        "max_chars": 1200,
+        "include_related": false,
+        "include_images": false
+      },
+      "expected": {
+        "source": "mql5",
+        "path": "ordersend.htm",
+        "title": "OrderSend",
+        "topic_id": "mql5:97448830fb7a699ce8db9b3c",
+        "html_sha256": "fa9bdfc2bd12e0c4c6833eb7cbb897aff19bd1ed26b49d7fab8e02044c5d81de",
+        "source_revision": "b6b3338a985e1efedc2c87fa478f648d7de53e1daa6d2a8a9e5359b8878e23fa",
+        "section_heading": "Return Value",
+        "section_id": "mql5:97448830fb7a699ce8db9b3c:s002",
+        "passage": "this is not a sign of successful execution of a trade operation",
+        "focus_match": "exact"
+      }
+    }
+  ]
+}
