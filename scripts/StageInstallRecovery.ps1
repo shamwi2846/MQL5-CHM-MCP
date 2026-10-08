@@ -170,6 +170,7 @@ function Assert-StagedRevisionReportValue {
         [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedRevision
     )
     Assert-ExactJsonProperties -Object $StageReport -Names @('schema_version','index_revision','corpus_revision','base_index_revision','base_corpus_revision','staged_at','validation_passed','source_topic_counts','changes','asset_changes','required_rankings') -Context 'stage report'
+    Assert-StagedRevisionReportTypes -Report $StageReport
     if ([int]$StageReport.schema_version -ne 3 -or [string]$StageReport.index_revision -cne $ExpectedRevision -or $StageReport.validation_passed -isnot [bool] -or -not [bool]$StageReport.validation_passed) { throw 'Stage report is not approved for this index revision.' }
     if ([string]$StageReport.corpus_revision -cnotmatch '^[0-9a-f]{64}$') { throw 'Stage report corpus_revision is invalid.' }
     if (($null -eq $StageReport.base_index_revision) -ne ($null -eq $StageReport.base_corpus_revision)) { throw 'Stage report base revisions must both be set or both be null.' }
@@ -233,6 +234,7 @@ function Get-RevisionStageJournal {
     if ((Get-Item -LiteralPath $path).Length -gt 2097152) { throw 'Revision stage journal is unexpectedly large.' }
     $journal = Read-JsonFile -Path $path -Context 'revision stage journal' -RequireObject
     Assert-ExactJsonProperties -Object $journal -Names @('schema_version','operation','index_revision','corpus_revision','base_index_revision','base_corpus_revision','candidate_tree_sha256','json_digest_contract','stage_report_canonical_sha256','stage_report_file_sha256','destination_existed','prior_stage_report_canonical_sha256','prior_stage_report_file_sha256','allow_legacy_active','started_at','stage_report') -Context 'revision stage journal'
+    Assert-RevisionStageJournalTypes -Journal $journal
     if ([int]$journal.schema_version -ne 1) { throw 'Revision stage journal schema_version must be 1.' }
     if (@('rebuild','documentation-update') -cnotcontains [string]$journal.operation) { throw 'Revision stage journal operation is invalid.' }
     if ([string]$journal.json_digest_contract -cne 'powershell-json-compress-depth20-v1') { throw 'Revision stage journal JSON digest contract is invalid.' }

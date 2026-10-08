@@ -2224,7 +2224,7 @@ function Get-RevisionJsonField {
     param(
         [Parameter(Mandatory)][AllowNull()][object]$Object,
         [Parameter(Mandatory)][string]$Name,
-        [Parameter(Mandatory)][ValidateSet('Object','String','NullableString','Integer')][string]$Type,
+        [Parameter(Mandatory)][ValidateSet('Object','String','NullableString','Integer','Boolean','Array')][string]$Type,
         [string]$Context = 'revision JSON',
         [long]$Minimum = 0
     )
@@ -2237,6 +2237,8 @@ function Get-RevisionJsonField {
         'Object' { $value -is [pscustomobject] }
         'String' { $value -is [string] -and $value.Length -gt 0 -and $value -cnotmatch '[\x00-\x1f\x7f]' }
         'NullableString' { $null -eq $value -or ($value -is [string] -and $value -cnotmatch '[\x00-\x1f\x7f]') }
+        'Boolean' { $value -is [bool] }
+        'Array' { $value -is [Array] }
         'Integer' {
             $numeric = (Test-TransactionJsonInteger $value) -or $value -is [double] -or $value -is [single] -or $value -is [decimal]
             $numeric -and $value -ge $Minimum -and $value -le [long]9007199254740991 -and
@@ -2246,6 +2248,59 @@ function Get-RevisionJsonField {
     }
     if (-not $valid) { throw "$Context.$Name must have JSON type $Type$(if ($Type -ceq 'Integer') { ' in the safe integer range' })." }
     return ,$value
+}
+
+function Assert-RevisionStageJournalTypes {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$Journal)
+    Get-RevisionJsonField $Journal 'schema_version' Integer 'revision stage journal' -Minimum 1 | Out-Null
+    foreach ($name in @('operation','index_revision','corpus_revision','candidate_tree_sha256','json_digest_contract','stage_report_canonical_sha256','stage_report_file_sha256','started_at')) {
+        Get-RevisionJsonField $Journal $name String 'revision stage journal' | Out-Null
+    }
+    foreach ($name in @('base_index_revision','base_corpus_revision','prior_stage_report_canonical_sha256','prior_stage_report_file_sha256')) {
+        Get-RevisionJsonField $Journal $name NullableString 'revision stage journal' | Out-Null
+    }
+    foreach ($name in @('destination_existed','allow_legacy_active')) { Get-RevisionJsonField $Journal $name Boolean 'revision stage journal' | Out-Null }
+    $report = Get-RevisionJsonField $Journal 'stage_report' Object 'revision stage journal'
+    Assert-StagedRevisionReportTypes -Report $report
+}
+
+function Assert-StagedRevisionReportTypes {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$Report, [switch]$Legacy)
+    $context = if ($Legacy) { 'legacy stage report' } else { 'stage report' }
+    Get-RevisionJsonField $Report 'schema_version' Integer $context -Minimum 1 | Out-Null
+    $names = if ($Legacy) { @('revision','base_revision','staged_at') } else { @('index_revision','corpus_revision','staged_at') }
+    foreach ($name in $names) { Get-RevisionJsonField $Report $name String $context | Out-Null }
+    if (-not $Legacy) {
+        foreach ($name in @('base_index_revision','base_corpus_revision')) { Get-RevisionJsonField $Report $name NullableString $context | Out-Null }
+    }
+    Get-RevisionJsonField $Report 'validation_passed' Boolean $context | Out-Null
+    foreach ($name in @('source_topic_counts','changes','required_rankings')) { Get-RevisionJsonField $Report $name Object $context | Out-Null }
+    foreach ($source in $Report.source_topic_counts.PSObject.Properties) {
+        $counts = Get-RevisionJsonField $Report.source_topic_counts $source.Name Object "$context.source_topic_counts"
+        foreach ($name in @('base','candidate')) { Get-RevisionJsonField $counts $name Integer "$context.source_topic_counts.$($source.Name)" | Out-Null }
+        Get-RevisionJsonField $counts 'delta' Integer "$context.source_topic_counts.$($source.Name)" -Minimum -9007199254740991 | Out-Null
+    }
+    $groups = @('changes')
+    if (-not $Legacy) { Get-RevisionJsonField $Report 'asset_changes' Object $context | Out-Null; $groups += 'asset_changes' }
+    foreach ($group in $groups) {
+        $value = $Report.PSObject.Properties[$group].Value
+        foreach ($property in $value.PSObject.Properties) {
+            $name = $property.Name; $fieldContext = "$context.$group"
+            if ($name -cmatch '(?:_count|_bytes)$') { Get-RevisionJsonField $value $name Integer $fieldContext | Out-Null }
+            elseif ($name -cmatch '_delta$') { Get-RevisionJsonField $value $name Integer $fieldContext -Minimum -9007199254740991 | Out-Null }
+            elseif ($name -cmatch '_truncated$' -or $name -ceq 'reduction_requires_review') { Get-RevisionJsonField $value $name Boolean $fieldContext | Out-Null }
+            elseif ($name -cmatch '_ids$') {
+                $ids = Get-RevisionJsonField $value $name Array $fieldContext
+                foreach ($id in $ids) { if ($id -isnot [string] -or [string]::IsNullOrWhiteSpace($id) -or $id -match '[\x00-\x1f\x7f]') { throw "$fieldContext.$name must contain JSON strings." } }
+            }
+        }
+    }
+    foreach ($query in $Report.required_rankings.PSObject.Properties) {
+        $ranking = Get-RevisionJsonField $Report.required_rankings $query.Name Object "$context.required_rankings"
+        foreach ($name in @('title','source')) { Get-RevisionJsonField $ranking $name String "$context.required_rankings.$($query.Name)" | Out-Null }
+    }
 }
 
 function Assert-RevisionManifestTypes {
@@ -2353,7 +2408,7 @@ function Assert-SevenZipProvenance {
 function Assert-UtcIsoTimestamp {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Value, [string]$Context = 'timestamp')
-    if ($Value -notmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?Z$') { throw "$Context must be an ISO-8601 UTC timestamp." }
+    if ($Value -notmatch '\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?Z\z') { throw "$Context must be an ISO-8601 UTC timestamp." }
     try { $parsed = [DateTimeOffset]::Parse($Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) } catch { throw "$Context must be an ISO-8601 UTC timestamp." }
     if ($parsed.Offset -ne [TimeSpan]::Zero) { throw "$Context must use UTC." }
 }
@@ -2903,6 +2958,11 @@ function Get-PreparedFileSetTransactionDefinition {
     Assert-NoReparsePoint -Root $rootFull -Path $sourcePath
     if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) { throw 'Prepared file-set transaction journal is not a regular file.' }
     $journal = Read-JsonFile -Path $sourcePath -Context 'prepared file-set transaction journal' -RequireObject
+    # Validate the original values before string casts or pipeline-returning
+    # numeric helpers can enumerate a singleton JSON array into a scalar.
+    Get-RevisionJsonField $journal 'schema_version' Integer 'prepared file-set transaction journal' -Minimum 1 | Out-Null
+    foreach ($name in @('operation','transaction_id')) { Get-RevisionJsonField $journal $name String 'prepared file-set transaction journal' | Out-Null }
+    Get-RevisionJsonField $journal 'items' Array 'prepared file-set transaction journal' | Out-Null
     $numericJournal = Get-TransactionJsonNumericView -Path $sourcePath -Parsed $journal
     $numericSchemaVersion = Get-TransactionJsonValue -Object $numericJournal -Name 'schema_version'
     if (-not (Test-TransactionJsonInteger $numericSchemaVersion)) {
@@ -2913,6 +2973,7 @@ function Get-PreparedFileSetTransactionDefinition {
         Assert-ExactJsonProperties -Object $journal -Names @('schema_version','operation','transaction_id','items') -Context 'prepared file-set transaction journal'
     } elseif ($schemaVersion -eq 2) {
         Assert-ExactJsonProperties -Object $journal -Names @('schema_version','operation','transaction_id','role','items') -Context 'prepared file-set transaction journal'
+        Get-RevisionJsonField $journal 'role' String 'prepared file-set transaction journal' | Out-Null
         if ([string]$journal.role -cnotin @('node-runtime','sevenzip-license','sevenzip-runtime','portable-zip')) { throw 'Prepared file-set transaction journal role is invalid.' }
         if ([string]::IsNullOrWhiteSpace($ExpectedRole)) { throw 'Role-bound transaction recovery requires its explicit expected context.' }
     } else {
@@ -2941,6 +3002,10 @@ function Get-PreparedFileSetTransactionDefinition {
         $numericNewBytes = Get-TransactionJsonValue -Object $numericItem -Name 'new_bytes'
         $numericOldBytes = Get-TransactionJsonValue -Object $numericItem -Name 'old_bytes'
         Assert-ExactJsonProperties -Object $item -Names @('target','prepared','backup','old_present','old_bytes','old_sha256','new_bytes','new_sha256') -Context 'prepared file-set transaction item'
+        foreach ($name in @('target','prepared','backup','new_sha256')) { Get-RevisionJsonField $item $name String 'prepared file-set transaction item' | Out-Null }
+        Get-RevisionJsonField $item 'old_present' Boolean 'prepared file-set transaction item' | Out-Null
+        Get-RevisionJsonField $item 'new_bytes' Integer 'prepared file-set transaction item' | Out-Null
+        Get-RevisionJsonField $item 'old_sha256' NullableString 'prepared file-set transaction item' | Out-Null
         $targetLeaf = Assert-TransactionLeafName -Name ([string]$item.target) -Context 'transaction target'
         $preparedLeaf = Assert-TransactionLeafName -Name ([string]$item.prepared) -Context 'transaction prepared file'
         $backupLeaf = Assert-TransactionLeafName -Name ([string]$item.backup) -Context 'transaction backup file'
@@ -2951,6 +3016,7 @@ function Get-PreparedFileSetTransactionDefinition {
             throw 'Prepared file-set transaction item descriptor is invalid.'
         }
         if ([bool]$item.old_present) {
+            Get-RevisionJsonField $item 'old_bytes' Integer 'prepared file-set transaction item' | Out-Null
             if (-not (Test-TransactionJsonInteger $numericOldBytes) -or [int64]$item.old_bytes -lt 0 -or
                 [string]$item.old_sha256 -cnotmatch '^[0-9a-f]{64}$') {
                 throw 'Prepared file-set transaction prior descriptor is invalid.'
@@ -3584,13 +3650,13 @@ function Get-RevisionStageReportRepairContext {
     Assert-NoReparsePoint -Root $revisionsRoot -Path $manifestPath
     if ((Get-FileSystemItemOrFallback -Path $manifestPath).Length -gt 2097152) { throw "Revision manifest is unexpectedly large during stage-report repair: $manifestPath" }
     $manifest = Read-JsonFile -Path $manifestPath -Context 'revision manifest for stage-report repair' -RequireObject
-    $schema = [int](Get-RequiredJsonProperty $manifest 'schema_version' 'revision manifest for stage-report repair')
-    $database = Get-RequiredJsonProperty $manifest 'database' 'revision manifest for stage-report repair'
-    $databaseHash = [string](Get-RequiredJsonProperty $database 'sha256' 'revision manifest database for stage-report repair')
-    $corpusRevision = [string](Get-RequiredJsonProperty $manifest 'corpus_sha256' 'revision manifest for stage-report repair')
+    $schema = Get-RevisionJsonField $manifest 'schema_version' Integer 'revision manifest for stage-report repair' -Minimum 1
+    $database = Get-RevisionJsonField $manifest 'database' Object 'revision manifest for stage-report repair'
+    $databaseHash = Get-RevisionJsonField $database 'sha256' String 'revision manifest database for stage-report repair'
+    $corpusRevision = Get-RevisionJsonField $manifest 'corpus_sha256' String 'revision manifest for stage-report repair'
     if ($databaseHash -cnotmatch '^[0-9a-f]{64}$' -or $corpusRevision -cnotmatch '^[0-9a-f]{64}$') { throw 'Revision manifest identities are invalid during stage-report repair.' }
     if ($schema -eq $script:ManifestSchemaVersion) {
-        $indexRevision = [string](Get-RequiredJsonProperty $manifest 'index_revision' 'revision manifest for stage-report repair')
+        $indexRevision = Get-RevisionJsonField $manifest 'index_revision' String 'revision manifest for stage-report repair'
         if ($indexRevision -cne $databaseHash -or $revisionName -cne $indexRevision) { throw 'Current revision identity is inconsistent during stage-report repair.' }
         return [pscustomobject]@{Kind='current';ExpectedRevision=$indexRevision;RevisionRoot=$revisionRoot}
     }
@@ -3649,6 +3715,7 @@ function Repair-InterruptedMaintenanceArtifacts {
         param($canonicalPath)
         $journal = Read-JsonFile -Path $canonicalPath -Context 'revision stage journal' -RequireObject
         Assert-ExactJsonProperties -Object $journal -Names @('schema_version','operation','index_revision','corpus_revision','base_index_revision','base_corpus_revision','candidate_tree_sha256','json_digest_contract','stage_report_canonical_sha256','stage_report_file_sha256','destination_existed','prior_stage_report_canonical_sha256','prior_stage_report_file_sha256','allow_legacy_active','started_at','stage_report') -Context 'revision stage journal'
+        Assert-RevisionStageJournalTypes -Journal $journal
         if ([int]$journal.schema_version -ne 1 -or @('rebuild','documentation-update') -cnotcontains [string]$journal.operation) { throw 'Revision stage journal schema or operation is invalid.' }
         if ([string]$journal.json_digest_contract -cne 'powershell-json-compress-depth20-v1') { throw 'Revision stage journal digest contract is invalid.' }
         foreach ($name in @('index_revision','corpus_revision','candidate_tree_sha256','stage_report_canonical_sha256','stage_report_file_sha256')) {
@@ -3988,6 +4055,12 @@ function Assert-Revision {
     $corpusLockPath = Join-Path $revisionRoot 'corpus.lock.json'
     foreach ($immutablePath in @($manifestPath,$databasePath,$corpusLockPath)) { Assert-NoReparsePoint -Root $revisionConfinement -Path $immutablePath }
     $corpusLock = Read-JsonFile -Path $corpusLockPath -Context 'revision corpus lock' -RequireObject
+    Get-RevisionJsonField $corpusLock 'sources' Array 'revision corpus lock' | Out-Null
+    foreach ($lockSource in $corpusLock.sources) {
+        foreach ($name in @('id','filename','sha256')) { Get-RevisionJsonField $lockSource $name String 'revision corpus lock source' | Out-Null }
+        Get-RevisionJsonField $lockSource 'expected_topics' Integer 'revision corpus lock source' -Minimum 1 | Out-Null
+    }
+    if ($null -ne $corpusLock.expected_total_topics) { Get-RevisionJsonField $corpusLock 'expected_total_topics' Integer 'revision corpus lock' -Minimum 1 | Out-Null }
     if ($null -eq $corpusLock.sources -or @($corpusLock.sources).Count -ne 3) { throw 'Revision corpus lock must describe exactly three sources.' }
     $manifest = Read-JsonFile -Path $manifestPath -Context 'revision manifest' -RequireObject
     Assert-RevisionManifestTypes -Manifest $manifest
@@ -4195,11 +4268,15 @@ function Get-UpdateStatus {
     $path = Join-Path $root 'maintenance\update-status.json'
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { if ($AllowMissing) { return $null }; throw "Update status is missing: $path" }
     $status = Read-JsonFile -Path $path -Context 'update status' -RequireObject
-    $schemaVersion = [int](Get-RequiredJsonProperty $status 'schema_version' 'update status')
+    $schemaVersion = Get-RevisionJsonField $status 'schema_version' Integer 'update status' -Minimum 1
+    foreach ($name in @('checked_at','status','active_revision')) { Get-RevisionJsonField $status $name String 'update status' | Out-Null }
+    foreach ($name in @('candidate_revision','message')) { Get-RevisionJsonField $status $name NullableString 'update status' | Out-Null }
     if ($schemaVersion -eq 1) {
         Assert-ExactJsonProperties -Object $status -Names @('schema_version','checked_at','status','active_revision','candidate_revision','message') -Context 'legacy update status'
     } elseif ($schemaVersion -eq 2) {
         Assert-ExactJsonProperties -Object $status -Names @('schema_version','checked_at','status','active_revision','active_corpus_revision','candidate_revision','candidate_corpus_revision','message') -Context 'update status'
+        Get-RevisionJsonField $status 'active_corpus_revision' String 'update status' | Out-Null
+        Get-RevisionJsonField $status 'candidate_corpus_revision' NullableString 'update status' | Out-Null
         if ([string]$status.active_corpus_revision -cnotmatch '^[0-9a-f]{64}$') { throw 'Update status active_corpus_revision is invalid.' }
         if ($null -ne $status.candidate_corpus_revision -and [string]$status.candidate_corpus_revision -cnotmatch '^[0-9a-f]{64}$') { throw 'Update status candidate_corpus_revision is invalid.' }
     } else { throw 'Update status schema_version must be 1 or 2.' }
@@ -4276,6 +4353,7 @@ function Assert-StagedRevisionReport {
     )
     $report = Read-JsonFile -Path $Path -Context 'stage report' -RequireObject
     Assert-ExactJsonProperties -Object $report -Names @('schema_version','index_revision','corpus_revision','base_index_revision','base_corpus_revision','staged_at','validation_passed','source_topic_counts','changes','asset_changes','required_rankings') -Context 'stage report'
+    Assert-StagedRevisionReportTypes -Report $report
     if ([int]$report.schema_version -ne 3 -or [string]$report.index_revision -cne $ExpectedRevision -or $report.validation_passed -isnot [bool] -or -not [bool]$report.validation_passed) { throw 'Stage report is not approved for this index revision.' }
     if ([string]$report.corpus_revision -cnotmatch '^[0-9a-f]{64}$') { throw 'Stage report corpus_revision is invalid.' }
     if (($null -eq $report.base_index_revision) -ne ($null -eq $report.base_corpus_revision)) { throw 'Stage report base revisions must both be set or both be null.' }
@@ -4300,6 +4378,7 @@ function Assert-LegacyStagedRevisionReport {
     if ((Get-FileSystemItemOrFallback -Path $full).Length -gt 2097152) { throw 'Legacy stage report exceeds the 2 MiB validation limit.' }
     $report = Read-JsonFile -Path $full -Context 'legacy stage report' -RequireObject
     Assert-ExactJsonProperties -Object $report -Names @('schema_version','revision','base_revision','staged_at','validation_passed','source_topic_counts','changes','required_rankings') -Context 'legacy stage report'
+    Assert-StagedRevisionReportTypes -Report $report -Legacy
     if ([int]$report.schema_version -ne 1 -or [string]$report.revision -cne $ExpectedCorpusRevision -or $report.validation_passed -isnot [bool] -or -not [bool]$report.validation_passed) { throw 'Legacy stage report is not approved for this corpus revision.' }
     if ([string]$report.base_revision -cnotmatch '^[0-9a-f]{64}$' -or [string]$report.base_revision -ceq $ExpectedCorpusRevision) { throw 'Legacy stage report base_revision is invalid.' }
     Assert-UtcIsoTimestamp -Value ([string]$report.staged_at) -Context 'legacy stage report staged_at'
@@ -4338,11 +4417,13 @@ function Get-RevisionTransition {
         throw "Revision transition journal is missing: $path"
     }
     $transition = Read-JsonFile -Path $path -Context 'revision transition journal' -RequireObject
-    $schemaVersion = [int](Get-RequiredJsonProperty $transition 'schema_version' 'revision transition journal')
+    $schemaVersion = Get-RevisionJsonField $transition 'schema_version' Integer 'revision transition journal' -Minimum 1
+    foreach ($name in @('operation','from_revision','to_revision','started_at')) { Get-RevisionJsonField $transition $name String 'revision transition journal' | Out-Null }
     if ($schemaVersion -eq 1) {
         Assert-ExactJsonProperties -Object $transition -Names @('schema_version','operation','from_revision','to_revision','started_at') -Context 'legacy revision transition journal'
     } elseif ($schemaVersion -eq 2) {
         Assert-ExactJsonProperties -Object $transition -Names @('schema_version','operation','from_revision','from_corpus_revision','to_revision','to_corpus_revision','started_at') -Context 'revision transition journal'
+        foreach ($name in @('from_corpus_revision','to_corpus_revision')) { Get-RevisionJsonField $transition $name String 'revision transition journal' | Out-Null }
         foreach ($name in @('from_corpus_revision','to_corpus_revision')) { if ([string]$transition.PSObject.Properties[$name].Value -cnotmatch '^[0-9a-f]{64}$') { throw "Revision transition $name is invalid." } }
     } else { throw 'Revision transition schema_version must be 1 or 2.' }
     if (@('apply','rollback') -notcontains [string]$transition.operation) { throw 'Revision transition operation is invalid.' }

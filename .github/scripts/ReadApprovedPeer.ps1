@@ -8,8 +8,8 @@ if ($record -isnot [Collections.IDictionary] -or @($record.Keys).Count -ne 4 -or
     @($record.Keys | Where-Object {$_ -cnotin @('schema_version','repository','version','commit')}).Count -ne 0 -or
     ($record.schema_version -isnot [int] -and $record.schema_version -isnot [long]) -or $record.schema_version -ne 1 -or
     $record.repository -isnot [string] -or $record.repository -cne $ExpectedRepository -or
-    $record.commit -isnot [string] -or $record.commit -cnotmatch '^[0-9a-f]{40}$' -or
-    $record.version -isnot [string] -or $record.version -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {throw 'Invalid approved peer record.'}
+    $record.commit -isnot [string] -or $record.commit -cnotmatch '\A[0-9a-f]{40}\z' -or
+    $record.version -isnot [string] -or $record.version -cnotmatch '\A(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\z') {throw 'Invalid approved peer record.'}
 if ($PeerRoot) {
     if (-not $VersionFile) {throw 'Peer verification requires its version file.'}
     $commit=(& git -C $PeerRoot rev-parse HEAD).Trim()

@@ -20,6 +20,12 @@ try {
         $copy=$good|ConvertFrom-Json -AsHashtable;$copy[$field]=switch($field){schema_version {1.0} repository {'other/repository'} version {'01.0.0'} commit {'A'*40}}
         [IO.File]::WriteAllText($path,($copy|ConvertTo-Json -Compress));$failed=$false;try{& $reader -RecordPath $path -ExpectedRepository $expected | Out-Null}catch{$failed=$true};Assert $failed ('Invalid approved field accepted '+$field)
     }
+    foreach($field in @('commit','version')) {
+        foreach($suffix in @("`n","`r`n","`r",' ',"`t")) {
+            $copy=$good|ConvertFrom-Json -AsHashtable;$copy[$field]+=$suffix
+            [IO.File]::WriteAllText($path,($copy|ConvertTo-Json -Compress));$failed=$false;try{& $reader -RecordPath $path -ExpectedRepository $expected | Out-Null}catch{$failed=$true};Assert $failed ('Trailing characters accepted in approved '+$field)
+        }
+    }
     [IO.File]::WriteAllText($path,$good);& $reader -RecordPath $path -ExpectedRepository $expected | Out-Null;$checks++
     $peer=Join-Path $root 'peer';[void][IO.Directory]::CreateDirectory($peer)
     & git -C $peer init --quiet; & git -C $peer config user.name 'Compatibility fixture'; & git -C $peer config user.email 'fixture@example.invalid'

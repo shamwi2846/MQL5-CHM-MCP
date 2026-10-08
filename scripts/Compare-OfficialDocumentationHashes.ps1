@@ -32,6 +32,8 @@ function Compare-OfficialDocumentationHashes {
         Assert-NoReparsePoint -Root $root -Path $lockPath
         $lock = Read-JsonFile -Path $lockPath -Context 'tracked corpus lock' -RequireObject
         Assert-ExactJsonProperties -Object $lock -Names @('schema_version','sources','expected_total_topics') -Context 'tracked corpus lock'
+        Get-RevisionJsonField $lock 'schema_version' String 'tracked corpus lock' | Out-Null
+        Get-RevisionJsonField $lock 'sources' Array 'tracked corpus lock' | Out-Null
         if ([string]$lock.schema_version -cne '1.0' -or @($lock.sources).Count -ne 3) {
             throw 'Tracked corpus lock must use schema 1.0 and describe exactly three sources.'
         }
@@ -40,6 +42,7 @@ function Compare-OfficialDocumentationHashes {
         $expectedById = @{}
         foreach ($source in @($lock.sources)) {
             Assert-ExactJsonProperties -Object $source -Names @('id','filename','sha256','expected_topics','role') -Context 'tracked corpus lock source'
+            foreach ($name in @('id','filename','sha256')) { Get-RevisionJsonField $source $name String 'tracked corpus lock source' | Out-Null }
             $id = [string]$source.id
             if ([string]::IsNullOrWhiteSpace($id) -or $expectedById.ContainsKey($id)) {
                 throw "Tracked corpus lock contains a missing or duplicate source id: '$id'."

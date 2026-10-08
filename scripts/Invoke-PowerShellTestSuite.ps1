@@ -9,6 +9,9 @@ $ErrorActionPreference = 'Stop'
 
 $maintenance = @(
     'Test-JsonObjectRoots.ps1',
+    'Test-JsonScalarTypes.ps1',
+    'Test-TransactionScalarTypes.ps1',
+    'Test-CorpusLockTypes.ps1',
     'Test-CodexRegistration.ps1',
     'Test-FileSetTransaction.ps1',
     'Test-GlobalMutex.ps1',

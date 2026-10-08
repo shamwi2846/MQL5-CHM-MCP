@@ -582,6 +582,20 @@ test("release identity rejects serialized non-object roots before pipeline enume
   }
 });
 
+test("release identity rejects every trailing version character with matching lockfile versions", async () => {
+  for (const refType of ["branch", "tag"]) {
+    for (const packageVersion of ["1.2.3\n", "1.2.3-rc.1+build.7\n", "1.2.3\r\n", "1.2.3\r", "1.2.3 ", "1.2.3\t"]) {
+      const invalid = await runReleaseVersionCheck({ packageVersion, refType });
+      assert.notEqual(invalid.status, 0, `${refType} accepted trailing characters in ${JSON.stringify(packageVersion)}`);
+      assert.match(`${invalid.stderr}\n${invalid.stdout}`, /not a release version/i);
+    }
+    for (const packageVersion of ["1.2.3", "1.2.3-rc.1", "1.2.3-rc.1+build.7"]) {
+      const valid = await runReleaseVersionCheck({ packageVersion, refType });
+      assert.equal(valid.status, 0, `${refType} rejected valid SemVer ${packageVersion}: ${valid.stderr}`);
+    }
+  }
+});
+
 test("release identity retains malformed JSON and missing-file failures", async () => {
   for (const file of ["packageText", "lockText"]) {
     const invalid = await runReleaseVersionCheck({ [file]: '{"version":' });
