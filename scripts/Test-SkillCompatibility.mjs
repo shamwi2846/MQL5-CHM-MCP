@@ -229,6 +229,7 @@ export async function runCompatibility({ skillRoot, pythonPath, serverPath = pat
   };
   let serverVersion;
   let verifiedCorpusRevision;
+  let verifiedIndexRevision;
   try {
     beforeCorpus = await artifactHashes(root);
     await client.connect(transport);
@@ -238,6 +239,7 @@ export async function runCompatibility({ skillRoot, pythonPath, serverPath = pat
     checks.push("server_identity_and_advertised_contract");
     const status = (await call("mql5_chm_status", {})).structuredContent;
     verifiedCorpusRevision = status.corpus_revision;
+    verifiedIndexRevision = status.index_revision;
     assert.equal(status.index_revision, status.index_sha256);
     checks.push("status_revision_fields");
     const search = (await call("mql5_chm_search", { query: identifier, source: "mql5", expand: false, limit: 1 })).structuredContent;
@@ -332,7 +334,7 @@ export async function runCompatibility({ skillRoot, pythonPath, serverPath = pat
   for (const file of skillFiles) assert.equal(hash(await readFile(path.join(skillRoot, file))), beforeSkill[file], "Skill changed during compatibility validation");
   assert.equal(hash(await readFile(serverPath)), beforeServer, "Server bundle changed during compatibility validation");
   checks.push("read_only_artifacts_unchanged");
-  return { schema_version: 1, status: "passed", mode: fixture ? "synthetic_corpus" : "installed_corpus", verified_utc: new Date().toISOString(), mcp_checkout_commit: gitCommit(repositoryRoot), skill_checkout_commit: gitCommit(path.resolve(skillRoot, "../..")), server_version: serverVersion, server_path: serverPath, server_sha256: beforeServer, skill_root: skillRoot, skill_files_sha256: beforeSkill, metadata_dependency_verified: true, corpus_revision: verifiedCorpusRevision, checks };
+  return { schema_version: 1, status: "passed", mode: fixture ? "synthetic_corpus" : "installed_corpus", verified_utc: new Date().toISOString(), mcp_checkout_commit: gitCommit(repositoryRoot), skill_checkout_commit: gitCommit(path.resolve(skillRoot, "../..")), server_version: serverVersion, server_path: serverPath, server_sha256: beforeServer, skill_root: skillRoot, skill_files_sha256: beforeSkill, metadata_dependency_verified: true, corpus_revision: verifiedCorpusRevision, index_revision: verifiedIndexRevision, artifact_sha256: beforeCorpus, checks };
 }
 
 async function cli() {

@@ -47,6 +47,14 @@ jobs:
         shell: pwsh
         run: npm run test:fast
 
+      - name: Generated JSON cases under both supported hosts
+        shell: pwsh
+        run: |
+          ./tests/Test-GeneratedJson.ps1
+          $env:PSModulePath="$env:USERPROFILE\Documents\WindowsPowerShell\Modules;$env:ProgramFiles\WindowsPowerShell\Modules;$env:WINDIR\System32\WindowsPowerShell\v1.0\Modules"
+          powershell.exe -NoProfile -File ./tests/Test-GeneratedJson.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Generated Windows PowerShell cases failed.' }
+
       - name: Run maintenance tests under PowerShell 7
         shell: pwsh
         run: npm run test:maintenance

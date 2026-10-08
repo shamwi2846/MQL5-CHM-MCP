@@ -21,8 +21,32 @@ permissions:
   contents: read
 
 jobs:
+  resolve-peer:
+    name: Resolve the approved skill commit
+    runs-on: windows-latest
+    timeout-minutes: 5
+    outputs:
+      commit: ${{ steps.peer.outputs.commit }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Validate the approved peer record
+        id: peer
+        shell: pwsh
+        env:
+          EXPECTED_PEER: ${{ github.repository_owner }}/MQL5-Coding-Skill
+        run: ./.github/scripts/ReadApprovedPeer.ps1 -RecordPath ./.github/approved-peer.json -ExpectedRepository $env:EXPECTED_PEER
+      - name: Test approved peer validation
+        shell: pwsh
+        run: ./.github/scripts/TestApprovedPeer.ps1
   pair:
-    name: Verify the actual MCP and skill pair
+    name: Verify the actual MCP and skill pair (${{ matrix.pair }})
+    needs: resolve-peer
+    strategy:
+      fail-fast: false
+      matrix:
+        pair: [main, approved]
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: windows-latest
     timeout-minutes: 15
@@ -37,10 +61,17 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: ${{ github.repository_owner }}/MQL5-Coding-Skill
-          ref: ${{ inputs.peer_ref || 'main' }}
+          ref: ${{ matrix.pair == 'approved' && needs.resolve-peer.outputs.commit || inputs.peer_ref || 'main' }}
           path: skill
           ssh-key: ${{ secrets.MQL5_PEER_READ_KEY }}
           persist-credentials: false
+
+      - name: Verify the approved checkout identity
+        if: matrix.pair == 'approved'
+        shell: pwsh
+        env:
+          EXPECTED_PEER: ${{ github.repository_owner }}/MQL5-Coding-Skill
+        run: ./mcp/.github/scripts/ReadApprovedPeer.ps1 -RecordPath ./mcp/.github/approved-peer.json -ExpectedRepository $env:EXPECTED_PEER -PeerRoot ./skill -VersionFile skills/mql5-coding/version.json
 
       - name: Use Node.js 24.17.0
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
@@ -88,6 +119,8 @@ jobs:
           "MCP commit: $($proof.mcp_checkout_commit)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
           "Skill commit: $($proof.skill_checkout_commit)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
           "Passed checks: $($proof.checks.Count)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          node mcp/.github/scripts/CollectPeerEvidence.mjs "$PWD/mcp" "$PWD/skill/skills/mql5-coding" "$PWD/compatibility-identities.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Peer identity evidence failed.' }
 
       - name: Test the environment health command under both PowerShell versions
         shell: pwsh
@@ -100,7 +133,9 @@ jobs:
       - name: Retain the verified repository pair
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: mql5-compatibility-${{ github.sha }}
-          path: compatibility.json
+          name: mql5-compatibility-${{ matrix.pair }}-${{ github.sha }}
+          path: |
+            compatibility.json
+            compatibility-identities.json
           if-no-files-found: error
           retention-days: 30

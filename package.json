@@ -1,6 +1,6 @@
 {
   "name": "mql5-chm-mcp",
-  "version": "1.3.6",
+  "version": "1.3.7",
   "private": true,
   "type": "module",
   "description": "Portable read-only MCP server for the official local MQL5 CHM corpus.",
@@ -14,7 +14,7 @@
     "test:app-mcp": "node scripts/Test-AppBundle.mjs",
     "test:powershell-syntax": "pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/Test-PowerShellSyntax.ps1 && powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File ./scripts/Test-PowerShellSyntax.ps1",
     "pretest:fast": "npm run build:candidate",
-    "test:fast": "npm run notices:check && npm run test:powershell-syntax && node --test --test-concurrency=1 --test-skip-pattern=\"^(the one official trailing-PNG exception|signature extraction returns only|signature extraction trusts|portable stdio MCP)\" tests/batch-lookup.test.mjs tests/identifier-benchmark.test.mjs tests/build-script.test.mjs tests/bundled-notices.test.mjs tests/ci-contract.test.mjs tests/image-indexer-v12.test.mjs tests/image-runtime-v12.test.mjs tests/png-palette.test.mjs tests/png-transparency.test.mjs tests/raster-identifiers.test.mjs tests/image-service-v12.test.mjs tests/indexer-recovery.test.mjs tests/indexer-v11.test.mjs tests/install-smoke.test.mjs tests/maintenance-metadata.test.mjs tests/mcp.test.mjs tests/server-v11.test.mjs tests/skill-compatibility.test.mjs tests/unit.test.mjs tests/v12-contract.test.mjs",
+    "test:fast": "npm run notices:check && npm run test:powershell-syntax && node --test --test-concurrency=1 --test-skip-pattern=\"^(the one official trailing-PNG exception|signature extraction returns only|signature extraction trusts|portable stdio MCP)\" tests/batch-lookup.test.mjs tests/identifier-benchmark.test.mjs tests/build-script.test.mjs tests/bundled-notices.test.mjs tests/ci-contract.test.mjs tests/image-indexer-v12.test.mjs tests/image-runtime-v12.test.mjs tests/png-palette.test.mjs tests/png-transparency.test.mjs tests/raster-identifiers.test.mjs tests/generated-inputs.test.mjs tests/image-service-v12.test.mjs tests/indexer-recovery.test.mjs tests/indexer-v11.test.mjs tests/install-smoke.test.mjs tests/maintenance-metadata.test.mjs tests/mcp.test.mjs tests/server-v11.test.mjs tests/skill-compatibility.test.mjs tests/unit.test.mjs tests/v12-contract.test.mjs",
     "test:maintenance": "pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/Invoke-PowerShellTestSuite.ps1 -Suite Maintenance",
     "test:release:powershell": "pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/Invoke-PowerShellTestSuite.ps1 -Suite Release",
     "test:release:windows-powershell": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File ./scripts/Invoke-PowerShellTestSuite.ps1 -Suite Release",
@@ -28,7 +28,8 @@
     "package:portable": "powershell -NoProfile -ExecutionPolicy Bypass -File ./Package-Portable.ps1",
     "test:skill-compatibility": "node scripts/Test-SkillCompatibility.mjs",
     "benchmark:identifiers": "node scripts/Measure-IdentifierBatch.mjs",
-    "test:environment-health": "node --test tests/environment-health.test.mjs"
+    "test:environment-health": "node --test tests/environment-health.test.mjs",
+    "test:generated:extended": "pwsh -NoProfile -File tests/Invoke-GeneratedInputTests.ps1 -Tier extended"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
