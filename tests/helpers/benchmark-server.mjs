@@ -15,6 +15,15 @@ export async function main({ root }) {
       if (failure === "status-error") return { isError: true, content: [{ type: "text", text: "controlled status error" }] };
       return reply({ corpus_revision: "fixture-corpus", index_revision: "fixture-index" });
     }
+    // Identifier measurements request limit 1; the frozen quality matrix uses
+    // limit 8 or the read/image interfaces. Malformed structured entries remain
+    // protocol-valid so the real CLI exercises its grading failure path.
+    if (failure.startsWith("quality-") && (params.name === "mql5_chm_read" || params.name === "mql5_chm_read_image" || params.arguments.limit === 8)) {
+      if (failure === "quality-tool-error") return { isError: true, content: [{ type: "text", text: "controlled quality error" }] };
+      if (params.name === "mql5_chm_read_image") return { structuredContent: {}, content: [{ type: "text", text: "missing image" }] };
+      if (params.name === "mql5_chm_read") return reply({ images: failure === "quality-null-entry" ? [null] : {}, image_count: 1 });
+      return reply({ query: params.arguments.query, source: params.arguments.source, count: 1, results: failure === "quality-null-entry" ? [null] : {} });
+    }
     let measuredMode;
     let value;
     if (params.name === "mql5_chm_search") {

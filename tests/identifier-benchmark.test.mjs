@@ -9,6 +9,7 @@ import { median } from "../scripts/IdentifierBenchmarkStatistics.mjs";
 
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const serverPath = path.join(repository, "tests/helpers/benchmark-server.mjs");
+const qualityCasesPath = path.join(repository, "tests/fixtures/documentation-quality.json");
 for (const [label, samples, expected] of [
   ["one sample", [7], 7],
   ["odd count", [10, 2, 4], 4],
@@ -20,6 +21,40 @@ for (const [label, samples, expected] of [
     const original = [...samples];
     assert.equal(median(samples), expected);
     assert.deepEqual(samples, original, "Statistics must preserve the original measurements");
+  });
+}
+
+for (const fault of ["quality-null-entry", "quality-object-container", "quality-tool-error"]) {
+  test(`public benchmark retains all quality failures for ${fault}`, { timeout: 20_000 }, async t => {
+    const fixture = await mkdtemp(path.join(tmpdir(), "mql5-quality-benchmark-"));
+    t.after(async () => {
+      assert.ok(path.resolve(fixture).startsWith(path.resolve(tmpdir()) + path.sep));
+      await rm(fixture, { recursive: true, force: true });
+    });
+    await mkdir(path.join(fixture, "data"));
+    const pointer = path.join(fixture, "data/active.json");
+    const report = path.join(fixture, "measurement.json");
+    const qualityOutput = path.join(fixture, "quality.json");
+    await writeFile(pointer, "{}\n");
+    await writeFile(path.join(fixture, "fault.txt"), fault);
+    const originalServer = await readFile(serverPath), originalPointer = await readFile(pointer), originalCases = await readFile(qualityCasesPath);
+    const result = spawnSync(process.execPath, [path.join(repository, "scripts/Measure-IdentifierBatch.mjs"), "--package-root", fixture, "--server-path", serverPath, "--samples", "3", "--report", report, "--quality-cases", qualityCasesPath, "--quality-output", qualityOutput], { encoding: "utf8", windowsHide: true, timeout: 15_000 });
+    assert.equal(result.error, undefined);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Documentation quality cases failed; retained full evidence/);
+    const evidence = JSON.parse(await readFile(qualityOutput, "utf8"));
+    assert.equal(evidence.status, "failed");
+    assert.equal(evidence.cases.length, 32);
+    assert.ok(evidence.cases.every(entry => entry.status === "failed" && entry.issues.length > 0 && entry.warm_samples_ms.length === 9 && entry.response_sha256.length === 9));
+    if (fault === "quality-null-entry") {
+      assert.deepEqual(evidence.cases[0].initial_response.structuredContent.results, [null]);
+      assert.ok(evidence.cases[0].issues.includes("Invalid citation entry"));
+    }
+    assert.deepEqual(evidence.artifact_integrity, { server_unchanged: true, pointer_unchanged: true });
+    await assert.rejects(access(report), { code: "ENOENT" });
+    assert.deepEqual(await readFile(serverPath), originalServer);
+    assert.deepEqual(await readFile(pointer), originalPointer);
+    assert.deepEqual(await readFile(qualityCasesPath), originalCases);
   });
 }
 test("identifier benchmark refuses a median without samples", () => {
