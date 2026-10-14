@@ -1,4 +1,4 @@
-# Portable Read-Only MQL5 CHM MCP v1.3.11
+# Portable Read-Only MQL5 CHM MCP v1.3.12
 
 ## Value Proposition
 
@@ -76,6 +76,8 @@ Update documentation:
 - Portability: the release ZIP contains only the active schema-3 revision, runtime, scripts, checksums, and licenses; it is published with a timestamp-free ZIP manifest sidecar
 
 ## Public MCP Interfaces
+
+The initialize result carries concise server `instructions` (at most 1,500 characters, essentials within the first 512) that Codex and Claude Code show to the model: the status, lookup and read workflow; that an exact match only identifies a candidate until a returned passage supports the claim; text-only read flags and cursor continuation; citation fields; and the `require_current` freshness check. They name only registered tools and real input parameters (tested), and stay consistent with the companion skill.
 
 All tools use `readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: true`, and `openWorldHint: false`.
 All bounded inputs are validated strictly. Out-of-range values are rejected and never silently clamped.
@@ -173,11 +175,11 @@ HTTP timestamps are labeled as HTTP metadata or retrieval time, never as a CHM b
 
 ## Index and Revision Model
 
-- Server/package version: 1.3.11. Manifest and SQLite schema version: 3. Pointer schema: 2.
+- Server/package version: 1.3.12. Manifest and SQLite schema version: 3. Pointer schema: 2.
 - `corpus_sha256` is the SHA-256 of the UTF-8 concatenation `source_id + NUL + lowercase_chm_sha256 + NUL` for `mql5`, `mql5book`, then `neuronetworksbook`. It intentionally depends only on the downloaded source set so the checker can name a candidate before extraction.
 - `index_revision` is the lowercase SHA-256 of the completed schema-3 SQLite database. The database contains the complete asset catalog and asset-tree digest, so this identity binds text and image metadata without creating a self-hash cycle.
 - SQLite identity-bearing data excludes build/retrieval times, ETags, and HTTP Last-Modified. Those values remain in the manifest. Identical inputs, index contract, and image policy must produce byte-identical databases and index revisions.
-- SQLite metadata includes `index_contract`, the image-policy digest, asset-catalog digest, asset-tree digest, and exact counts. `index_contract` changes whenever extraction or indexing semantics change without a SQL-schema change. v1.3.11 emits `mql5-chm-index-v3-assets-v4`, introduced in v1.3.3 for DOM-ordered image associations and offset-aware trailing-whitespace trimming. The transitional runtime accepts rollback contracts `mql5-chm-index-v3-assets-v1` and `mql5-chm-index-v3-assets-v2`, and `mql5-chm-index-v3-assets-v3` as well as the current contract, while new candidate activation requires the current contract.
+- SQLite metadata includes `index_contract`, the image-policy digest, asset-catalog digest, asset-tree digest, and exact counts. `index_contract` changes whenever extraction or indexing semantics change without a SQL-schema change. v1.3.12 emits `mql5-chm-index-v3-assets-v4`, introduced in v1.3.3 for DOM-ordered image associations and offset-aware trailing-whitespace trimming. The transitional runtime accepts rollback contracts `mql5-chm-index-v3-assets-v1` and `mql5-chm-index-v3-assets-v2`, and `mql5-chm-index-v3-assets-v3` as well as the current contract, while new candidate activation requires the current contract.
 - Image occurrences use the latest preceding retained heading in source DOM order; occurrences before the first retained heading or in heading-free topics use the first section. An image may legitimately share the following heading's text offset while belonging to the preceding section. Trailing-whitespace removal updates recorded heading and image positions before final normalization, without inserting markers or changing rendered text.
 - Each immutable revision lives under `revisions/<index_revision>/` and contains its three CHMs, database, manifest, corpus lock, stage report when staged, and the exact `assets/` tree.
 - `data/active.json` is the only activation pointer. Schema 2 retains `active_revision`, `previous_revision`, and `activated_at`; revision fields identify indexes and are replaced atomically.

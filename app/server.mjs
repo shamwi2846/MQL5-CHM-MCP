@@ -35435,6 +35435,16 @@ async function createSearchService(options = {}) {
 
 // src/server.mjs
 var MODULE_PROJECT_ROOT2 = resolve2(dirname2(fileURLToPath2(import.meta.url)), "..");
+var SERVER_EVIDENCE_RULE = "An exact match only identifies a candidate: base each claim on a returned passage that supports it and contains the complete identifier.";
+var SERVER_INSTRUCTIONS = [
+  "Offline MQL5 documentation for MetaTrader 5 API, language, error, trade-retcode and Strategy Tester facts.",
+  SERVER_EVIDENCE_RULE,
+  'Call mql5_chm_status once per task; look up 2+ names with mql5_chm_lookup_identifiers (source "mql5", limit 1), one name with mql5_chm_search (source "mql5", expand false); then mql5_chm_read the chosen topic_id with section_id or focus.',
+  "Batch lookups take up to 16 names; when that tool is unavailable use one mql5_chm_search per name. With no exact match, search a narrow concept phrase and confirm relevance.",
+  "For text-only reads pass include_related false and include_images false; to continue, pass next_cursor as cursor with the same topic_id and section_id.",
+  "Cite the exact title, topic_id (and section_id when used) and the corpus or index revision once per answer.",
+  "The corpus is a local snapshot: when current information matters, pass require_current true and check the returned official_search_query on mql5.com."
+].join(" ");
 var TOOL_ANNOTATIONS = Object.freeze({
   readOnlyHint: true,
   destructiveHint: false,
@@ -35627,8 +35637,8 @@ function toolFailure(error51) {
 }
 function createMcpServer(service) {
   const server = new McpServer(
-    { name: "mql5-chm", version: "1.3.11" },
-    { capabilities: { tools: {} } }
+    { name: "mql5-chm", version: "1.3.12" },
+    { capabilities: { tools: {} }, instructions: SERVER_INSTRUCTIONS }
   );
   server.registerTool(
     "mql5_chm_search",
@@ -35926,6 +35936,8 @@ if (isDirectInvocation()) {
   await main();
 }
 export {
+  SERVER_EVIDENCE_RULE,
+  SERVER_INSTRUCTIONS,
   createMcpServer,
   main
 };

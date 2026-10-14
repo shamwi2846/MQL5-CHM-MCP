@@ -194,6 +194,39 @@ for (const shell of ["pwsh.exe", "powershell.exe"]) {
       assert.equal(report.python.available, true);
       assert.equal(report.python.pyyaml_available, true);
     });
+    // The approved-peer CI leg pins an older skill whose health command has no
+    // Claude Code mode; exercise these cases only against a supporting peer.
+    const peerSupportsClaude = /\[ValidateSet\('Codex','Claude'\)\]\[string\]\$ClientHost/u.test(await readFile(health, "utf8"));
+    await t.test("Claude Code registration: user scope, overriding local scope, and absence", { skip: peerSupportsClaude ? false : "peer skill predates Claude Code health checks" }, async () => {
+      const claudeHome = path.join(temporary, "claude home");
+      await mkdir(claudeHome, { recursive: true });
+      const workspaceKey = temporary.replaceAll("\\", "/");
+      const entry = command => ({ type: "stdio", command, args: [path.join(fixture.root, "app/server.mjs")], env: {} });
+      const owned = entry(path.join(fixture.root, "runtime/node.exe"));
+      // Case-distinct project keys are legal in Claude Code's configuration.
+      const writeConfig = (user, local) => writeFile(path.join(claudeHome, ".claude.json"), JSON.stringify({
+        projects: { [workspaceKey]: { mcpServers: local ? { "mql5-chm": local } : {} }, [workspaceKey.toUpperCase() + "-other"]: {}, [workspaceKey.toLowerCase() + "-other"]: {} },
+        mcpServers: user ? { "mql5-chm": user } : {},
+      }));
+      const claude = ["-ClientHost", "Claude", "-ClaudeConfigDirectory", claudeHome, "-ClaudePath", path.join(temporary, "missing-claude.exe")];
+      await writeConfig(owned, null);
+      let { report } = run(claude);
+      assert.equal(report.client_host, "Claude");
+      assert.equal(report.claude.registration_state, "enabled");
+      assert.equal(report.claude.registration_scope, "user");
+      assert.equal(report.mcp.stdio_available, true);
+      assert.deepEqual(report.issues.filter(issue => issue.severity === "error"), []);
+      assert.ok(codes(report).includes("claude_cli_missing"));
+      await writeConfig(owned, entry(path.join(temporary, "other package/runtime/node.exe")));
+      ({ report } = run(claude, 1));
+      assert.equal(report.claude.registration_scope, "local");
+      assert.deepEqual(report.claude.shadowed_scopes, ["user"]);
+      assert.ok(codes(report).includes("mcp_registration_mismatch"));
+      await writeConfig(null, null);
+      ({ report } = run(claude, 1));
+      assert.equal(report.claude.registration_state, "absent");
+      assert.ok(codes(report).includes("claude_registration_missing"));
+    });
     await t.test("matching inventories accept an additional skill resource without a fixed file count", async () => {
       const relative = "assets/health-inventory-fixture.txt";
       const bytes = Buffer.from("Additional supported asset used only by this fixture.\n");

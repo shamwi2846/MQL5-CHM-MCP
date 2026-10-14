@@ -36,7 +36,7 @@ try {
         Assert-CandidateActivationAccepted -ProjectRoot $root -CandidateIndexRevision ([string]$pending.to_revision) -BaseRevision $baseForRecovery -AcceptAssetReduction:$AcceptAssetReduction | Out-Null
         $completed = Complete-RevisionTransition -ProjectRoot $root
         Clear-RevisionTransition -ProjectRoot $root -ExpectedTransition $completed
-        Write-Host "Recovered incomplete rebuild activation $($completed.from_revision) -> $($completed.to_revision). Restart Codex before using it."
+        Write-Host "Recovered incomplete rebuild activation $($completed.from_revision) -> $($completed.to_revision). Restart any running Codex or Claude Code sessions that use this package before using it."
         return
     }
 
@@ -47,7 +47,7 @@ try {
             Set-ActiveRevisionPointer -ProjectRoot $root -ActiveRevision $Revision -PreviousRevision $null -SchemaVersion 2 | Out-Null
             Set-UpdateStatus -ProjectRoot $root -Status 'up-to-date' -ActiveRevision $Revision -ActiveCorpusRevision ([string]$candidate.CorpusRevision) -CandidateRevision $Revision -CandidateCorpusRevision ([string]$candidate.CorpusRevision) -Message 'The initial verified index revision was activated locally.' | Out-Null
             Update-ManagedChecksumsIfPresent -ProjectRoot $root
-            Write-Host "Activated initial index revision $Revision. Restart Codex before using it."
+            Write-Host "Activated initial index revision $Revision. Restart any running Codex or Claude Code sessions that use this package before using it."
             return
         }
         if ([int]$pointer.schema_version -eq 1) { $pointer = Convert-ActiveRevisionPointerToSchema2 -ProjectRoot $root -AdditionalValidatedRevisions @($Revision) }
@@ -63,7 +63,7 @@ try {
         Start-RevisionTransition -ProjectRoot $root -Operation apply -FromRevision ([string]$base.IndexRevision) -ToRevision $Revision | Out-Null
         $completed = Complete-RevisionTransition -ProjectRoot $root
         Clear-RevisionTransition -ProjectRoot $root -ExpectedTransition $completed
-        Write-Host "Activated rebuilt index revision $Revision. Restart Codex before using it."
+        Write-Host "Activated rebuilt index revision $Revision. Restart any running Codex or Claude Code sessions that use this package before using it."
         return
     }
 
