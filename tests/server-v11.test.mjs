@@ -5,7 +5,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CallToolResultSchema, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 
-import { createMcpServer } from "../src/server.mjs";
+import { SERVER_EVIDENCE_RULE, createMcpServer } from "../src/server.mjs";
 
 const sourceRevision = "a".repeat(64);
 const corpusRevision = "b".repeat(64);
@@ -199,6 +199,39 @@ test("focused MCP results expose exact, approximate, and missing match status", 
     }
     const unfiltered = await client.callTool({ name: "mql5_chm_read", arguments: { topic_id: topicId } });
     assert.equal(unfiltered.structuredContent.focus_match, null);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("server instructions reach the client and name only real tools and inputs", async () => {
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const server = createMcpServer(fakeService);
+  const client = new Client({ name: "mql5-chm-instructions-test", version: "1.0.0" });
+  try {
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    const instructions = client.getInstructions();
+    assert.equal(typeof instructions, "string");
+    assert.ok(instructions.length > 200 && instructions.length <= 1_500, `instructions length ${instructions.length}`);
+    const listed = await client.listTools();
+    const toolNames = new Set(listed.tools.map((tool) => tool.name));
+    const inputNames = new Set(listed.tools.flatMap((tool) => Object.keys(tool.inputSchema.properties ?? {})));
+    const outputNames = new Set(["next_cursor", "official_search_query"]);
+    for (const name of instructions.match(/\bmql5_chm_[a-z_]+/gu)) assert.ok(toolNames.has(name), `unknown tool ${name}`);
+    for (const name of ["source", "limit", "expand", "topic_id", "section_id", "focus", "include_related", "include_images", "cursor", "require_current"]) {
+      assert.ok(instructions.includes(name), `instructions omit ${name}`);
+      assert.ok(inputNames.has(name), `instructions name a non-input ${name}`);
+    }
+    for (const name of outputNames) assert.ok(instructions.includes(name));
+    // Clients may truncate to 512 characters: the complete evidence rule and the
+    // core status/lookup/read workflow must survive that truncation.
+    const head = instructions.slice(0, 512);
+    assert.ok(head.includes(SERVER_EVIDENCE_RULE), "the complete evidence rule must fit in the first 512 characters");
+    for (const tool of ["mql5_chm_status", "mql5_chm_lookup_identifiers", "mql5_chm_search", "mql5_chm_read"]) {
+      assert.ok(head.includes(tool), `${tool} must appear in the first 512 characters`);
+    }
   } finally {
     await client.close();
     await server.close();

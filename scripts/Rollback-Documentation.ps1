@@ -27,7 +27,7 @@ try {
         Assert-Revision -ProjectRoot $root -Revision ([string]$pending.from_revision) -IdentityMode $identityMode | Out-Null
         Assert-Revision -ProjectRoot $root -Revision ([string]$pending.to_revision) -IdentityMode $identityMode | Out-Null
         $completed = Complete-RevisionTransition -ProjectRoot $root
-        Write-Host "Recovered incomplete rollback $($completed.from_revision) -> $($completed.to_revision). Restart Codex before using it."
+        Write-Host "Recovered incomplete rollback $($completed.from_revision) -> $($completed.to_revision). Restart any running Codex or Claude Code sessions that use this package before using it."
         Clear-RevisionTransition -ProjectRoot $root -ExpectedTransition $completed
         return
     }
@@ -39,7 +39,7 @@ try {
     Assert-Revision -ProjectRoot $root -Revision $previous -IdentityMode Index | Out-Null
     Start-RevisionTransition -ProjectRoot $root -Operation rollback -FromRevision $current -ToRevision $previous | Out-Null
     $completed = Complete-RevisionTransition -ProjectRoot $root
-    Write-Host "Rolled back documentation revision $current -> $previous. Restart Codex before using it."
+    Write-Host "Rolled back documentation revision $current -> $previous. Restart any running Codex or Claude Code sessions that use this package before using it."
     Clear-RevisionTransition -ProjectRoot $root -ExpectedTransition $completed
 } finally {
     if ($null -ne $lock) { $lock.Dispose() }

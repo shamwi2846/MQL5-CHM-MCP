@@ -38,7 +38,7 @@ try {
         }
         $completed = Complete-RevisionTransition -ProjectRoot $root
         Clear-RevisionTransition -ProjectRoot $root -ExpectedTransition $completed
-        Write-Host "Recovered incomplete $($completed.operation) transition $($completed.from_revision) -> $($completed.to_revision). Restart Codex before using it."
+        Write-Host "Recovered incomplete $($completed.operation) transition $($completed.from_revision) -> $($completed.to_revision). Restart any running Codex or Claude Code sessions that use this package before using it."
         return
     }
 
@@ -63,7 +63,7 @@ try {
         Start-RevisionTransition -ProjectRoot $root -Operation apply -FromRevision ([string]$pointer.active_revision) -ToRevision $Revision | Out-Null
         $completed = Complete-RevisionTransition -ProjectRoot $root
         Clear-RevisionTransition -ProjectRoot $root -ExpectedTransition $completed
-        Write-Host "Activated documentation index revision $Revision. Restart Codex before using it."
+        Write-Host "Activated documentation index revision $Revision. Restart any running Codex or Claude Code sessions that use this package before using it."
         return
     }
 
