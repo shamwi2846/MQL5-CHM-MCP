@@ -552,7 +552,11 @@ function Convert-DevelopmentLegacyActivePointerForStageRecovery {
     $root = Resolve-FullPath -Path $ProjectRoot -MustExist -PathType Container
     if ((Get-Mql5ChmLayoutMode -ProjectRoot $root) -ne 'development') { return $null }
     $pointer = Get-ActiveRevisionPointer -ProjectRoot $root -AllowMissing
-    if ($null -ne $pointer -and [int]$pointer.schema_version -eq 1) {
+    # A pending apply/rollback transition excludes a pending stage install, and
+    # the conversion refuses it; leave the legacy pointer for that transition's
+    # own recovery path instead of blocking it here.
+    if ($null -ne $pointer -and [int]$pointer.schema_version -eq 1 -and
+        $null -eq (Get-RevisionTransition -ProjectRoot $root -AllowMissing)) {
         return Convert-ActiveRevisionPointerToSchema2 -ProjectRoot $root
     }
     return $pointer

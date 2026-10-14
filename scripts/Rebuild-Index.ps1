@@ -95,8 +95,10 @@ try {
         $newCount = [int]$candidate.Manifest.sources.PSObject.Properties[$definition.Id].Value.topic_count
         $sourceCounts[$definition.Id] = [ordered]@{ base=$baseCount; candidate=$newCount; delta=($newCount-$baseCount) }
     }
-    $changes = if ($null -eq $base) { Get-TopicChangeReport -BaseInspection $null -CandidateInspection $candidate.Inspection } else { Get-TopicChangeReport -BaseInspection (Invoke-DatabaseInspection -NodePath (Resolve-NodeExecutable -ProjectRoot $root) -DatabasePath $base.DatabasePath) -CandidateInspection $candidate.Inspection }
-    $baseAssetInspection = if ($null -eq $base) { $null } else { Invoke-DatabaseInspection -NodePath (Resolve-NodeExecutable -ProjectRoot $root) -DatabasePath $base.DatabasePath }
+    # The immutable base was inspected once above; reuse it for both reports
+    # (Update-Documentation.ps1 does the same).
+    $changes = if ($null -eq $base) { Get-TopicChangeReport -BaseInspection $null -CandidateInspection $candidate.Inspection } else { Get-TopicChangeReport -BaseInspection $baseInspection -CandidateInspection $candidate.Inspection }
+    $baseAssetInspection = if ($null -eq $base) { $null } else { $baseInspection }
     $assetChanges = Get-AssetChangeReport -BaseInspection $baseAssetInspection -CandidateInspection $candidate.Inspection
     $rankings = [ordered]@{}; foreach ($query in @('OnTick','PositionSelectByTicket','OrderSend','CopyBuffer')) { $row=$candidate.Inspection.ranking.PSObject.Properties[$query].Value; $rankings[$query]=[ordered]@{title=[string]$row.title;source=[string]$row.source} }
     $stageReport = New-StagedRevisionReportValue -Revision ([string]$candidate.IndexRevision) -CorpusRevision ([string]$candidate.CorpusRevision) -BaseRevision $(if ($null -eq $base) { $null } else { [string]$base.IndexRevision }) -BaseCorpusRevision $(if ($null -eq $base) { $null } else { [string]$base.CorpusRevision }) -SourceTopicCounts $sourceCounts -Changes $changes -AssetChanges $assetChanges -RequiredRankings $rankings

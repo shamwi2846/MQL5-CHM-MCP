@@ -1730,7 +1730,7 @@ function Invoke-BoundedNodeJsDownload {
     $client = New-Object Net.Http.HttpClient($handler, $true)
     $client.Timeout = [Threading.Timeout]::InfiniteTimeSpan
     $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Get, $Uri)
-    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.3.10')
+    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.3.11')
     $response = $null
     $stream = $null
     $deadline = New-Object Threading.CancellationTokenSource([TimeSpan]::FromSeconds($TimeoutSeconds))
@@ -2125,7 +2125,13 @@ function Install-CodexMql5ChmRegistration {
     }
 
     $failureMessage = $null
-    $add = Invoke-NativeCapture -FilePath $CodexPath -Arguments @('mcp', 'add', 'mql5-chm', '--', $NodePath, $ServerPath)
+    # A timeout or launch failure can follow a completed write, so it takes the
+    # same ownership-checked rollback path as a nonzero exit.
+    try {
+        $add = Invoke-NativeCapture -FilePath $CodexPath -Arguments @('mcp', 'add', 'mql5-chm', '--', $NodePath, $ServerPath)
+    } catch {
+        $add = [pscustomobject]@{ ExitCode=-1; Text="Codex add command failed: $($_.Exception.Message)" }
+    }
     if ($add.ExitCode -ne 0) {
         $failureMessage = "Failed to register mql5-chm with Codex. Exit code: $($add.ExitCode). $($add.Text)"
     } else {
@@ -2151,7 +2157,11 @@ function Install-CodexMql5ChmRegistration {
         throw "$failureMessage Rollback was withheld because the registration now targets a different package."
     }
 
-    $remove = Invoke-NativeCapture -FilePath $CodexPath -Arguments @('mcp', 'remove', 'mql5-chm')
+    try {
+        $remove = Invoke-NativeCapture -FilePath $CodexPath -Arguments @('mcp', 'remove', 'mql5-chm')
+    } catch {
+        $remove = [pscustomobject]@{ ExitCode=-1; Text="Codex remove command failed: $($_.Exception.Message)" }
+    }
     $removeFailure = if ($remove.ExitCode -ne 0) { " Automatic rollback command reported exit code $($remove.ExitCode): $($remove.Text)" } else { '' }
     try { $afterRemoval = Get-CodexMcpRegistration -CodexPath $CodexPath } catch {
         throw "$failureMessage$removeFailure Automatic rollback ran, but its postcondition could not be verified: $($_.Exception.Message)"
@@ -2181,7 +2191,11 @@ function Uninstall-CodexMql5ChmRegistration {
     if (-not (Test-Mql5ChmRegistrationOwned -Registration $existing -NodePath $NodePath -ServerPath $ServerPath)) {
         throw "The mql5-chm registration belongs to a different package path; refusing to remove it."
     }
-    $remove = Invoke-NativeCapture -FilePath $CodexPath -Arguments @('mcp', 'remove', 'mql5-chm')
+    try {
+        $remove = Invoke-NativeCapture -FilePath $CodexPath -Arguments @('mcp', 'remove', 'mql5-chm')
+    } catch {
+        $remove = [pscustomobject]@{ ExitCode=-1; Text="Codex remove command failed: $($_.Exception.Message)" }
+    }
     $removeFailure = if ($remove.ExitCode -ne 0) { "Codex remove reported exit code $($remove.ExitCode): $($remove.Text)" } else { $null }
     try { $afterRemoval = Get-CodexMcpRegistration -CodexPath $CodexPath } catch {
         $prefix = if ($null -eq $removeFailure) { 'Codex remove ran' } else { $removeFailure }
@@ -2365,16 +2379,63 @@ function Get-ClaudeMcpRegistrations {
     if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { return $result }
     $text = [IO.File]::ReadAllText($ConfigPath)
     if ([string]::IsNullOrWhiteSpace($text)) { return $result }
-    $userEntry = Get-CaseSensitiveJsonMember -Text $text -Path @('mcpServers','mql5-chm')
-    if ($null -ne $userEntry) { $result.User = ConvertTo-Mql5ChmClaudeRegistration -EntryJson $userEntry }
-    $projects = Get-CaseSensitiveJsonMember -Text $text -Path @('projects') -Keys
-    $local = @()
-    foreach ($project in @($projects)) {
-        if ($null -eq $project) { continue }
-        if ($null -ne (Get-CaseSensitiveJsonMember -Text $text -Path @('projects',[string]$project,'mcpServers','mql5-chm'))) { $local += [string]$project }
-    }
-    $result.LocalProjects = $local
+    $entries = Get-ClaudeConfigMql5ChmEntries -Text $text
+    if ($null -ne $entries.User) { $result.User = ConvertTo-Mql5ChmClaudeRegistration -EntryJson $entries.User }
+    $result.LocalProjects = @($entries.LocalProjects)
     return $result
+}
+
+function Get-ClaudeConfigMql5ChmEntries {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Text)
+    # One case-sensitive parse of the whole configuration (it can hold many
+    # projects): the user-scope entry's JSON text, and the projects that
+    # define their own local-scope mql5-chm entry.
+    $user = $null
+    $local = New-Object System.Collections.Generic.List[string]
+    if ($PSVersionTable.PSEdition -eq 'Core') {
+        $objectKind = [Text.Json.JsonValueKind]::Object
+        $document = [Text.Json.JsonDocument]::Parse($Text)
+        try {
+            $root = $document.RootElement
+            if ($root.ValueKind -eq $objectKind) {
+                $servers = [Text.Json.JsonElement]::new()
+                $entry = [Text.Json.JsonElement]::new()
+                if ($root.TryGetProperty('mcpServers', [ref]$servers) -and $servers.ValueKind -eq $objectKind -and
+                    $servers.TryGetProperty('mql5-chm', [ref]$entry)) { $user = $entry.GetRawText() }
+                $projects = [Text.Json.JsonElement]::new()
+                if ($root.TryGetProperty('projects', [ref]$projects) -and $projects.ValueKind -eq $objectKind) {
+                    foreach ($project in $projects.EnumerateObject()) {
+                        $projectValue = $project.Value
+                        $projectServers = [Text.Json.JsonElement]::new()
+                        if ($projectValue.ValueKind -eq $objectKind -and
+                            $projectValue.TryGetProperty('mcpServers', [ref]$projectServers) -and
+                            $projectServers.ValueKind -eq $objectKind -and
+                            $projectServers.TryGetProperty('mql5-chm', [ref]$entry)) { $local.Add($project.Name) }
+                    }
+                }
+            }
+        } finally { $document.Dispose() }
+    } else {
+        Add-Type -AssemblyName System.Web.Extensions
+        $serializer = New-Object Web.Script.Serialization.JavaScriptSerializer
+        $serializer.MaxJsonLength = [int]::MaxValue
+        $root = $serializer.DeserializeObject($Text)
+        $mapType = [Collections.Generic.IDictionary[string,object]]
+        if ($root -is $mapType) {
+            if ($root.ContainsKey('mcpServers') -and $root['mcpServers'] -is $mapType -and $root['mcpServers'].ContainsKey('mql5-chm')) {
+                $user = $serializer.Serialize($root['mcpServers']['mql5-chm'])
+            }
+            if ($root.ContainsKey('projects') -and $root['projects'] -is $mapType) {
+                foreach ($key in $root['projects'].Keys) {
+                    $project = $root['projects'][$key]
+                    if ($project -is $mapType -and $project.ContainsKey('mcpServers') -and $project['mcpServers'] -is $mapType -and
+                        $project['mcpServers'].ContainsKey('mql5-chm')) { $local.Add([string]$key) }
+                }
+            }
+        }
+    }
+    return [pscustomobject]@{ User=$user; LocalProjects=$local.ToArray() }
 }
 
 function Install-ClaudeMql5ChmRegistration {
@@ -4465,6 +4526,9 @@ function Copy-DirectoryTreeNoReparse {
     $reparseItems = @(Get-ChildItem -LiteralPath $sourceFull -Recurse -Force | Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 })
     if ($reparseItems.Count -gt 0) { throw "Refusing to copy a revision containing reparse points: $($reparseItems[0].FullName)" }
     if (Test-Path -LiteralPath $destinationFull) { throw "Copy destination already exists: $destinationFull" }
+    # Lexical confinement alone would follow a junction in the destination's
+    # existing ancestors out of the project.
+    Assert-NoReparsePoint -Root $root -Path (Split-Path -Parent $destinationFull)
     New-Item -ItemType Directory -Path $destinationFull -ErrorAction Stop | Out-Null
     foreach ($item in Get-ChildItem -LiteralPath $sourceFull -Force) { Copy-Item -LiteralPath $item.FullName -Destination $destinationFull -Recurse -Force -ErrorAction Stop }
     return $destinationFull
@@ -4896,7 +4960,7 @@ function Invoke-OfficialChmDownload {
             try {
                 if ($null -eq $InternalTestHooks) {
                     $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Get, $current)
-                    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp/1.3.10')
+                    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp/1.3.11')
                     try {
                         $httpResponse = $client.SendAsync(
                             $request,

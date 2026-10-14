@@ -38,6 +38,16 @@ test("batch service preserves order, duplicates, rankings and separate citation 
   }
   assert.equal(batch.result_count, batch.lookups.reduce((n,x) => n+x.count,0));
   assert.deepEqual(await readFile(pointer), before);
+
+  // Duplicate names keep their own output entries but are searched once.
+  const queries = [];
+  const search = service.search.bind(service);
+  service.search = (input) => { queries.push(input.query); return search(input); };
+  try {
+    const repeated = service.lookupIdentifiers({ identifiers: [absent, absent, absent, exact] });
+    assert.deepEqual(repeated.lookups.map(x => x.identifier), [absent, absent, absent, exact]);
+    assert.deepEqual(queries, [absent, exact]);
+  } finally { delete service.search; }
 });
 
 test("batch service rejects malformed complete requests before the first query", async t => {
