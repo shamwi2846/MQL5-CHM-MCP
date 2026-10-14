@@ -282,13 +282,13 @@ function requireSafeInteger(value, label, minimum = 0) {
 function canonicalPath(pathname) {
   return process.platform === "win32" ? pathname.toLowerCase() : pathname;
 }
-function assertConfined(root, pathname, label) {
+function assertConfined(root, pathname, label, knownRealRoot = null) {
   const absoluteRoot = resolve(root);
   const absolutePath = resolve(pathname);
   let realRoot;
   let realPath;
   try {
-    realRoot = realpathSync.native(absoluteRoot);
+    realRoot = knownRealRoot ?? realpathSync.native(absoluteRoot);
     realPath = realpathSync.native(absolutePath);
   } catch (error51) {
     fail("MISSING_PACKAGE_FILE", `${label} is missing or inaccessible.`, { cause: error51 });
@@ -401,6 +401,36 @@ function trigramSimilarity(left, right) {
   }
   return 2 * common / (leftGrams.size + rightGrams.size);
 }
+// trigramSimilarity with its per-value normalization and trigram work done once,
+// so the fuzzy scan reuses keys for every stored title and alias.
+function trigramKey(value) {
+  const normalized = normalizeText(value);
+  return { normalized, grams: normalized ? trigramSet(normalized) : null };
+}
+function keyedTrigramSimilarity(left, right) {
+  if (!left.normalized || !right.normalized) return 0;
+  if (left.normalized === right.normalized) return 1;
+  let common = 0;
+  for (const gram of left.grams) {
+    if (right.grams.has(gram)) common += 1;
+  }
+  return 2 * common / (left.grams.size + right.grams.size);
+}
+// Exact normalized title-or-alias match for topics t. An OR with a correlated
+// alias EXISTS made SQLite scan every topic of the source (~7 ms per lookup);
+// this form probes topics_source_title_idx and aliases_normalized_idx and then
+// fetches by primary key. The unary + stops the planner from driving the outer
+// query from the source index (both operands are TEXT, so no affinity changes).
+// For "all", listing every source is exact: startup verification proves the
+// sources table holds exactly SOURCE_NAMES and every topic references it.
+function exactTopicFilter(source) {
+  const sources = source === "all" ? SOURCE_NAMES : [source];
+  return {
+    sql: `t.topic_id IN (SELECT topic_id FROM topics WHERE source IN (${sources.map(() => "?").join(",")}) AND normalized_title=? ` +
+      "UNION ALL SELECT topic_id FROM aliases WHERE normalized_alias=?)" + (source === "all" ? "" : " AND +t.source=?"),
+    args: (term) => source === "all" ? [...sources, term, term] : [source, term, term, source],
+  };
+}
 function sourcePreference(source) {
   return source === "mql5" ? 0 : source === "mql5book" ? 1 : 2;
 }
@@ -423,7 +453,7 @@ function makeSnippet(content, query, maximum = 500) {
 async function sha256File(pathname) {
   return await new Promise((resolveHash, rejectHash) => {
     const hash2 = createHash("sha256");
-    const stream = createReadStream(pathname);
+    const stream = createReadStream(pathname, { highWaterMark: 1024 * 1024 });
     stream.on("error", rejectHash);
     stream.on("data", (chunk) => hash2.update(chunk));
     stream.on("end", () => resolveHash(hash2.digest("hex")));
@@ -938,6 +968,15 @@ function verifyAssetCatalog(database, manifest, packageInfo) {
   ]);
   const catalogHash = createHash("sha256").update(JSON.stringify(catalogRows), "utf8").digest("hex");
   if (catalogHash !== manifest.assets.catalog_sha256) fail("INVALID_INDEX", "The asset-catalog digest is invalid.");
+  // Resolve the package root once for this pass; every asset path is still
+  // realpath-resolved and confined, and the root is re-resolved after the
+  // closure walk so a root that changes during validation fails closed.
+  let realProjectRoot;
+  try {
+    realProjectRoot = assertConfined(packageInfo.projectRoot, packageInfo.projectRoot, "The MCP package root");
+  } catch (error) {
+    fail("INVALID_INDEX", "The immutable asset catalog failed validation.", { cause: error });
+  }
   for (const row of rows) {
     try {
       if (!ASSET_ID_PATTERN.test(row.asset_id) || !SOURCE_NAMES.includes(row.source) || !validateInternalAssetPath(row.internal_path)) {
@@ -962,7 +1001,7 @@ function verifyAssetCatalog(database, manifest, packageInfo) {
       const expectedExtensionMime = new Map([[".png", "image/png"], [".jpg", "image/jpeg"], [".jpeg", "image/jpeg"], [".gif", "image/gif"]]).get(extname(row.internal_path).toLowerCase());
       if (!expectedExtensionMime || row.mime_type !== expectedExtensionMime) throw new Error("Asset extension and MIME disagree.");
       if (row.exposure === "exposed" && !["image/png", "image/jpeg"].includes(row.mime_type)) throw new Error("Unsupported asset is exposed.");
-      const pathname = assertConfined(packageInfo.projectRoot, resolve(packageInfo.revisionRoot, ...row.storage_key.split("/")), "An immutable asset");
+      const pathname = assertConfined(packageInfo.projectRoot, resolve(packageInfo.revisionRoot, ...row.storage_key.split("/")), "An immutable asset", realProjectRoot);
       const info = lstatSync(pathname);
       if (info.isSymbolicLink() || !info.isFile() || info.size !== row.byte_count) throw new Error("Asset file metadata mismatch.");
       const bytes = readFileSync(pathname);
@@ -991,6 +1030,10 @@ function verifyAssetCatalog(database, manifest, packageInfo) {
     assertNoReparse(assetCandidate, "The immutable asset directory", "directory");
     const assetRoot = assertConfined(packageInfo.projectRoot, assetCandidate, "The immutable asset directory");
     closure = listAssetTree(assetRoot, packageInfo.revisionRoot);
+    const closingProjectRoot = assertConfined(packageInfo.projectRoot, packageInfo.projectRoot, "The MCP package root");
+    if (canonicalPath(closingProjectRoot) !== canonicalPath(realProjectRoot)) {
+      fail("PATH_ESCAPE", "The MCP package root changed during asset validation.");
+    }
   } catch (error) {
     if (error instanceof Mql5ChmError) throw error;
     fail("INVALID_INDEX", "The immutable asset directory failed validation.", { cause: error });
@@ -1725,6 +1768,9 @@ function safeUtf16Boundary(text, offset) {
   return splitsSurrogatePair(text, offset) ? offset - 1 : offset;
 }
 var Mql5ChmSearchService = class {
+  // Both caches belong to this verified, read-only database and die with it.
+  #statements = new Map();
+  #fuzzyCandidates = null;
   constructor(database, packageInfo) {
     this.database = database;
     this.projectRoot = packageInfo.projectRoot;
@@ -1738,26 +1784,53 @@ var Mql5ChmSearchService = class {
   #assertOpen() {
     if (this.closed) fail("SERVICE_CLOSED", "The documentation search service is closed.");
   }
+  // Prepared once per SQL shape; callers bind fresh arguments on every call.
+  #statement(sql) {
+    let statement = this.#statements.get(sql);
+    if (!statement) {
+      const { database } = this;
+      statement = database.prepare(sql);
+      this.#statements.set(sql, statement);
+    }
+    return statement;
+  }
+  // Every topic (ordered by topic_id) with trigram keys for its title and
+  // aliases, built on the first fuzzy search instead of on every one.
+  #fuzzyIndex() {
+    if (!this.#fuzzyCandidates) {
+      const rows = this.#statement(
+        "SELECT t.topic_id, NULL AS section_id, t.source, t.title, t.normalized_title, t.breadcrumb, " +
+        "t.signature, COALESCE(group_concat(a.normalized_alias, char(31)), '') AS aliases " +
+        "FROM topics t LEFT JOIN aliases a ON a.topic_id=t.topic_id GROUP BY t.topic_id ORDER BY t.topic_id"
+      ).all();
+      this.#fuzzyCandidates = rows.map((row) => ({
+        row,
+        title: trigramKey(row.normalized_title),
+        aliases: row.aliases.split(String.fromCharCode(31)).filter(Boolean).map(trigramKey)
+      }));
+    }
+    return this.#fuzzyCandidates;
+  }
   #corpusExpansionTerms(seedTerms) {
     const normalizedSeeds = [...new Set(seedTerms.map(normalizeText).filter(Boolean))].slice(0, 16);
     if (normalizedSeeds.length === 0) return [];
     const seedTopicIds = [];
-    const findSeeds = this.database.prepare(
-      "SELECT t.topic_id FROM topics t WHERE t.normalized_title=? OR EXISTS " +
-      "(SELECT 1 FROM aliases a WHERE a.topic_id=t.topic_id AND a.normalized_alias=?) " +
+    const seedFilter = exactTopicFilter("all");
+    const findSeeds = this.#statement(
+      `SELECT t.topic_id FROM topics t WHERE ${seedFilter.sql} ` +
       "ORDER BY CASE WHEN t.normalized_title=? THEN 0 ELSE 1 END, " +
       "CASE t.source WHEN 'mql5' THEN 0 WHEN 'mql5book' THEN 1 ELSE 2 END, t.topic_id LIMIT 4"
     );
     for (const seed of normalizedSeeds) {
-      for (const row of findSeeds.all(seed, seed, seed)) seedTopicIds.push(row.topic_id);
+      for (const row of findSeeds.all(...seedFilter.args(seed), seed)) seedTopicIds.push(row.topic_id);
     }
     const uniqueTopicIds = [...new Set(seedTopicIds)].slice(0, 32);
     if (uniqueTopicIds.length === 0) return [];
     const placeholders = uniqueTopicIds.map(() => "?").join(",");
-    const aliasRows = this.database.prepare(
+    const aliasRows = this.#statement(
       `SELECT alias FROM aliases WHERE topic_id IN (${placeholders}) ORDER BY normalized_alias, topic_id LIMIT 32`
     ).all(...uniqueTopicIds);
-    const linkRows = this.database.prepare(
+    const linkRows = this.#statement(
       `SELECT t.title, l.label, l.relationship, l.ordinal FROM topic_links l ` +
       `JOIN topics t ON t.topic_id=l.target_topic_id WHERE l.source_topic_id IN (${placeholders}) ` +
       "AND l.resolution_status='resolved' AND l.target_topic_id IS NOT NULL " +
@@ -1788,8 +1861,12 @@ var Mql5ChmSearchService = class {
     const fetchLimit = Math.max(limit * 5, 24);
     const results = [];
     const seenTopics = new Set();
+    const exactFilter = exactTopicFilter(source);
     const addRows = (rows, matchKind, matchedTerms, snippetField = null, resultLimit = limit) => {
       for (const row of rows) {
+        // addUnique would drop these; skip them before building their snippets.
+        if (results.length >= resultLimit) break;
+        if (seenTopics.has(row.topic_id)) continue;
         const snippet = snippetField ? row[snippetField] : undefined;
         addUnique(
           results,
@@ -1801,15 +1878,14 @@ var Mql5ChmSearchService = class {
     };
 
     if (normalizedQuery) {
-      const exactStatement = this.database.prepare(
+      const exactStatement = this.#statement(
         "SELECT t.topic_id, NULL AS section_id, t.source, t.title, t.breadcrumb, t.signature, t.content, " +
         "CASE WHEN t.normalized_title = ? THEN 0 ELSE 1 END AS exact_kind FROM topics t " +
-        "WHERE (t.normalized_title = ? OR EXISTS (SELECT 1 FROM aliases a WHERE a.topic_id=t.topic_id AND a.normalized_alias=?))" +
-        sourceClause +
+        `WHERE ${exactFilter.sql}` +
         " ORDER BY exact_kind, CASE t.source WHEN 'mql5' THEN 0 WHEN 'mql5book' THEN 1 ELSE 2 END, length(t.breadcrumb), t.topic_id LIMIT ?"
       );
       for (const exactTerm of exactQueryTerms(query)) {
-        const rows = exactStatement.all(exactTerm, exactTerm, exactTerm, ...sourceArgs, fetchLimit);
+        const rows = exactStatement.all(exactTerm, ...exactFilter.args(exactTerm), fetchLimit);
         addRows(rows, "exact", [exactTerm]);
         if (results.length >= limit) break;
       }
@@ -1819,7 +1895,7 @@ var Mql5ChmSearchService = class {
     const originalFts = buildFtsQuery(query);
     let originalRows = [];
     if (results.length < limit && originalFts) {
-      originalRows = this.database.prepare(
+      originalRows = this.#statement(
         "SELECT t.topic_id, f.section_id, t.source, t.title, t.breadcrumb, t.signature, t.content, " +
         "snippet(search_fts, 7, '', '', ' … ', 64) AS matched_text, " +
         "bm25(search_fts, 0.0, 0.0, 0.0, 10.0, 9.0, 7.0, 4.0, 1.0) AS rank " +
@@ -1829,19 +1905,20 @@ var Mql5ChmSearchService = class {
       ).all(originalFts, ...sourceArgs, fetchLimit);
     }
 
-    const mappedExpansionTerms = getExpandedTerms(query, expand);
-    const corpusExpansionTerms = expand ? this.#corpusExpansionTerms([query, ...mappedExpansionTerms]) : [];
+    // Expansion terms only feed candidates for unfilled slots.
+    const expandSearch = expand && results.length < limit;
+    const mappedExpansionTerms = getExpandedTerms(query, expandSearch);
+    const corpusExpansionTerms = expandSearch ? this.#corpusExpansionTerms([query, ...mappedExpansionTerms]) : [];
     const expandedTerms = [...new Set([...mappedExpansionTerms, ...corpusExpansionTerms])].slice(0, 16);
     const expandedCandidates = [];
     if (results.length < limit && expandedTerms.length) {
-      const expandedExactStatement = this.database.prepare(
+      const expandedExactStatement = this.#statement(
         "SELECT t.topic_id, NULL AS section_id, t.source, t.title, t.breadcrumb, t.signature, t.content, t.content AS matched_text, 0.0 AS rank " +
-        "FROM topics t WHERE (t.normalized_title=? OR EXISTS (SELECT 1 FROM aliases a WHERE a.topic_id=t.topic_id AND a.normalized_alias=?))" +
-        sourceClause +
+        `FROM topics t WHERE ${exactFilter.sql}` +
         " ORDER BY CASE WHEN t.normalized_title=? THEN 0 ELSE 1 END, " +
         "CASE t.source WHEN 'mql5' THEN 0 WHEN 'mql5book' THEN 1 ELSE 2 END, t.topic_id LIMIT ?"
       );
-      const statement = this.database.prepare(
+      const statement = this.#statement(
         "SELECT t.topic_id, f.section_id, t.source, t.title, t.breadcrumb, t.signature, t.content, " +
         "snippet(search_fts, 7, '', '', ' … ', 64) AS matched_text, " +
         "bm25(search_fts, 0.0, 0.0, 0.0, 8.0, 7.0, 5.0, 3.0, 1.0) AS rank " +
@@ -1852,7 +1929,7 @@ var Mql5ChmSearchService = class {
       for (const [termIndex, term] of expandedTerms.entries()) {
         const normalizedTerm = normalizeText(term);
         if (normalizedTerm) {
-          const exactRows = expandedExactStatement.all(normalizedTerm, normalizedTerm, ...sourceArgs, normalizedTerm, fetchLimit);
+          const exactRows = expandedExactStatement.all(...exactFilter.args(normalizedTerm), normalizedTerm, fetchLimit);
           expandedCandidates.push(...exactRows.map((row) => ({ row, term, priority: 0, termIndex })));
         }
         const expandedFts = buildFtsQuery(term);
@@ -1922,28 +1999,25 @@ var Mql5ChmSearchService = class {
     }
 
     if (results.length < limit && normalizedQuery) {
-      const fuzzyRows = this.database.prepare(
-        "SELECT t.topic_id, NULL AS section_id, t.source, t.title, t.normalized_title, t.breadcrumb, " +
-        "t.signature, COALESCE(group_concat(a.normalized_alias, char(31)), '') AS aliases " +
-        "FROM topics t LEFT JOIN aliases a ON a.topic_id=t.topic_id WHERE 1=1" +
-        sourceClause +
-        " GROUP BY t.topic_id ORDER BY t.topic_id"
-      ).all(...sourceArgs);
       const threshold = fuzzyThreshold(query);
-      const ranked = fuzzyRows.map((row) => {
-        let score = trigramSimilarity(normalizedQuery, row.normalized_title);
-        for (const alias of row.aliases.split(String.fromCharCode(31)).filter(Boolean)) {
-          score = Math.max(score, trigramSimilarity(normalizedQuery, alias));
+      const queryKey = trigramKey(normalizedQuery);
+      const ranked = [];
+      for (const candidate of this.#fuzzyIndex()) {
+        if (source !== "all" && candidate.row.source !== source) continue;
+        let score = keyedTrigramSimilarity(queryKey, candidate.title);
+        for (const alias of candidate.aliases) {
+          score = Math.max(score, keyedTrigramSimilarity(queryKey, alias));
         }
-        return { row, score };
-      }).filter(({ score }) => score >= threshold).sort(
+        if (score >= threshold) ranked.push({ row: candidate.row, score });
+      }
+      ranked.sort(
         (left, right) =>
           right.score - left.score ||
           sourcePreference(left.row.source) - sourcePreference(right.row.source) ||
           compareOrdinal(left.row.title, right.row.title) ||
           compareOrdinal(left.row.topic_id, right.row.topic_id)
       );
-      const contentStatement = this.database.prepare("SELECT content FROM topics WHERE topic_id=?");
+      const contentStatement = this.#statement("SELECT content FROM topics WHERE topic_id=?");
       for (const candidate of ranked) {
         if (results.length >= limit) break;
         if (seenTopics.has(candidate.row.topic_id)) continue;
@@ -2014,7 +2088,7 @@ var Mql5ChmSearchService = class {
     const ftsQuery = buildFtsQuery(focus);
     if (ftsQuery) {
       // Topic metadata is repeated on every section; only section text can locate the focus.
-      const rows = this.database.prepare(
+      const rows = this.#statement(
         "SELECT s.section_id, s.heading, s.start_offset, s.end_offset, s.content, bm25(search_fts, 0.0, 0.0, 0.0, 8.0, 7.0, 10.0, 3.0, 1.0) AS rank FROM search_fts f JOIN sections s ON s.section_id=f.section_id WHERE search_fts MATCH ? AND f.topic_id=? AND f.section_id IS NOT NULL ORDER BY rank, s.ordinal"
       ).all(`{heading body}: (${ftsQuery})`, topicId);
       const exact = rows.find((row) => findFocusMatch(row.content, focus).kind === "exact" || findFocusMatch(row.heading, focus).kind === "exact");
@@ -2023,7 +2097,7 @@ var Mql5ChmSearchService = class {
     }
     const normalizedFocus = normalizeText(focus);
     if (!normalizedFocus) return null;
-    const sections = this.database.prepare(
+    const sections = this.#statement(
       "SELECT section_id, heading, start_offset, end_offset, content FROM sections WHERE topic_id=? ORDER BY ordinal"
     ).all(topicId);
     let best = null;
@@ -2041,7 +2115,7 @@ var Mql5ChmSearchService = class {
   }
   #relatedTopics(topic, limit) {
     if (limit <= 0) return [];
-    const linked = this.database.prepare(
+    const linked = this.#statement(
       "SELECT t.topic_id, t.source, t.title, t.breadcrumb, " +
       "CASE WHEN MIN(CASE l.relationship WHEN 'see-also' THEN 0 ELSE 1 END)=0 THEN 'see-also' ELSE 'inline' END AS relationship, " +
       "MIN(l.ordinal) AS first_ordinal " +
@@ -2054,7 +2128,7 @@ var Mql5ChmSearchService = class {
     const rows = [...linked];
     const seen = new Set(rows.map((row) => row.topic_id));
     if (rows.length < limit) {
-      const sameTitle = this.database.prepare(
+      const sameTitle = this.#statement(
         "SELECT topic_id, source, title, breadcrumb, 'same-title' AS relationship " +
         "FROM topics WHERE normalized_title=? AND topic_id<>? AND source<>? " +
         "ORDER BY CASE source WHEN 'mql5' THEN 0 WHEN 'mql5book' THEN 1 ELSE 2 END, topic_id LIMIT ?"
@@ -2080,7 +2154,7 @@ var Mql5ChmSearchService = class {
     if (!this.assetSupportAvailable) return { images: [], imageCount: 0, nextImageCursor: null };
     const sectionClause = sectionId ? " AND ta.section_id=?" : "";
     const args = sectionId ? [topic.topic_id, sectionId] : [topic.topic_id];
-    const rows = this.database.prepare(
+    const rows = this.#statement(
       "SELECT ta.asset_id, ta.section_id, ta.occurrence_ordinal, ta.text_offset, ta.contextual_caption, " +
       "a.canonical_caption, a.mime_type, a.byte_count, a.width, a.height, s.ordinal AS section_ordinal " +
       "FROM topic_assets ta JOIN assets a ON a.asset_id=ta.asset_id " +
@@ -2147,7 +2221,7 @@ var Mql5ChmSearchService = class {
         fail("INVALID_CURSOR", "The continuation cursor belongs to a different section.");
       }
     }
-    const topic = this.database.prepare("SELECT topic_id, source, title, breadcrumb, signature, content, content_length FROM topics WHERE topic_id=?").get(topicId);
+    const topic = this.#statement("SELECT topic_id, source, title, breadcrumb, signature, content, content_length FROM topics WHERE topic_id=?").get(topicId);
     if (!topic) fail("TOPIC_NOT_FOUND", "No documentation topic exists for topic_id.");
     let selectedSectionId = sectionId ?? null;
     let selectedText = topic.content;
@@ -2171,7 +2245,7 @@ var Mql5ChmSearchService = class {
       }
     }
     if (selectedSectionId) {
-      const section = this.database.prepare(
+      const section = this.#statement(
         "SELECT section_id, heading, start_offset, end_offset, content FROM sections WHERE section_id=? AND topic_id=?"
       ).get(selectedSectionId, topicId);
       if (!section) fail("SECTION_NOT_FOUND", "No documentation section exists for section_id and topic_id.");
@@ -2236,7 +2310,7 @@ var Mql5ChmSearchService = class {
     this.#assertOpen();
     const assetId = validateReadImageInput(input);
     if (!this.assetSupportAvailable) fail("ASSET_CATALOG_UNAVAILABLE", "This verified revision does not contain an image catalog.");
-    const row = this.database.prepare(
+    const row = this.#statement(
       "SELECT asset_id, source, internal_path, storage_key, mime_type, sha256, byte_count, width, height, exposure, exposure_reason, canonical_caption " +
       "FROM assets WHERE asset_id=? AND exposure='exposed' AND mime_type IN ('image/png','image/jpeg')"
     ).get(assetId);
@@ -2275,12 +2349,12 @@ var Mql5ChmSearchService = class {
         try { closeSync(handle); } catch { /* Integrity validation already determines the public result. */ }
       }
     }
-    const primary = this.database.prepare(
+    const primary = this.#statement(
       "SELECT t.topic_id, t.source, t.title, t.breadcrumb, ta.section_id " +
       "FROM topic_assets ta JOIN topics t ON t.topic_id=ta.topic_id WHERE ta.asset_id=? " +
       "ORDER BY CASE t.source WHEN 'mql5' THEN 0 WHEN 'mql5book' THEN 1 ELSE 2 END, t.topic_id, ta.occurrence_ordinal LIMIT 1"
     ).get(assetId);
-    const associationCount = this.database.prepare("SELECT COUNT(*) AS count FROM topic_assets WHERE asset_id=?").get(assetId).count;
+    const associationCount = this.#statement("SELECT COUNT(*) AS count FROM topic_assets WHERE asset_id=?").get(assetId).count;
     if (!primary || associationCount < 1) fail("ASSET_INTEGRITY_FAILED", "The requested technical image failed integrity validation.");
     return {
       data: bytes.toString("base64"),
@@ -2367,6 +2441,8 @@ var Mql5ChmSearchService = class {
   close() {
     if (this.closed) return;
     this.closed = true;
+    this.#statements.clear();
+    this.#fuzzyCandidates = null;
     this.database.close();
   }
 };
@@ -2410,11 +2486,13 @@ export {
   encodeImageCursor,
   ftsTokens,
   inspectRasterImage,
+  keyedTrigramSimilarity,
   makeRuntimeAssetId,
   makeSnippet,
   normalizeText,
   resolveProjectRoot,
   sha256File,
+  trigramKey,
   trigramSimilarity,
   verifyPackage,
 };
