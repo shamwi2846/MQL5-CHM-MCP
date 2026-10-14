@@ -270,8 +270,10 @@ try {
     $expectedPortableSetNames = @('root','runtime','app','config','data','maintenance','scripts','tools','licenses')
     $expectedPortableRoot = @(
         '.mql5-chm-package-root',
+        'Install-Claude.ps1',
         'Install-Codex.ps1',
         'Rebuild-Index.ps1',
+        'Uninstall-Claude.ps1',
         'Uninstall-Codex.ps1',
         'Package-Portable.ps1',
         'Check-DocumentationUpdates.ps1',
@@ -286,6 +288,7 @@ try {
         'Common.ps1',
         'Compare-OfficialDocumentationHashes.ps1',
         'IndexMaintenance.ps1',
+        'Install-Claude.ps1',
         'Install-Codex.ps1',
         'Package-Portable.ps1',
         'Rebuild-Index.ps1',
@@ -293,6 +296,7 @@ try {
         'SevenZipRuntime.ps1',
         'Smoke-Test-McpServer.mjs',
         'StageInstallRecovery.ps1',
+        'Uninstall-Claude.ps1',
         'Uninstall-Codex.ps1',
         'Update-Documentation.ps1',
         'inspect-database.mjs'

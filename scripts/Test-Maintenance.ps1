@@ -699,7 +699,7 @@ try {
         $node.Extent.Text -notmatch "'--outdir'"
     }, $true))
     Assert-Fixture -Condition ($unsafeLiveBuildCalls.Count -eq 0) -Message 'Portable packaging still contains a build invocation that can overwrite the live app bundles.'
-    foreach ($maintenanceScriptName in @('Rebuild-Index.ps1','Update-Documentation.ps1','Check-DocumentationUpdates.ps1','Install-Codex.ps1','Package-Portable.ps1')) {
+    foreach ($maintenanceScriptName in @('Rebuild-Index.ps1','Update-Documentation.ps1','Check-DocumentationUpdates.ps1','Install-Codex.ps1','Install-Claude.ps1','Package-Portable.ps1')) {
         $maintenanceScriptText = Get-Content -LiteralPath (Join-Path $projectRoot "scripts\$maintenanceScriptName") -Raw
         $rootGuardIndex = $maintenanceScriptText.IndexOf('Assert-NoReparsePoint -Root $root -Path $root',[StringComparison]::Ordinal)
         $lockIndex = $maintenanceScriptText.IndexOf('Enter-ExclusiveFileLock',[StringComparison]::Ordinal)
@@ -741,7 +741,7 @@ try {
         $packageWrapperText.Contains('[switch]$AcceptAssetReduction') -and
         $packageWrapperText.Contains('$arguments.AcceptAssetReduction=$true')
     ) -Message 'Candidate packaging does not verify pinned Node before semantic inspection, bind the verified runtime path, verify against the current active base, or forward explicit asset-reduction acknowledgement.'
-    foreach($blockedByStageScript in @('Install-Codex.ps1','Package-Portable.ps1')){
+    foreach($blockedByStageScript in @('Install-Codex.ps1','Install-Claude.ps1','Package-Portable.ps1')){
         $blockedByStageText=Get-Content -LiteralPath (Join-Path $projectRoot "scripts\$blockedByStageScript") -Raw
         $artifactRepairPosition=$blockedByStageText.IndexOf('Repair-InterruptedMaintenanceArtifacts',[StringComparison]::Ordinal)
         $stageGuardPosition=$blockedByStageText.IndexOf('Assert-NoPendingRevisionStageInstall',[StringComparison]::Ordinal)
@@ -752,6 +752,11 @@ try {
     $installSmokeIndex=$installScriptText.IndexOf('Smoke-Test-McpServer.mjs',[StringComparison]::Ordinal)
     $installRegistrationIndex=$installScriptText.IndexOf('Install-CodexMql5ChmRegistration',[StringComparison]::Ordinal)
     Assert-Fixture -Condition ($installSmokeIndex -ge 0 -and $installRegistrationIndex -gt $installSmokeIndex -and $installScriptText.Contains("'--expected-active-revision'") -and $installScriptText.Contains("'--expected-index-revision'") -and $installScriptText.Contains("'--expected-corpus-revision'")) -Message 'Installer does not complete the revision-bound MCP smoke test before Codex registration.'
+    $claudeInstallScriptText=Get-Content -LiteralPath (Join-Path $projectRoot 'scripts\Install-Claude.ps1') -Raw
+    $claudeSmokeIndex=$claudeInstallScriptText.IndexOf('Smoke-Test-McpServer.mjs',[StringComparison]::Ordinal)
+    $claudeRegistrationIndex=$claudeInstallScriptText.IndexOf('Install-ClaudeMql5ChmRegistration',[StringComparison]::Ordinal)
+    $claudeLockReleaseIndex=$claudeInstallScriptText.IndexOf('$lock.Dispose()',[StringComparison]::Ordinal)
+    Assert-Fixture -Condition ($claudeInstallScriptText.Contains('Assert-PackageChecksums -ProjectRoot $root -AllowLegacyActive') -and $claudeSmokeIndex -ge 0 -and $claudeRegistrationIndex -gt $claudeSmokeIndex -and $claudeLockReleaseIndex -gt $claudeRegistrationIndex -and $claudeInstallScriptText.Contains("'--expected-active-revision'") -and $claudeInstallScriptText.Contains("'--expected-index-revision'") -and $claudeInstallScriptText.Contains("'--expected-corpus-revision'")) -Message 'Claude Code installer does not complete the revision-bound MCP smoke test before registration under the maintenance lock.'
     $rollbackScriptText = Get-Content -LiteralPath (Join-Path $projectRoot 'scripts\Rollback-Documentation.ps1') -Raw
     $rollbackArtifactRepairIndex = $rollbackScriptText.IndexOf('Repair-InterruptedMaintenanceArtifacts',[StringComparison]::Ordinal)
     $rollbackStageRepairIndex = $rollbackScriptText.IndexOf('Repair-InterruptedRevisionStageInstall',[StringComparison]::Ordinal)

@@ -53,7 +53,7 @@ const fakeService = {
         match_kind: "exact",
         matched_terms: ["positionselectbyticket"],
         citation: citation(),
-        snippet: "Selects an open position by ticket.",
+        snippet: "Selects an open position by ticket. bool PositionSelectByTicket(ulong ticket) | Parameters ticket",
       }],
     };
   },
@@ -242,6 +242,9 @@ test("source MCP exposes v1.2 schemas and keeps text and image bytes in separate
     assert.equal(search.isError, undefined);
     assert.equal(Object.hasOwn(search.structuredContent.results[0], "snippet"), false);
     assert.equal(search.structuredContent.results[0].match_kind, "exact");
+    const searchText = search.content[0].text;
+    assert.equal(searchText.split("bool PositionSelectByTicket(ulong ticket)").length - 1, 1, "signature is printed exactly once");
+    assert.match(searchText, /Selects an open position by ticket\. \| Parameters ticket/u);
     const searchWithExtraArgument = await client.callTool({
       name: "mql5_chm_search",
       arguments: { query: "PositionSelectByTicket", path: "secret.txt" },

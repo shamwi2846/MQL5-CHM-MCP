@@ -13,6 +13,7 @@ $maintenance = @(
     'Test-TransactionScalarTypes.ps1',
     'Test-CorpusLockTypes.ps1',
     'Test-CodexRegistration.ps1',
+    'Test-ClaudeRegistration.ps1',
     'Test-FileSetTransaction.ps1',
     'Test-GlobalMutex.ps1',
     'Test-IndexMaintenanceRepairs.ps1',

@@ -33150,7 +33150,7 @@ import {
 import { dirname, extname, isAbsolute, parse as parse3, relative, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
-import { inflateSync } from "node:zlib";
+import { crc32, inflateSync } from "node:zlib";
 
 // src/png-scanlines.mjs
 function validatePngScanlines(inflated, passes, { bitsPerPixel, bitDepth, colorType, paletteEntries }) {
@@ -33836,14 +33836,6 @@ function verifyColumns(database, table, expectedColumns) {
     fail("INVALID_INDEX", `The ${table} table has an unexpected schema.`);
   }
 }
-function crc32(buffer) {
-  let crc = 4294967295;
-  for (const byte of buffer) {
-    crc ^= byte;
-    for (let bit = 0; bit < 8; bit += 1) crc = crc >>> 1 ^ (crc & 1 ? 3988292384 : 0);
-  }
-  return (crc ^ 4294967295) >>> 0;
-}
 function inspectPng(buffer) {
   const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
   if (buffer.length > MAX_IMAGE_BYTES) throw new Error("PNG exceeds the image byte limit.");
@@ -33871,7 +33863,7 @@ function inspectPng(buffer) {
     if (!/[A-Z]/u.test(type[2])) throw new Error("Invalid PNG chunk type.");
     const data = buffer.subarray(offset + 8, offset + 8 + length);
     const declaredCrc = buffer.readUInt32BE(offset + 8 + length);
-    if (crc32(Buffer.concat([typeBytes, data])) !== declaredCrc) throw new Error("Invalid PNG chunk CRC.");
+    if (crc32(buffer.subarray(offset + 4, offset + 8 + length)) !== declaredCrc) throw new Error("Invalid PNG chunk CRC.");
     validateTransparency(type, length, { colorType, paletteEntries, sawPalette, sawData });
     if (!sawHeader) {
       if (type !== "IHDR" || length !== 13) throw new Error("PNG IHDR is missing.");
@@ -35528,6 +35520,14 @@ var onlineCheckSchema = external_exports.object({
 function citationFooter(citation) {
   return `Source: ${citation.source_file} | ${citation.title} | ${citation.section_id ?? citation.topic_id} | source ${citation.source_revision.slice(0, 12)}`;
 }
+function snippetWithoutSignature(snippet, signature) {
+  if (!snippet || !signature) return snippet;
+  const flattened = signature.replace(/\s+/gu, " ").trim();
+  if (flattened.length < 12) return snippet;
+  const index = snippet.indexOf(flattened);
+  if (index < 0) return snippet;
+  return `${snippet.slice(0, index).trimEnd()} ${snippet.slice(index + flattened.length).trimStart()}`.trim();
+}
 function searchText(result) {
   if (result.results.length === 0) {
     const suffix = result.online_check?.recommended && result.online_check.official_search_query ? `
@@ -35537,7 +35537,8 @@ Official check suggested: ${result.online_check.official_search_query}` : "";
   const entries = result.results.map((entry, index) => {
     const lines = [`${index + 1}. ${entry.title} [${entry.match_kind}]`];
     if (entry.signature) lines.push(entry.signature);
-    if (entry.snippet) lines.push(entry.snippet);
+    const snippet = snippetWithoutSignature(entry.snippet, entry.signature);
+    if (snippet) lines.push(snippet);
     lines.push(citationFooter(entry.citation));
     return lines.join("\n");
   });
@@ -35617,7 +35618,7 @@ function toolFailure(error51) {
 }
 function createMcpServer(service) {
   const server = new McpServer(
-    { name: "mql5-chm", version: "1.3.8" },
+    { name: "mql5-chm", version: "1.3.10" },
     { capabilities: { tools: {} } }
   );
   server.registerTool(

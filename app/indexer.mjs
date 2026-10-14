@@ -6574,7 +6574,7 @@ import { hostname as systemHostname } from "node:os";
 import { spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
-import { inflateSync } from "node:zlib";
+import { crc32, inflateSync } from "node:zlib";
 
 // src/png-scanlines.mjs
 function validatePngScanlines(inflated, passes, { bitsPerPixel, bitDepth, colorType, paletteEntries }) {
@@ -13007,22 +13007,6 @@ function computeCorpusRevision(sources) {
   }
   return hash.digest("hex");
 }
-var CRC32_TABLE = (() => {
-  const table = new Uint32Array(256);
-  for (let index2 = 0; index2 < table.length; index2 += 1) {
-    let value = index2;
-    for (let bit = 0; bit < 8; bit += 1) {
-      value = value & 1 ? 3988292384 ^ value >>> 1 : value >>> 1;
-    }
-    table[index2] = value >>> 0;
-  }
-  return table;
-})();
-function crc32(bytes) {
-  let value = 4294967295;
-  for (const byte of bytes) value = CRC32_TABLE[(value ^ byte) & 255] ^ value >>> 8;
-  return (value ^ 4294967295) >>> 0;
-}
 function inspectPng(bytes, limits = {}) {
   const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
   const maxBytes = Number(limits.max_bytes ?? Number.MAX_SAFE_INTEGER);
@@ -16157,10 +16141,13 @@ function assertAssetIdentityAvailable(byPath, byId, identity) {
   byId.set(assetId, registered);
   return registered;
 }
+var MAX_TOTAL_CATALOG_BYTES = 256 * 1024 * 1024;
 async function catalogAssets(sources, imagePolicy) {
   const assets = [];
   const byPath = /* @__PURE__ */ new Map();
   const byId = /* @__PURE__ */ new Map();
+  const maxAssetBytes = Number(imagePolicy.policy.limits.max_bytes);
+  let totalBytes = 0;
   for (const source of sources) {
     const files = await enumerateFiles(
       source.extractedDirectory,
@@ -16173,7 +16160,18 @@ async function catalogAssets(sources, imagePolicy) {
       const pathSha256 = makeAssetPathDigest(internalPath);
       const assetId = makeAssetId(source.source, internalPath);
       assertAssetIdentityAvailable(byPath, byId, { source: source.source, internalPath, pathKey, pathSha256, assetId });
+      const { size } = await stat(filePath);
+      if (!Number.isSafeInteger(size) || size > maxAssetBytes) {
+        throw new Error(`Invalid raster asset ${source.source}/${internalPath}: Image exceeds ${maxAssetBytes} bytes.`);
+      }
+      if (totalBytes + size > MAX_TOTAL_CATALOG_BYTES) {
+        throw new Error(`Raster catalog exceeds ${MAX_TOTAL_CATALOG_BYTES} total bytes at ${source.source}/${internalPath}.`);
+      }
       const bytes = await readFile(filePath);
+      if (bytes.length !== size) {
+        throw new Error(`Raster asset changed while it was catalogued: ${source.source}/${internalPath}`);
+      }
+      totalBytes += bytes.length;
       const assetSha256 = createHash("sha256").update(bytes).digest("hex");
       const integrityException = imagePolicy.integrityExceptions.get(pathKey) ?? null;
       if (integrityException && integrityException.sha256 !== assetSha256) {
@@ -16915,6 +16913,7 @@ export {
   ASSET_ID_PATTERN,
   EXPECTED_TOTAL_TOPIC_COUNT,
   INDEX_CONTRACT,
+  MAX_TOTAL_CATALOG_BYTES,
   SCHEMA_VERSION,
   SOURCE_DEFINITIONS,
   acquireBuildLock,

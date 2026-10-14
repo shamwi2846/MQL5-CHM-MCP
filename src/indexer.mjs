@@ -23,7 +23,7 @@ import { hostname as systemHostname } from "node:os";
 import { spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
-import { inflateSync } from "node:zlib";
+import { crc32, inflateSync } from "node:zlib";
 import { validatePngScanlines } from "./png-scanlines.mjs";
 import { createPngTransparencyValidator } from "./png-transparency.mjs";
 import { hasGifHeader, readPngChunkType } from "./raster-identifiers.mjs";
@@ -348,24 +348,6 @@ export function computeCorpusRevision(sources) {
     throw new Error(`Corpus revision requires exactly these sources: ${SOURCE_IDS.join(", ")}.`);
   }
   return hash.digest("hex");
-}
-
-const CRC32_TABLE = (() => {
-  const table = new Uint32Array(256);
-  for (let index = 0; index < table.length; index += 1) {
-    let value = index;
-    for (let bit = 0; bit < 8; bit += 1) {
-      value = (value & 1) ? (0xedb88320 ^ (value >>> 1)) : (value >>> 1);
-    }
-    table[index] = value >>> 0;
-  }
-  return table;
-})();
-
-function crc32(bytes) {
-  let value = 0xffffffff;
-  for (const byte of bytes) value = CRC32_TABLE[(value ^ byte) & 0xff] ^ (value >>> 8);
-  return (value ^ 0xffffffff) >>> 0;
 }
 
 function inspectPng(bytes, limits = {}) {
@@ -3917,10 +3899,16 @@ export function assertAssetIdentityAvailable(byPath, byId, identity) {
   return registered;
 }
 
+// Maintenance-time memory bound for retained catalog bytes. The official
+// corpus holds about 11.6 MB; rejection never changes a valid index.
+export const MAX_TOTAL_CATALOG_BYTES = 256 * 1024 * 1024;
+
 async function catalogAssets(sources, imagePolicy) {
   const assets = [];
   const byPath = new Map();
   const byId = new Map();
+  const maxAssetBytes = Number(imagePolicy.policy.limits.max_bytes);
+  let totalBytes = 0;
   for (const source of sources) {
     const files = await enumerateFiles(source.extractedDirectory, (filePath) =>
       imagePolicy.catalogExtensions.has(path.extname(filePath).toLowerCase()),
@@ -3932,7 +3920,20 @@ async function catalogAssets(sources, imagePolicy) {
       const pathSha256 = makeAssetPathDigest(internalPath);
       const assetId = makeAssetId(source.source, internalPath);
       assertAssetIdentityAvailable(byPath, byId, { source: source.source, internalPath, pathKey, pathSha256, assetId });
+      // Bound memory before reading: an oversized file is rejected without
+      // being loaded, and retained catalog bytes have an aggregate ceiling.
+      const { size } = await stat(filePath);
+      if (!Number.isSafeInteger(size) || size > maxAssetBytes) {
+        throw new Error(`Invalid raster asset ${source.source}/${internalPath}: Image exceeds ${maxAssetBytes} bytes.`);
+      }
+      if (totalBytes + size > MAX_TOTAL_CATALOG_BYTES) {
+        throw new Error(`Raster catalog exceeds ${MAX_TOTAL_CATALOG_BYTES} total bytes at ${source.source}/${internalPath}.`);
+      }
       const bytes = await readFile(filePath);
+      if (bytes.length !== size) {
+        throw new Error(`Raster asset changed while it was catalogued: ${source.source}/${internalPath}`);
+      }
+      totalBytes += bytes.length;
       const assetSha256 = createHash("sha256").update(bytes).digest("hex");
       const integrityException = imagePolicy.integrityExceptions.get(pathKey) ?? null;
       if (integrityException && integrityException.sha256 !== assetSha256) {
