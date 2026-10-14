@@ -64,6 +64,9 @@ test('generated inputs pass runtime and bundled retrieval without exposing inval
   service=await createSearchService({root:f.root});client=new Client({name:'generated-inputs',version:'1.0.0'});await client.connect(transport);
   // Drain expected server diagnostics: an unread stderr pipe can block long tiers.
   transport.stderr?.on('data',()=>{});
+  // The server connects before startup verification; the first tool call waits
+  // for it. Finish verification before mutating fixture assets.
+  const ready=await client.callTool({name:'mql5_chm_status',arguments:{}});assert.notEqual(ready.isError,true);
   for(const c of cases)try{
    await replace(f,c);
    if(c.valid&&c.category==='PNG')assert.deepEqual(Buffer.from(service.readImage({asset_id:f.assets[0].assetId}).data,'base64'),c.bytes);

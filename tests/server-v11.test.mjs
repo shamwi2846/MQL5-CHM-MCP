@@ -205,6 +205,48 @@ test("focused MCP results expose exact, approximate, and missing match status", 
   }
 });
 
+test("tools are listed before verification completes, but no tool runs until it succeeds", async () => {
+  const connect = async (service) => {
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const server = createMcpServer(service);
+    const client = new Client({ name: "mql5-chm-gate-test", version: "1.0.0" });
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    return { server, client };
+  };
+  let release;
+  const pending = new Promise((resolveService) => { release = resolveService; });
+  const gated = await connect(pending);
+  try {
+    assert.equal((await gated.client.listTools()).tools.length, 5, "tools/list must not wait for verification");
+    let settled = false;
+    const call = gated.client.callTool({ name: "mql5_chm_search", arguments: { query: "PositionSelectByTicket" } })
+      .finally(() => { settled = true; });
+    await new Promise((resolveTick) => setTimeout(resolveTick, 50));
+    assert.equal(settled, false, "a tool call must wait for verification");
+    release(fakeService);
+    const result = await call;
+    assert.equal(result.isError, undefined);
+    assert.equal(result.structuredContent.results[0].match_kind, "exact");
+  } finally {
+    await gated.client.close();
+    await gated.server.close();
+  }
+
+  const failure = Object.assign(new Error("fixture verification failure"), { name: "Mql5ChmError" });
+  const rejected = Promise.reject(failure);
+  rejected.catch(() => {});
+  const failed = await connect(rejected);
+  try {
+    const result = await failed.client.callTool({ name: "mql5_chm_status", arguments: {} });
+    assert.equal(result.isError, true);
+    assert.equal(result.structuredContent, undefined, "a failed verification must not return data");
+  } finally {
+    await failed.client.close();
+    await failed.server.close();
+  }
+});
+
 test("server instructions reach the client and name only real tools and inputs", async () => {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const server = createMcpServer(fakeService);
