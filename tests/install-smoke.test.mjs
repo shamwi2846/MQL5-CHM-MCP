@@ -260,6 +260,20 @@ test("Install-Codex runs the smoke gate before registration", async () => {
   assert.doesNotMatch(source, /'--expected-server-version'\s*,\s*'\d/u);
 });
 
+test("Install-Claude runs the smoke gate before registration and holds the maintenance lock", async () => {
+  const source = await readFile(path.join(root, "scripts", "Install-Claude.ps1"), "utf8");
+  const lock = source.indexOf("Enter-ExclusiveFileLock");
+  const checksums = source.indexOf("Assert-PackageChecksums -ProjectRoot $root -AllowLegacyActive");
+  const smoke = source.indexOf("Smoke-Test-McpServer.mjs");
+  const registration = source.indexOf("Install-ClaudeMql5ChmRegistration");
+  const release = source.indexOf("$lock.Dispose()");
+  assert.ok(lock >= 0 && checksums > lock, "installer does not verify checksums under the maintenance lock");
+  assert.ok(smoke > checksums, "installer does not invoke the MCP smoke helper after checksum verification");
+  assert.ok(registration > smoke, "installer can register before the MCP smoke gate");
+  assert.ok(release > registration, "installer releases the maintenance lock before registration");
+  assert.match(source, /'--expected-server-version'\s*,\s*\$expectedServerVersion/u);
+});
+
 test("portable packages carry checksum-bound version metadata for installation", async () => {
   const packager = await readFile(path.join(root, "scripts", "Package-Portable.ps1"), "utf8");
   const common = await readFile(path.join(root, "scripts", "Common.ps1"), "utf8");

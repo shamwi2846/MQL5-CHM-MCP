@@ -14,7 +14,7 @@ import {
 import { dirname, extname, isAbsolute, parse, relative, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
-import { inflateSync } from "node:zlib";
+import { crc32, inflateSync } from "node:zlib";
 import { validatePngScanlines } from "./png-scanlines.mjs";
 import { createPngTransparencyValidator } from "./png-transparency.mjs";
 import { hasGifHeader, readPngChunkType } from "./raster-identifiers.mjs";
@@ -611,14 +611,6 @@ function verifyColumns(database, table, expectedColumns) {
     fail("INVALID_INDEX", `The ${table} table has an unexpected schema.`);
   }
 }
-function crc32(buffer) {
-  let crc = 0xffffffff;
-  for (const byte of buffer) {
-    crc ^= byte;
-    for (let bit = 0; bit < 8; bit += 1) crc = crc >>> 1 ^ (crc & 1 ? 0xedb88320 : 0);
-  }
-  return (crc ^ 0xffffffff) >>> 0;
-}
 function inspectPng(buffer) {
   const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
   if (buffer.length > MAX_IMAGE_BYTES) throw new Error("PNG exceeds the image byte limit.");
@@ -646,7 +638,8 @@ function inspectPng(buffer) {
     if (!/[A-Z]/u.test(type[2])) throw new Error("Invalid PNG chunk type.");
     const data = buffer.subarray(offset + 8, offset + 8 + length);
     const declaredCrc = buffer.readUInt32BE(offset + 8 + length);
-    if (crc32(Buffer.concat([typeBytes, data])) !== declaredCrc) throw new Error("Invalid PNG chunk CRC.");
+    // Native CRC-32/IEEE over the contiguous chunk type and data, without a copy.
+    if (crc32(buffer.subarray(offset + 4, offset + 8 + length)) !== declaredCrc) throw new Error("Invalid PNG chunk CRC.");
     validateTransparency(type, length, { colorType, paletteEntries, sawPalette, sawData });
     if (!sawHeader) {
       if (type !== "IHDR" || length !== 13) throw new Error("PNG IHDR is missing.");

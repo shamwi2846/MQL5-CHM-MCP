@@ -1730,7 +1730,7 @@ function Invoke-BoundedNodeJsDownload {
     $client = New-Object Net.Http.HttpClient($handler, $true)
     $client.Timeout = [Threading.Timeout]::InfiniteTimeSpan
     $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Get, $Uri)
-    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.3.8')
+    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.3.10')
     $response = $null
     $stream = $null
     $deadline = New-Object Threading.CancellationTokenSource([TimeSpan]::FromSeconds($TimeoutSeconds))
@@ -2190,6 +2190,287 @@ function Uninstall-CodexMql5ChmRegistration {
     if ($null -ne $afterRemoval) {
         $prefix = if ($null -eq $removeFailure) { 'Codex reported successful removal' } else { $removeFailure }
         throw "$prefix, but an mql5-chm registration is still present; the observed entry was preserved and no second removal was attempted."
+    }
+    if ($null -ne $removeFailure) { throw "$removeFailure, but the mql5-chm registration is confirmed absent." }
+    return [pscustomobject]@{ State='removed' }
+    } finally {
+        $registrationLock.Dispose()
+    }
+}
+
+function Resolve-ClaudeExecutable {
+    [CmdletBinding()]
+    param()
+
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $directories = New-Object System.Collections.Generic.List[string]
+    foreach ($rawDirectory in ([string]$env:Path).Split([IO.Path]::PathSeparator)) {
+        $directory = [Environment]::ExpandEnvironmentVariables(([string]$rawDirectory).Trim().Trim('"'))
+        if ([string]::IsNullOrWhiteSpace($directory)) { continue }
+        try { $directories.Add([IO.Path]::GetFullPath($directory)) } catch { continue }
+    }
+    # The native installer places claude.exe here even when PATH is not updated.
+    if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) { $directories.Add((Join-Path $env:USERPROFILE '.local\bin')) }
+    foreach ($directory in $directories) {
+        foreach ($candidateName in @('claude.exe','claude.cmd')) {
+            try {
+                $candidate = Join-Path $directory $candidateName
+                if (-not (Test-Path -LiteralPath $candidate -PathType Leaf -ErrorAction Stop)) { continue }
+                $candidate = Resolve-FullPath -Path $candidate -MustExist -PathType Leaf
+                if ($seen.Add($candidate)) { $candidates.Add($candidate) }
+            } catch { continue }
+        }
+    }
+    if ($candidates.Count -eq 0) { throw 'Claude Code CLI was not found in PATH or the native installer location.' }
+    foreach ($candidate in $candidates) {
+        try {
+            $probe = Invoke-NativeCapture -FilePath $candidate -Arguments @('--version') -TimeoutSeconds 15
+            if ($probe.ExitCode -eq 0 -and ([string]$probe.Text).Trim() -match '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\s+\(Claude Code\)$') {
+                return $candidate
+            }
+        } catch { continue }
+    }
+    throw "Claude Code CLI candidates were found, but none passed a bounded '--version' capability probe: $($candidates -join ', ')"
+}
+
+function Enter-ClaudeRegistrationMutex {
+    [CmdletBinding()]
+    param([ValidateRange(1,3600)][int]$TimeoutSeconds = 120)
+
+    $mutexName = 'Global\Mql5ChmMcp-ClaudeRegistration-v1'
+    try { $mutex = New-Object Threading.Mutex($false, $mutexName) } catch {
+        throw "Unable to open the machine-global Claude Code registration mutex '$mutexName': $($_.Exception.Message)"
+    }
+    $acquired = $false
+    try {
+        try { $acquired = $mutex.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds)) }
+        catch [Threading.AbandonedMutexException] { $acquired = $true }
+        if (-not $acquired) { throw "Timed out waiting for the machine-global Claude Code registration mutex '$mutexName'." }
+        $lease = [pscustomobject]@{ Mutex=$mutex; Name=$mutexName; Released=$false }
+        $lease | Add-Member ScriptMethod Dispose {
+            if (-not $this.Released) {
+                $this.Mutex.ReleaseMutex()
+                $this.Mutex.Dispose()
+                $this.Released = $true
+            }
+        }
+        return $lease
+    } catch {
+        if ($acquired) {
+            try { $mutex.ReleaseMutex() } finally { $mutex.Dispose() }
+        } else { $mutex.Dispose() }
+        throw
+    }
+}
+
+function Get-ClaudeUserConfigPath {
+    [CmdletBinding()]
+    param()
+    # Claude Code keeps user- and local-scope MCP entries in .claude.json:
+    # inside CLAUDE_CONFIG_DIR when set, otherwise in the user's home.
+    if (-not [string]::IsNullOrWhiteSpace($env:CLAUDE_CONFIG_DIR)) {
+        return [IO.Path]::GetFullPath((Join-Path $env:CLAUDE_CONFIG_DIR '.claude.json'))
+    }
+    return [IO.Path]::GetFullPath((Join-Path $env:USERPROFILE '.claude.json'))
+}
+
+function Get-CaseSensitiveJsonMember {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
+        [Parameter(Mandatory)][string[]]$Path,
+        [switch]$Keys
+    )
+    # Claude's configuration can hold project keys that differ only by case,
+    # which ConvertFrom-Json rejects. Return the selected member's JSON text,
+    # or its property names with -Keys; $null when a member is absent.
+    if ($PSVersionTable.PSEdition -eq 'Core') {
+        $document = [Text.Json.JsonDocument]::Parse($Text)
+        try {
+            $element = $document.RootElement
+            foreach ($name in $Path) {
+                if ($element.ValueKind -ne [Text.Json.JsonValueKind]::Object) { return $null }
+                $next = [Text.Json.JsonElement]::new()
+                if (-not $element.TryGetProperty([string]$name, [ref]$next)) { return $null }
+                $element = $next
+            }
+            if ($Keys) {
+                if ($element.ValueKind -ne [Text.Json.JsonValueKind]::Object) { return $null }
+                return ,@($element.EnumerateObject() | ForEach-Object { $_.Name })
+            }
+            return $element.GetRawText()
+        } finally { $document.Dispose() }
+    }
+    Add-Type -AssemblyName System.Web.Extensions
+    $serializer = New-Object Web.Script.Serialization.JavaScriptSerializer
+    $serializer.MaxJsonLength = [int]::MaxValue
+    $value = $serializer.DeserializeObject($Text)
+    foreach ($name in $Path) {
+        if ($value -isnot [Collections.Generic.IDictionary[string,object]] -or -not $value.ContainsKey($name)) { return $null }
+        $value = $value[$name]
+    }
+    if ($Keys) {
+        if ($value -isnot [Collections.Generic.IDictionary[string,object]]) { return $null }
+        return ,@($value.Keys)
+    }
+    return $serializer.Serialize($value)
+}
+
+function ConvertTo-Mql5ChmClaudeRegistration {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$EntryJson)
+    # Present a Claude entry in the registration shape used by the shared
+    # ownership/equivalence checks. Claude entries have no enabled flag or
+    # tool filters in the server entry itself. Require an object root before
+    # deserialization: PowerShell 7 unwraps a singleton array.
+    $trimmedEntry = $EntryJson.Trim()
+    if (-not $trimmedEntry.StartsWith('{') -or -not $trimmedEntry.EndsWith('}')) {
+        throw 'Claude Code returned a malformed mql5-chm registration.'
+    }
+    $entry = $trimmedEntry | ConvertFrom-Json -ErrorAction Stop
+    if ($null -eq $entry -or $entry -is [array] -or $entry -isnot [pscustomobject]) {
+        throw 'Claude Code returned a malformed mql5-chm registration.'
+    }
+    foreach ($unsupported in @('url','headers')) {
+        if ($null -ne $entry.PSObject.Properties[$unsupported]) { throw 'The mql5-chm Claude Code registration is not a stdio entry.' }
+    }
+    $typeProperty = $entry.PSObject.Properties['type']
+    $type = if ($null -eq $typeProperty -or $null -eq $typeProperty.Value) { 'stdio' } else { $typeProperty.Value }
+    $commandProperty = $entry.PSObject.Properties['command']
+    $argsProperty = $entry.PSObject.Properties['args']
+    if ($type -isnot [string] -or $null -eq $commandProperty -or $commandProperty.Value -isnot [string] -or
+        ($null -ne $argsProperty -and $null -ne $argsProperty.Value -and $argsProperty.Value -isnot [array])) {
+        throw 'Claude Code returned a malformed mql5-chm registration.'
+    }
+    $arguments = if ($null -eq $argsProperty -or $null -eq $argsProperty.Value) { @() } else { @($argsProperty.Value) }
+    foreach ($value in $arguments) { if ($value -isnot [string]) { throw 'Claude Code returned a malformed mql5-chm registration.' } }
+    $transport = [pscustomobject]@{ type=$type; command=[string]$commandProperty.Value; args=[object[]]$arguments }
+    $envProperty = $entry.PSObject.Properties['env']
+    if ($null -ne $envProperty) { $transport | Add-Member NoteProperty env $envProperty.Value }
+    $registration = [pscustomobject]@{ name='mql5-chm'; enabled=$true; transport=$transport }
+    if (-not (Test-Mql5ChmRegistrationStructure -Registration $registration)) {
+        throw 'Claude Code returned a malformed mql5-chm registration.'
+    }
+    return $registration
+}
+
+function Get-ClaudeMcpRegistrations {
+    [CmdletBinding()]
+    param([string]$ConfigPath = (Get-ClaudeUserConfigPath))
+
+    # Returns the user-scope entry plus any per-project (local-scope) entries
+    # that take precedence over it in those projects.
+    $result = [pscustomobject]@{ User=$null; LocalProjects=@() }
+    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { return $result }
+    $text = [IO.File]::ReadAllText($ConfigPath)
+    if ([string]::IsNullOrWhiteSpace($text)) { return $result }
+    $userEntry = Get-CaseSensitiveJsonMember -Text $text -Path @('mcpServers','mql5-chm')
+    if ($null -ne $userEntry) { $result.User = ConvertTo-Mql5ChmClaudeRegistration -EntryJson $userEntry }
+    $projects = Get-CaseSensitiveJsonMember -Text $text -Path @('projects') -Keys
+    $local = @()
+    foreach ($project in @($projects)) {
+        if ($null -eq $project) { continue }
+        if ($null -ne (Get-CaseSensitiveJsonMember -Text $text -Path @('projects',[string]$project,'mcpServers','mql5-chm'))) { $local += [string]$project }
+    }
+    $result.LocalProjects = $local
+    return $result
+}
+
+function Install-ClaudeMql5ChmRegistration {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ClaudePath,
+        [Parameter(Mandatory)][string]$NodePath,
+        [Parameter(Mandatory)][string]$ServerPath
+    )
+
+    $registrationLock = Enter-ClaudeRegistrationMutex
+    try {
+    $existing = (Get-ClaudeMcpRegistrations).User
+    if ($null -ne $existing) {
+        if (-not (Test-Mql5ChmRegistrationEquivalent -Registration $existing -NodePath $NodePath -ServerPath $ServerPath)) {
+            throw "A conflicting Claude Code user-scope MCP registration named 'mql5-chm' already exists. Remove it explicitly before installing this package."
+        }
+        return [pscustomobject]@{ State='already-installed'; Registration=$existing; LocalProjects=@((Get-ClaudeMcpRegistrations).LocalProjects) }
+    }
+
+    $failureMessage = $null
+    # A timeout or launch failure can follow a completed write, so it takes the
+    # same ownership-checked rollback path as a nonzero exit.
+    try {
+        $add = Invoke-NativeCapture -FilePath $ClaudePath -Arguments @('mcp', 'add', '--scope', 'user', 'mql5-chm', '--', $NodePath, $ServerPath) -TimeoutSeconds 120
+    } catch {
+        $add = [pscustomobject]@{ ExitCode=-1; Text="Claude Code add command failed: $($_.Exception.Message)" }
+    }
+    if ($add.ExitCode -ne 0) {
+        $failureMessage = "Failed to register mql5-chm with Claude Code. Exit code: $($add.ExitCode). $($add.Text)"
+    } else {
+        try {
+            $state = Get-ClaudeMcpRegistrations
+            if ($null -ne $state.User -and (Test-Mql5ChmRegistrationEquivalent -Registration $state.User -NodePath $NodePath -ServerPath $ServerPath)) {
+                return [pscustomobject]@{ State='installed'; Registration=$state.User; LocalProjects=@($state.LocalProjects) }
+            }
+            $failureMessage = 'Claude Code reported success, but the user-scope mql5-chm registration was missing, malformed, or did not match the verified package paths.'
+        } catch {
+            $failureMessage = "Claude Code reported success, but post-install validation failed: $($_.Exception.Message)"
+        }
+    }
+
+    try { $current = (Get-ClaudeMcpRegistrations).User } catch {
+        throw "$failureMessage Rollback was withheld because the current registration could not be inspected safely: $($_.Exception.Message)"
+    }
+    if ($null -eq $current) { throw "$failureMessage No mql5-chm user-scope registration remains." }
+    if (-not (Test-Mql5ChmRegistrationOwned -Registration $current -NodePath $NodePath -ServerPath $ServerPath)) {
+        throw "$failureMessage Rollback was withheld because the registration now targets a different package."
+    }
+    try {
+        $remove = Invoke-NativeCapture -FilePath $ClaudePath -Arguments @('mcp', 'remove', '--scope', 'user', 'mql5-chm') -TimeoutSeconds 120
+    } catch {
+        $remove = [pscustomobject]@{ ExitCode=-1; Text="Claude Code remove command failed: $($_.Exception.Message)" }
+    }
+    $removeFailure = if ($remove.ExitCode -ne 0) { " Automatic rollback command reported exit code $($remove.ExitCode): $($remove.Text)" } else { '' }
+    try { $afterRemoval = (Get-ClaudeMcpRegistrations).User } catch {
+        throw "$failureMessage$removeFailure Automatic rollback ran, but its postcondition could not be verified: $($_.Exception.Message)"
+    }
+    if ($null -ne $afterRemoval) {
+        throw "$failureMessage$removeFailure Automatic rollback did not leave the registration absent; the observed entry was preserved and no second removal was attempted."
+    }
+    if ($remove.ExitCode -ne 0) { throw "$failureMessage$removeFailure The registration is nevertheless confirmed absent." }
+    throw "$failureMessage The newly created registration was rolled back."
+    } finally {
+        $registrationLock.Dispose()
+    }
+}
+
+function Uninstall-ClaudeMql5ChmRegistration {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ClaudePath,
+        [Parameter(Mandatory)][string]$NodePath,
+        [Parameter(Mandatory)][string]$ServerPath
+    )
+
+    $registrationLock = Enter-ClaudeRegistrationMutex
+    try {
+    $existing = (Get-ClaudeMcpRegistrations).User
+    if ($null -eq $existing) { return [pscustomobject]@{ State='absent' } }
+    if (-not (Test-Mql5ChmRegistrationOwned -Registration $existing -NodePath $NodePath -ServerPath $ServerPath)) {
+        throw 'The Claude Code mql5-chm registration belongs to a different package path; refusing to remove it.'
+    }
+    try {
+        $remove = Invoke-NativeCapture -FilePath $ClaudePath -Arguments @('mcp', 'remove', '--scope', 'user', 'mql5-chm') -TimeoutSeconds 120
+    } catch {
+        $remove = [pscustomobject]@{ ExitCode=-1; Text="Claude Code remove command failed: $($_.Exception.Message)" }
+    }
+    $removeFailure = if ($remove.ExitCode -ne 0) { "Claude Code remove reported exit code $($remove.ExitCode): $($remove.Text)" } else { $null }
+    try { $afterRemoval = (Get-ClaudeMcpRegistrations).User } catch {
+        $prefix = if ($null -eq $removeFailure) { 'Claude Code remove ran' } else { $removeFailure }
+        throw "$prefix, but the uninstall postcondition could not be inspected safely: $($_.Exception.Message)"
+    }
+    if ($null -ne $afterRemoval) {
+        $prefix = if ($null -eq $removeFailure) { 'Claude Code reported successful removal' } else { $removeFailure }
+        throw "$prefix, but an mql5-chm user-scope registration is still present; the observed entry was preserved and no second removal was attempted."
     }
     if ($null -ne $removeFailure) { throw "$removeFailure, but the mql5-chm registration is confirmed absent." }
     return [pscustomobject]@{ State='removed' }
@@ -4615,7 +4896,7 @@ function Invoke-OfficialChmDownload {
             try {
                 if ($null -eq $InternalTestHooks) {
                     $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Get, $current)
-                    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp/1.3.8')
+                    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp/1.3.10')
                     try {
                         $httpResponse = $client.SendAsync(
                             $request,
@@ -4876,8 +5157,10 @@ function Get-PortablePackageFileSets {
     return [ordered]@{
         root = @(
             '.mql5-chm-package-root'
+            'Install-Claude.ps1'
             'Install-Codex.ps1'
             'Rebuild-Index.ps1'
+            'Uninstall-Claude.ps1'
             'Uninstall-Codex.ps1'
             'Package-Portable.ps1'
             'Check-DocumentationUpdates.ps1'
@@ -4910,6 +5193,7 @@ function Get-PortablePackageFileSets {
             'Common.ps1'
             'Compare-OfficialDocumentationHashes.ps1'
             'IndexMaintenance.ps1'
+            'Install-Claude.ps1'
             'Install-Codex.ps1'
             'Package-Portable.ps1'
             'Rebuild-Index.ps1'
@@ -4917,6 +5201,7 @@ function Get-PortablePackageFileSets {
             'SevenZipRuntime.ps1'
             'Smoke-Test-McpServer.mjs'
             'StageInstallRecovery.ps1'
+            'Uninstall-Claude.ps1'
             'Uninstall-Codex.ps1'
             'Update-Documentation.ps1'
             'inspect-database.mjs'

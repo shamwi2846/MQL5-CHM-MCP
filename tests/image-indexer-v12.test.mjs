@@ -663,6 +663,20 @@ test("schema-3 builds preserve JavaScript UTF-16 offsets for supplementary Unico
   }
 });
 
+test("index builds reject an oversized raster file by size before cataloguing it", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "mql5-index-oversized-"));
+  try {
+    await createMiniCorpus(root);
+    await writeFile(path.join(root, "extracted", "mql5", "huge.png"), Buffer.alloc(2_097_153));
+    await assert.rejects(
+      buildIndex(root, miniCorpusBuildOptions({ outputDirectory: "candidate" })),
+      /Invalid raster asset mql5\/huge\.png: Image exceeds 2097152 bytes\./u,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("real index builds can explicitly reclaim a dead local legacy lock", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "mql5-index-legacy-lock-"));
   try {

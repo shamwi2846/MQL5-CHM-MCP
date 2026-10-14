@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 import jpegCodec from "jpeg-js";
-import { deflateSync } from "node:zlib";
+import { crc32 as nativeCrc32, deflateSync } from "node:zlib";
 
 import {
   decodeImageCursor,
@@ -82,6 +82,24 @@ function makeCustomPng({ width = 1, height = 1, bitDepth = 8, colorType = 6, raw
     pngChunk("IEND"),
   ]);
 }
+
+test("native zlib CRC-32 matches the PNG reference CRC on edge and random inputs", () => {
+  const inputs = [Buffer.alloc(0), Buffer.from("IEND", "ascii"), Buffer.alloc(1, 0xff), Buffer.alloc(65_537, 0xa5)];
+  let seed = 0x1234_5678;
+  for (let index = 0; index < 64; index += 1) {
+    const buffer = Buffer.alloc((index * 97) % 5_000);
+    for (let offset = 0; offset < buffer.length; offset += 1) {
+      seed = (Math.imul(seed, 1_103_515_245) + 12_345) >>> 0;
+      buffer[offset] = seed >>> 24;
+    }
+    inputs.push(buffer);
+  }
+  for (const input of inputs) {
+    assert.equal(nativeCrc32(input), crc32(input));
+    assert.equal(nativeCrc32(input.subarray(1)), crc32(input.subarray(1)));
+  }
+  assert.equal(nativeCrc32(Buffer.from("IEND", "ascii")), 0xae426082);
+});
 
 test("stable asset IDs case-fold normalized CHM paths", () => {
   const lower = makeRuntimeAssetId("mql5", "images/object.png");

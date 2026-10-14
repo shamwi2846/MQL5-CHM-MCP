@@ -124,6 +124,17 @@ function citationFooter(citation) {
   return `Source: ${citation.source_file} | ${citation.title} | ${citation.section_id ?? citation.topic_id} | source ${citation.source_revision.slice(0, 12)}`;
 }
 
+// The signature is printed on its own lines, so drop its exact flattened copy
+// from the snippet. Only a verbatim match is removed; otherwise the snippet is kept.
+function snippetWithoutSignature(snippet, signature) {
+  if (!snippet || !signature) return snippet;
+  const flattened = signature.replace(/\s+/gu, " ").trim();
+  if (flattened.length < 12) return snippet;
+  const index = snippet.indexOf(flattened);
+  if (index < 0) return snippet;
+  return `${snippet.slice(0, index).trimEnd()} ${snippet.slice(index + flattened.length).trimStart()}`.trim();
+}
+
 function searchText(result) {
   if (result.results.length === 0) {
     const suffix = result.online_check?.recommended && result.online_check.official_search_query
@@ -134,7 +145,8 @@ function searchText(result) {
   const entries = result.results.map((entry, index) => {
     const lines = [`${index + 1}. ${entry.title} [${entry.match_kind}]`];
     if (entry.signature) lines.push(entry.signature);
-    if (entry.snippet) lines.push(entry.snippet);
+    const snippet = snippetWithoutSignature(entry.snippet, entry.signature);
+    if (snippet) lines.push(snippet);
     lines.push(citationFooter(entry.citation));
     return lines.join("\n");
   });
@@ -220,7 +232,7 @@ function toolFailure(error) {
 
 export function createMcpServer(service) {
   const server = new McpServer(
-    { name: "mql5-chm", version: "1.3.8" },
+    { name: "mql5-chm", version: "1.3.10" },
     { capabilities: { tools: {} } },
   );
 
