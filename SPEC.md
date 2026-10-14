@@ -1,4 +1,4 @@
-# Portable Read-Only MQL5 CHM MCP v1.3.12
+# Portable Read-Only MQL5 CHM MCP v1.3.13
 
 ## Value Proposition
 
@@ -175,11 +175,11 @@ HTTP timestamps are labeled as HTTP metadata or retrieval time, never as a CHM b
 
 ## Index and Revision Model
 
-- Server/package version: 1.3.12. Manifest and SQLite schema version: 3. Pointer schema: 2.
+- Server/package version: 1.3.13. Manifest and SQLite schema version: 3. Pointer schema: 2.
 - `corpus_sha256` is the SHA-256 of the UTF-8 concatenation `source_id + NUL + lowercase_chm_sha256 + NUL` for `mql5`, `mql5book`, then `neuronetworksbook`. It intentionally depends only on the downloaded source set so the checker can name a candidate before extraction.
 - `index_revision` is the lowercase SHA-256 of the completed schema-3 SQLite database. The database contains the complete asset catalog and asset-tree digest, so this identity binds text and image metadata without creating a self-hash cycle.
 - SQLite identity-bearing data excludes build/retrieval times, ETags, and HTTP Last-Modified. Those values remain in the manifest. Identical inputs, index contract, and image policy must produce byte-identical databases and index revisions.
-- SQLite metadata includes `index_contract`, the image-policy digest, asset-catalog digest, asset-tree digest, and exact counts. `index_contract` changes whenever extraction or indexing semantics change without a SQL-schema change. v1.3.12 emits `mql5-chm-index-v3-assets-v4`, introduced in v1.3.3 for DOM-ordered image associations and offset-aware trailing-whitespace trimming. The transitional runtime accepts rollback contracts `mql5-chm-index-v3-assets-v1` and `mql5-chm-index-v3-assets-v2`, and `mql5-chm-index-v3-assets-v3` as well as the current contract, while new candidate activation requires the current contract.
+- SQLite metadata includes `index_contract`, the image-policy digest, asset-catalog digest, asset-tree digest, and exact counts. `index_contract` changes whenever extraction or indexing semantics change without a SQL-schema change. v1.3.13 emits `mql5-chm-index-v3-assets-v4`, introduced in v1.3.3 for DOM-ordered image associations and offset-aware trailing-whitespace trimming. The transitional runtime accepts rollback contracts `mql5-chm-index-v3-assets-v1` and `mql5-chm-index-v3-assets-v2`, and `mql5-chm-index-v3-assets-v3` as well as the current contract, while new candidate activation requires the current contract.
 - Image occurrences use the latest preceding retained heading in source DOM order; occurrences before the first retained heading or in heading-free topics use the first section. An image may legitimately share the following heading's text offset while belonging to the preceding section. Trailing-whitespace removal updates recorded heading and image positions before final normalization, without inserting markers or changing rendered text.
 - Each immutable revision lives under `revisions/<index_revision>/` and contains its three CHMs, database, manifest, corpus lock, stage report when staged, and the exact `assets/` tree.
 - `data/active.json` is the only activation pointer. Schema 2 retains `active_revision`, `previous_revision`, and `activated_at`; revision fields identify indexes and are replaced atomically.
@@ -270,6 +270,7 @@ Caption precedence is `<figcaption>`, meaningful `title`, meaningful `alt`, near
 - Stage reports include base/candidate corpus and index revisions plus added, removed, changed, exposed, excluded, unsupported, oversized, unresolved, and unclassified asset counts. New official documentation may reduce total assets only after explicit report review; missing or unsafe non-decorative in-topic references always block activation.
 - Activation is refused if any source loses topics under the current policy, required representative topics disappear, extraction is incomplete, internal integrity/FTS checks fail, exact ranking regresses, asset/catalog closure fails, or package hashes mismatch.
 - At startup the schema-3 runtime verifies pointer, manifest, database, CHMs, SQLite integrity/FTS, all catalog rows, every asset file, exact asset-directory closure, byte totals, hashes, MIME, dimensions, pixel limits, and absence of reparse points.
+- The stdio transport connects before that verification so `initialize` and `tools/list` (static schemas and instructions, no documentation data) are answered within about 150 ms; clients such as Codex that snapshot tools when a turn starts would otherwise miss a server that answers after its ~2.5 s verification. Every tool call awaits the single verification result and nothing is served unless it succeeds. A failed verification writes the same `[mql5-chm] CODE: message` diagnostic, closes the connection, and exits with code 1; waiting calls receive no data. The "verified read-only stdio server ready." line is still written only after verification succeeds.
 - On every image call it resolves only a prepared catalog row, opens the opaque storage key read-only, enforces the byte cap before reading, and revalidates bytes, SHA-256, MIME, dimensions, and static-image policy before disclosure.
 - Runtime may use read-only filesystem primitives but exposes no network, process-spawning, extraction, temporary-file, arbitrary-file, write, delete, reindex, SQLite-extension, MetaTrader, MetaEditor, or trading capability.
 - Stdout is reserved for MCP JSON-RPC; diagnostics use stderr.

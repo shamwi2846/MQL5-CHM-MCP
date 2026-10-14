@@ -246,9 +246,13 @@ function toolFailure(error) {
   };
 }
 
+// `service` is a verified search service or a promise of one. Tool calls await
+// it, so nothing is served before startup verification completes, while
+// initialize and tools/list (static schemas) can be answered earlier.
 export function createMcpServer(service) {
+  const verifiedService = () => Promise.resolve(service);
   const server = new McpServer(
-    { name: "mql5-chm", version: "1.3.12" },
+    { name: "mql5-chm", version: "1.3.13" },
     { capabilities: { tools: {} }, instructions: SERVER_INSTRUCTIONS },
   );
 
@@ -279,7 +283,7 @@ export function createMcpServer(service) {
     },
     async (input) => {
       try {
-        const result = service.search(input);
+        const result = (await verifiedService()).search(input);
         return {
           content: [{ type: "text", text: searchText(result) }],
           structuredContent: conciseSearchOutput(result),
@@ -321,7 +325,7 @@ export function createMcpServer(service) {
     },
     async (input) => {
       try {
-        const result = service.lookupIdentifiers(input);
+        const result = (await verifiedService()).lookupIdentifiers(input);
         return { content: [{ type: "text", text: batchText(result) }], structuredContent: conciseBatchOutput(result) };
       } catch (error) { return toolFailure(error); }
     },
@@ -376,7 +380,7 @@ export function createMcpServer(service) {
     },
     async (input) => {
       try {
-        const result = service.read(input);
+        const result = (await verifiedService()).read(input);
         return {
           content: [{ type: "text", text: readText(result) }],
           structuredContent: conciseReadOutput(result),
@@ -415,7 +419,7 @@ export function createMcpServer(service) {
     },
     async (input) => {
       try {
-        const result = service.readImage(input);
+        const result = (await verifiedService()).readImage(input);
         return {
           content: [{ type: "image", data: result.data, mimeType: result.metadata.mime_type }],
           structuredContent: result.metadata,
@@ -514,7 +518,7 @@ export function createMcpServer(service) {
     },
     async () => {
       try {
-        const result = service.status();
+        const result = (await verifiedService()).status();
         return {
           content: [{ type: "text", text: statusText(result) }],
           structuredContent: result,
@@ -532,26 +536,51 @@ export function createMcpServer(service) {
 }
 
 export async function main({ root = MODULE_PROJECT_ROOT } = {}) {
-  let service;
-  let server;
+  let service = null;
+  let disconnected = false;
+  let settle;
+  const verified = new Promise((resolveService, rejectService) => { settle = { resolveService, rejectService }; });
+  // Waiting tool calls observe the outcome; this only prevents an unhandled
+  // rejection when verification fails before any tool was called.
+  verified.catch(() => {});
+  const server = createMcpServer(verified);
+  server.server.onclose = () => {
+    disconnected = true;
+    service?.close();
+  };
   try {
+    // Connect before verifying so clients that snapshot tools at the start of
+    // a turn (Codex) receive initialize and tools/list; yield once so already
+    // queued messages are answered before the synchronous verification phases.
+    // No tool executes until verification succeeds.
+    await server.connect(new StdioServerTransport());
+    // The SDK stdio transport does not report client EOF as a close; map it so
+    // the disconnect guard below also covers a client that leaves mid-startup.
+    const closeOnEof = () => { if (!disconnected) server.close().catch(() => {}); };
+    process.stdin.once("end", closeOnEof);
+    process.stdin.once("close", closeOnEof);
+    await new Promise((resolveTick) => setImmediate(resolveTick));
     service = await createSearchService({ root });
-    server = createMcpServer(service);
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
-    process.stderr.write("[mql5-chm] verified read-only stdio server ready.\n");
   } catch (error) {
+    settle.rejectService(error);
     const code = error instanceof Mql5ChmError ? error.code : "STARTUP_FAILED";
     const message = error instanceof Error ? error.message : String(error);
     process.stderr.write(`[mql5-chm] ${code}: ${message}\n`);
     try {
-      await server?.close();
+      await server.close();
     } catch {
       // Preserve the startup failure.
     }
     service?.close();
     process.exitCode = 1;
+    return;
   }
+  if (disconnected) {
+    service.close();
+    return;
+  }
+  settle.resolveService(service);
+  process.stderr.write("[mql5-chm] verified read-only stdio server ready.\n");
 }
 
 function isDirectInvocation() {

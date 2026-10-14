@@ -35636,8 +35636,9 @@ function toolFailure(error51) {
   };
 }
 function createMcpServer(service) {
+  const verifiedService = () => Promise.resolve(service);
   const server = new McpServer(
-    { name: "mql5-chm", version: "1.3.12" },
+    { name: "mql5-chm", version: "1.3.13" },
     { capabilities: { tools: {} }, instructions: SERVER_INSTRUCTIONS }
   );
   server.registerTool(
@@ -35665,7 +35666,7 @@ function createMcpServer(service) {
     },
     async (input) => {
       try {
-        const result = service.search(input);
+        const result = (await verifiedService()).search(input);
         return {
           content: [{ type: "text", text: searchText(result) }],
           structuredContent: conciseSearchOutput(result)
@@ -35705,7 +35706,7 @@ function createMcpServer(service) {
     },
     async (input) => {
       try {
-        const result = service.lookupIdentifiers(input);
+        const result = (await verifiedService()).lookupIdentifiers(input);
         return { content: [{ type: "text", text: batchText(result) }], structuredContent: conciseBatchOutput(result) };
       } catch (error51) {
         return toolFailure(error51);
@@ -35759,7 +35760,7 @@ function createMcpServer(service) {
     },
     async (input) => {
       try {
-        const result = service.read(input);
+        const result = (await verifiedService()).read(input);
         return {
           content: [{ type: "text", text: readText(result) }],
           structuredContent: conciseReadOutput(result)
@@ -35796,7 +35797,7 @@ function createMcpServer(service) {
     },
     async (input) => {
       try {
-        const result = service.readImage(input);
+        const result = (await verifiedService()).readImage(input);
         return {
           content: [{ type: "image", data: result.data, mimeType: result.metadata.mime_type }],
           structuredContent: result.metadata
@@ -35891,7 +35892,7 @@ function createMcpServer(service) {
     },
     async () => {
       try {
-        const result = service.status();
+        const result = (await verifiedService()).status();
         return {
           content: [{ type: "text", text: statusText(result) }],
           structuredContent: result
@@ -35905,26 +35906,49 @@ function createMcpServer(service) {
   return server;
 }
 async function main({ root = MODULE_PROJECT_ROOT2 } = {}) {
-  let service;
-  let server;
+  let service = null;
+  let disconnected = false;
+  let settle;
+  const verified = new Promise((resolveService, rejectService) => {
+    settle = { resolveService, rejectService };
+  });
+  verified.catch(() => {
+  });
+  const server = createMcpServer(verified);
+  server.server.onclose = () => {
+    disconnected = true;
+    service?.close();
+  };
   try {
+    await server.connect(new StdioServerTransport());
+    const closeOnEof = () => {
+      if (!disconnected) server.close().catch(() => {
+      });
+    };
+    process.stdin.once("end", closeOnEof);
+    process.stdin.once("close", closeOnEof);
+    await new Promise((resolveTick) => setImmediate(resolveTick));
     service = await createSearchService({ root });
-    server = createMcpServer(service);
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
-    process.stderr.write("[mql5-chm] verified read-only stdio server ready.\n");
   } catch (error51) {
+    settle.rejectService(error51);
     const code = error51 instanceof Mql5ChmError ? error51.code : "STARTUP_FAILED";
     const message = error51 instanceof Error ? error51.message : String(error51);
     process.stderr.write(`[mql5-chm] ${code}: ${message}
 `);
     try {
-      await server?.close();
+      await server.close();
     } catch {
     }
     service?.close();
     process.exitCode = 1;
+    return;
   }
+  if (disconnected) {
+    service.close();
+    return;
+  }
+  settle.resolveService(service);
+  process.stderr.write("[mql5-chm] verified read-only stdio server ready.\n");
 }
 function isDirectInvocation() {
   if (!process.argv[1]) return false;
