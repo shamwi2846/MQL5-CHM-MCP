@@ -331,6 +331,23 @@ switch ($arguments[1]) {
         Assert-Throws { Uninstall-CodexMql5ChmRegistration -CodexPath $codexPath -NodePath $nodePath -ServerPath $serverPath | Out-Null } 'Nonzero remove with a concurrent replacement was silently accepted.'
         $state = Read-FakeState
         Assert-Test ([string]$state.registration.transport.command -ceq $otherNode -and [int]$state.remove_count -eq 1) 'Nonzero remove did not preserve and report the observed replacement.'
+        # A CLI exception after a completed write must still roll back the owned entry.
+        Write-FakeState 'normal' $null
+        $originalNativeCapture = (Get-Command Invoke-NativeCapture -CommandType Function).ScriptBlock
+        try {
+            function Invoke-NativeCapture {
+                [CmdletBinding()]
+                param([Parameter(Mandatory)][string]$FilePath, [string[]]$Arguments = @(), [ValidateRange(1,1800)][int]$TimeoutSeconds = 300)
+                $captured = & $originalNativeCapture -FilePath $FilePath -Arguments $Arguments -TimeoutSeconds $TimeoutSeconds
+                if ($Arguments.Count -gt 1 -and $Arguments[1] -ceq 'add') { throw [TimeoutException]::new('simulated add deadline') }
+                return $captured
+            }
+            Assert-Throws { Install-CodexMql5ChmRegistration -CodexPath $codexPath -NodePath $nodePath -ServerPath $serverPath | Out-Null } 'A Codex add exception was reported as success.'
+            $state = Read-FakeState
+            Assert-Test ($null -eq $state.registration -and [int]$state.remove_count -eq 1) 'A Codex add exception left its owned registration behind.'
+        } finally {
+            Set-Item -LiteralPath Function:\Invoke-NativeCapture -Value $originalNativeCapture
+        }
     } finally { $env:MQL5_FAKE_CODEX_STATE = $oldStateVariable }
 
     Write-Host "Codex registration tests passed: $passed"

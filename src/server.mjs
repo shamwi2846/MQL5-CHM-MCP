@@ -232,7 +232,7 @@ function toolFailure(error) {
 
 export function createMcpServer(service) {
   const server = new McpServer(
-    { name: "mql5-chm", version: "1.3.10" },
+    { name: "mql5-chm", version: "1.3.11" },
     { capabilities: { tools: {} } },
   );
 
@@ -316,19 +316,19 @@ export function createMcpServer(service) {
     {
       title: "Read local MQL5 CHM documentation",
       description:
-        "Read a bounded passage from a stable topic ID. Optionally select a section or focus and include bounded related-topic metadata. The max_chars input must be an integer from 500 to 8000 and must not exceed 8000. In answers, name the exact returned section_heading when present (otherwise title), include citation.topic_id and citation.section_id when relevant, and state citation.corpus_revision or citation.index_revision once per answer when findings share that revision.",
+        "Read a bounded passage from a stable topic ID. Optionally select a section or focus and include bounded related-topic metadata. For text-only work pass include_related:false and include_images:false. To continue, pass the returned next_cursor as cursor (or next_image_cursor as image_cursor) with the same topic_id and section_id; cursors expire when the server restarts. The max_chars input must be an integer from 500 to 8000 and must not exceed 8000. In answers, name the exact returned section_heading when present (otherwise title), include citation.topic_id and citation.section_id when relevant, and state citation.corpus_revision or citation.index_revision once per answer when findings share that revision.",
       inputSchema: z.strictObject({
         topic_id: topicIdSchema.describe("Stable topic ID returned by mql5_chm_search"),
         section_id: sectionIdSchema.optional().describe("Optional stable section ID from search"),
         focus: z.string().trim().min(1).max(200).optional().describe("Passage-selection query"),
-        cursor: z.string().min(10).max(2_048).optional().describe("Opaque next_cursor from an earlier read"),
+        cursor: z.string().min(10).max(2_048).optional().describe("Opaque next_cursor from an earlier read of the same topic_id and section_id"),
         max_chars: z.number().int().min(500).max(8_000).optional().default(4_000)
           .describe("Maximum passage length; integer from 500 to 8000 and must not exceed 8000"),
         include_related: z.boolean().optional().default(true),
         related_limit: z.number().int().min(0).max(5).optional().default(3),
         include_images: z.boolean().optional().default(true).describe("Include bounded technical-image references when available"),
         image_limit: z.number().int().min(1).max(8).optional().default(5),
-        image_cursor: z.string().min(10).max(2_048).optional().describe("Opaque next_image_cursor from an earlier read"),
+        image_cursor: z.string().min(10).max(2_048).optional().describe("Opaque next_image_cursor from an earlier read of the same topic_id and section_id"),
       }),
       outputSchema: {
         topic_id: topicIdSchema,

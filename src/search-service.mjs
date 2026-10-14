@@ -1570,7 +1570,7 @@ function decodeCursor(cursor) {
   const expected = Buffer.from(cursorTag(parts[0]), "ascii");
   const actual = Buffer.from(parts[1], "ascii");
   if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) {
-    fail("INVALID_CURSOR", "The continuation cursor failed validation.");
+    fail("INVALID_CURSOR", "The continuation cursor failed validation. Cursors are valid only for the same topic and section and only while this server process runs; repeat mql5_chm_read without cursor to restart.");
   }
   let payload;
   try {
@@ -1610,7 +1610,7 @@ function decodeImageCursor(cursor) {
   }
   const expected = Buffer.from(imageCursorTag(parts[0]), "ascii");
   const actual = Buffer.from(parts[1], "ascii");
-  if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) fail("INVALID_IMAGE_CURSOR", "The image cursor failed validation.");
+  if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) fail("INVALID_IMAGE_CURSOR", "The image cursor failed validation. Image cursors are valid only for the same topic and section and only while this server process runs; repeat mql5_chm_read without image_cursor to restart.");
   let payload;
   try {
     const decoded = Buffer.from(parts[0], "base64url");
@@ -1960,9 +1960,13 @@ var Mql5ChmSearchService = class {
     else if (results[0].match_kind === "fuzzy") reason = "fuzzy-only";
     else if (updateStatus?.status === "different-revision-available") reason = "newer-revision-available";
     const safeOnlineQuery = query.replaceAll('"', "");
-    const officialSearchQuery = source === "all"
-      ? Object.values(SOURCES).map((entry) => `${entry.online_scope} "${safeOnlineQuery}"`).join(" OR ")
-      : `${SOURCES[source].online_scope} "${safeOnlineQuery}"`;
+    // Budget the quoted phrase so every site clause stays complete within the
+    // 500-character limit instead of truncating the joined query mid-quote.
+    const onlineScopes = source === "all" ? Object.values(SOURCES).map((entry) => entry.online_scope) : [SOURCES[source].online_scope];
+    const clauseOverhead = onlineScopes.reduce((total, scope) => total + scope.length + 3, 0) + 4 * (onlineScopes.length - 1);
+    const phraseBudget = Math.max(1, Math.floor((500 - clauseOverhead) / onlineScopes.length));
+    const onlinePhrase = safeOnlineQuery.slice(0, safeUtf16Boundary(safeOnlineQuery, Math.min(phraseBudget, safeOnlineQuery.length))).trimEnd();
+    const officialSearchQuery = onlineScopes.map((scope) => `${scope} "${onlinePhrase}"`).join(" OR ");
     return {
       query,
       source,
@@ -1980,8 +1984,14 @@ var Mql5ChmSearchService = class {
   lookupIdentifiers(input) {
     this.#assertOpen();
     const { identifiers, source, limit, requireCurrent } = validateBatchInput(input);
+    // Duplicates are preserved in the output but searched once per request.
+    const searched = new Map();
     const lookups = identifiers.map((identifier) => {
-      const result = this.search({ query: identifier, source, limit, expand: false, require_current: requireCurrent });
+      let result = searched.get(identifier);
+      if (result === undefined) {
+        result = this.search({ query: identifier, source, limit, expand: false, require_current: requireCurrent });
+        searched.set(identifier, result);
+      }
       return {
         identifier,
         match_status: result.results.some((entry) => entry.match_kind === "exact") ? "exact" : result.count ? "non_exact" : "none",

@@ -34680,7 +34680,7 @@ function decodeCursor(cursor) {
   const expected = Buffer.from(cursorTag(parts[0]), "ascii");
   const actual = Buffer.from(parts[1], "ascii");
   if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) {
-    fail("INVALID_CURSOR", "The continuation cursor failed validation.");
+    fail("INVALID_CURSOR", "The continuation cursor failed validation. Cursors are valid only for the same topic and section and only while this server process runs; repeat mql5_chm_read without cursor to restart.");
   }
   let payload;
   try {
@@ -34718,7 +34718,7 @@ function decodeImageCursor(cursor) {
   }
   const expected = Buffer.from(imageCursorTag(parts[0]), "ascii");
   const actual = Buffer.from(parts[1], "ascii");
-  if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) fail("INVALID_IMAGE_CURSOR", "The image cursor failed validation.");
+  if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) fail("INVALID_IMAGE_CURSOR", "The image cursor failed validation. Image cursors are valid only for the same topic and section and only while this server process runs; repeat mql5_chm_read without image_cursor to restart.");
   let payload;
   try {
     const decoded = Buffer.from(parts[0], "base64url");
@@ -35018,7 +35018,11 @@ var Mql5ChmSearchService = class {
     else if (results[0].match_kind === "fuzzy") reason = "fuzzy-only";
     else if (updateStatus?.status === "different-revision-available") reason = "newer-revision-available";
     const safeOnlineQuery = query.replaceAll('"', "");
-    const officialSearchQuery = source === "all" ? Object.values(SOURCES).map((entry) => `${entry.online_scope} "${safeOnlineQuery}"`).join(" OR ") : `${SOURCES[source].online_scope} "${safeOnlineQuery}"`;
+    const onlineScopes = source === "all" ? Object.values(SOURCES).map((entry) => entry.online_scope) : [SOURCES[source].online_scope];
+    const clauseOverhead = onlineScopes.reduce((total, scope) => total + scope.length + 3, 0) + 4 * (onlineScopes.length - 1);
+    const phraseBudget = Math.max(1, Math.floor((500 - clauseOverhead) / onlineScopes.length));
+    const onlinePhrase = safeOnlineQuery.slice(0, safeUtf16Boundary(safeOnlineQuery, Math.min(phraseBudget, safeOnlineQuery.length))).trimEnd();
+    const officialSearchQuery = onlineScopes.map((scope) => `${scope} "${onlinePhrase}"`).join(" OR ");
     return {
       query,
       source,
@@ -35036,8 +35040,13 @@ var Mql5ChmSearchService = class {
   lookupIdentifiers(input) {
     this.#assertOpen();
     const { identifiers, source, limit, requireCurrent } = validateBatchInput(input);
+    const searched = /* @__PURE__ */ new Map();
     const lookups = identifiers.map((identifier) => {
-      const result = this.search({ query: identifier, source, limit, expand: false, require_current: requireCurrent });
+      let result = searched.get(identifier);
+      if (result === void 0) {
+        result = this.search({ query: identifier, source, limit, expand: false, require_current: requireCurrent });
+        searched.set(identifier, result);
+      }
       return {
         identifier,
         match_status: result.results.some((entry) => entry.match_kind === "exact") ? "exact" : result.count ? "non_exact" : "none",
@@ -35618,7 +35627,7 @@ function toolFailure(error51) {
 }
 function createMcpServer(service) {
   const server = new McpServer(
-    { name: "mql5-chm", version: "1.3.10" },
+    { name: "mql5-chm", version: "1.3.11" },
     { capabilities: { tools: {} } }
   );
   server.registerTool(
@@ -35697,18 +35706,18 @@ function createMcpServer(service) {
     "mql5_chm_read",
     {
       title: "Read local MQL5 CHM documentation",
-      description: "Read a bounded passage from a stable topic ID. Optionally select a section or focus and include bounded related-topic metadata. The max_chars input must be an integer from 500 to 8000 and must not exceed 8000. In answers, name the exact returned section_heading when present (otherwise title), include citation.topic_id and citation.section_id when relevant, and state citation.corpus_revision or citation.index_revision once per answer when findings share that revision.",
+      description: "Read a bounded passage from a stable topic ID. Optionally select a section or focus and include bounded related-topic metadata. For text-only work pass include_related:false and include_images:false. To continue, pass the returned next_cursor as cursor (or next_image_cursor as image_cursor) with the same topic_id and section_id; cursors expire when the server restarts. The max_chars input must be an integer from 500 to 8000 and must not exceed 8000. In answers, name the exact returned section_heading when present (otherwise title), include citation.topic_id and citation.section_id when relevant, and state citation.corpus_revision or citation.index_revision once per answer when findings share that revision.",
       inputSchema: external_exports.strictObject({
         topic_id: topicIdSchema.describe("Stable topic ID returned by mql5_chm_search"),
         section_id: sectionIdSchema.optional().describe("Optional stable section ID from search"),
         focus: external_exports.string().trim().min(1).max(200).optional().describe("Passage-selection query"),
-        cursor: external_exports.string().min(10).max(2048).optional().describe("Opaque next_cursor from an earlier read"),
+        cursor: external_exports.string().min(10).max(2048).optional().describe("Opaque next_cursor from an earlier read of the same topic_id and section_id"),
         max_chars: external_exports.number().int().min(500).max(8e3).optional().default(4e3).describe("Maximum passage length; integer from 500 to 8000 and must not exceed 8000"),
         include_related: external_exports.boolean().optional().default(true),
         related_limit: external_exports.number().int().min(0).max(5).optional().default(3),
         include_images: external_exports.boolean().optional().default(true).describe("Include bounded technical-image references when available"),
         image_limit: external_exports.number().int().min(1).max(8).optional().default(5),
-        image_cursor: external_exports.string().min(10).max(2048).optional().describe("Opaque next_image_cursor from an earlier read")
+        image_cursor: external_exports.string().min(10).max(2048).optional().describe("Opaque next_image_cursor from an earlier read of the same topic_id and section_id")
       }),
       outputSchema: {
         topic_id: topicIdSchema,

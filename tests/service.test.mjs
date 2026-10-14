@@ -133,6 +133,11 @@ test("v1.1 expansions, citations, and official-check guidance are bounded", () =
   const unpairedSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u;
   assert.ok(officialSearchQuery.length <= 500);
   assert.doesNotMatch(officialSearchQuery, unpairedSurrogate);
+  // Every site clause stays complete: three scopes, each with a closed quote.
+  const longAllQuery = service.search({ query: "x".repeat(200), source: "all", require_current: true }).online_check.official_search_query;
+  assert.ok(longAllQuery.length <= 500);
+  assert.equal(longAllQuery.split(" OR ").length, 3);
+  for (const clause of longAllQuery.split(" OR ")) assert.match(clause, /^site:mql5\.com\/en\/[a-z]+ "x+"$/u);
 });
 
 test("status and related topics expose the active verified revision", () => {
