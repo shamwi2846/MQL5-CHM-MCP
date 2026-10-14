@@ -21,6 +21,7 @@ export const SERVER_INSTRUCTIONS = [
   "Call mql5_chm_status once per task; look up 2+ names with mql5_chm_lookup_identifiers (source \"mql5\", limit 1), one name with mql5_chm_search (source \"mql5\", expand false); then mql5_chm_read the chosen topic_id with section_id or focus.",
   "Batch lookups take up to 16 names; when that tool is unavailable use one mql5_chm_search per name. With no exact match, search a narrow concept phrase and confirm relevance.",
   "For text-only reads pass include_related false and include_images false; to continue, pass next_cursor as cursor with the same topic_id and section_id.",
+  "Reuse a verified passage for later claims while the index revision is unchanged instead of reading it again.",
   "Cite the exact title, topic_id (and section_id when used) and the corpus or index revision once per answer.",
   "The corpus is a local snapshot: when current information matters, pass require_current true and check the returned official_search_query on mql5.com.",
 ].join(" ");
@@ -252,7 +253,7 @@ function toolFailure(error) {
 export function createMcpServer(service) {
   const verifiedService = () => Promise.resolve(service);
   const server = new McpServer(
-    { name: "mql5-chm", version: "1.3.13" },
+    { name: "mql5-chm", version: "1.3.14" },
     { capabilities: { tools: {} }, instructions: SERVER_INSTRUCTIONS },
   );
 

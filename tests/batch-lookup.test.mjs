@@ -5,7 +5,7 @@ import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createMcpServer } from "../src/server.mjs";
-import { createSearchService } from "../src/search-service.mjs";
+import { createSearchService, keyedTrigramSimilarity, trigramKey, trigramSimilarity } from "../src/search-service.mjs";
 import { buildFixture } from "./helpers/runtime-fixture.mjs";
 
 const exact = "Mql5CompatibilityToken";
@@ -48,6 +48,50 @@ test("batch service preserves order, duplicates, rankings and separate citation 
     assert.deepEqual(repeated.lookups.map(x => x.identifier), [absent, absent, absent, exact]);
     assert.deepEqual(queries, [absent, exact]);
   } finally { delete service.search; }
+});
+
+test("exact title and alias lookups probe their indexes instead of scanning topics", async t => {
+  const { service } = await fixture(t);
+  const prepared = new Set();
+  const prepare = service.database.prepare.bind(service.database);
+  service.database.prepare = (sql) => { prepared.add(sql); return prepare(sql); };
+  try {
+    for (const source of ["mql5", "all", "mql5book"]) {
+      service.search({ query: exact, source, limit: 3 });
+      service.search({ query: "moving average trailing stop", source, limit: 5 });
+    }
+  } finally { delete service.database.prepare; }
+  const exactStatements = [...prepared].filter(sql => sql.includes("normalized_alias=?"));
+  // Main exact lookup, expansion exact lookup and corpus-expansion seeds, each per source shape.
+  for (const marker of ["exact_kind", "0.0 AS rank", "LIMIT 4"]) {
+    assert.ok(exactStatements.some(sql => sql.includes(marker)), `missing exact statement ${marker}`);
+  }
+  for (const sql of exactStatements) {
+    const plan = service.database.prepare(`EXPLAIN QUERY PLAN ${sql}`).all().map(row => row.detail);
+    const detail = plan.join("\n");
+    assert.ok(plan.some(line => /^SEARCH t USING (?:INDEX sqlite_autoindex_topics_1|PRIMARY KEY) \(topic_id=\?\)$/u.test(line)), detail);
+    assert.ok(plan.some(line => line.includes("topics_source_title_idx (source=? AND normalized_title=?)")), detail);
+    assert.ok(plan.some(line => line.includes("aliases_normalized_idx (normalized_alias=?)")), detail);
+    assert.ok(!plan.some(line => /^SCAN t\b/u.test(line) || /^SEARCH t USING INDEX topics_source_title_idx \(source=\?\)$/u.test(line)), detail);
+  }
+});
+
+test("prepared trigram keys reproduce trigramSimilarity exactly", () => {
+  const values = ["", " ", "OrderSend", "ordersend", "OrderSnd", "order_send", "Order", "ChatID", "ChartID", "1.5.2 Droout", "1.5.2 Dropout",
+    "Café crème", "CAFE CREME", "ß", "ﬁle", "İstanbul", "日本語 ドキュメント", "a", "ab", "abc", "abcd", "x".repeat(200), "TRADE_RETCODE_DONE", "trade retcode done"];
+  for (const left of values) for (const right of values) {
+    assert.equal(keyedTrigramSimilarity(trigramKey(left), trigramKey(right)), trigramSimilarity(left, right), `${left} | ${right}`);
+  }
+});
+
+test("typo fallback results are stable across sources and repeated searches", async t => {
+  const { service } = await fixture(t);
+  for (const source of ["all", "mql5", "mql5book", "neuronetworksbook"]) {
+    const first = service.search({ query: exact.slice(0, 6) + exact.slice(7), source, limit: 3 });
+    const again = service.search({ query: exact.slice(0, 6) + exact.slice(7), source, limit: 3 });
+    assert.deepEqual(again, first);
+    assert.ok(first.results.every(entry => source === "all" || entry.source === source));
+  }
 });
 
 test("batch service rejects malformed complete requests before the first query", async t => {

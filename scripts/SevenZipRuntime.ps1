@@ -187,7 +187,7 @@ function Invoke-BoundedSevenZipDownload {
     try {
         while ($true) {
             $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Get, $current)
-            [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.3.13')
+            [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.3.14')
             $response = $null
             $stream = $null
             try {
