@@ -62,9 +62,13 @@ const concepts = ["trailing stop", "order send request", "position close by tick
   "neural network layer", "gradient descent", "OpenCL kernel", "strategy tester optimization", "OnTester custom criterion",
   "magic number", "deviation slippage", "filling mode", "stop level freeze level", "tick value", "lot step", "error 4756"];
 
-// Continuation cursors are authenticated with a per-service random key, so they
-// differ between any two services by design; everything else must be equal.
-const withoutCursors = (value) => value && typeof value === "object" ? { ...value, next_cursor: null, next_image_cursor: null } : value;
+// Continuation cursors are authenticated with a per-service random key, so their
+// values differ between any two services by design; compare whether each cursor
+// is present (and its type), and everything else exactly.
+const cursorShape = (cursor) => cursor === null ? null : typeof cursor === "string" && cursor.length > 0 ? "<cursor>" : `<invalid ${typeof cursor}>`;
+const withoutCursors = (value) => value && typeof value === "object"
+  ? { ...value, next_cursor: cursorShape(value.next_cursor), next_image_cursor: cursorShape(value.next_image_cursor) }
+  : value;
 let checked = 0, mismatches = 0;
 const timing = { base: 0, next: 0 };
 const compare = (label, fn, expectError = false) => {
