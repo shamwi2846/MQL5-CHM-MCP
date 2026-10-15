@@ -702,9 +702,12 @@ async function acquireOsPublicationMutex() {
           `Global publication mutex holder exited before acquisition (code ${code}). ${holder.stderr}`.trim(),
         ),
       );
+      // Contention is reported at once as BUSY; this deadline only bounds a
+      // holder that never answers. A cold Windows PowerShell start on a fresh
+      // CI runner can take well over 10 s, so allow 60 s before failing.
       const timeout = setTimeout(() => finish(
         new Error("Timed out acquiring the global publication mutex."),
-      ), 10_000);
+      ), 60_000);
       child.once("error", onError);
       child.stdout.setEncoding("utf8");
       child.stdout.on("data", onData);
