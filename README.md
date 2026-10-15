@@ -1,8 +1,8 @@
-# MQL5 CHM MCP 1.3.15
+# MQL5 CHM MCP 1.3.16
 
 A portable, local MCP server for the official English MQL5 reference, AlgoBook, and Neural Networks book. The active corpus contains 4,827 indexed topics, 16,261 sections, and a secure catalog of the original technical diagrams, screenshots, charts, and MQL5 object icons. Runtime access is offline, stdio-only, and strictly read-only; no MetaTrader account, HTTP port, trading access, or authentication is required.
 
-**v1.3.15** reorganizes this README and adds the `npm run test:search-parity` development check; server behaviour is unchanged from v1.3.14, which made lookups much faster with identical results (about 0.5 ms per identifier instead of 8 ms). Earlier changes are listed under [Release history](#release-history).
+**v1.3.16** lets batch lookups take exact topic titles (such as `Order Properties`) beside identifiers and states the read-continuation rules where agents went wrong in real use; identifier results are unchanged. Earlier changes are listed under [Release history](#release-history).
 
 The server exposes five closed-world tools:
 
@@ -180,6 +180,8 @@ For identifier batches, the compatibility check verifies requested source and li
 The development identifier benchmark accepts `--quality-cases <absolute-json>` together with `--quality-output <new-absolute-json>`. Use `tests/fixtures/documentation-quality.json` for the frozen 32-case suite. Existing invocations retain their identifier-only behavior. Quality results record relevant-result rank, independently selected passages, citations, original image commitments, response bytes, and nine warm timing samples. Timing is descriptive; correctness is required. Golden expectations originate from original CHM HTML and are not generated from server answers. Full results, including failed cases, remain in the separate quality artifact. Development benchmarks are excluded from portable runtime packages.
 
 ## Release history
+
+v1.3.16 follows a review of real usage (62 EA-project sessions, about 3,100 tool calls, where every tool error was an input-validation error): `mql5_chm_lookup_identifiers` accepts exact topic titles of letters, digits and underscores separated by single spaces, matched literally and reported `exact` only when a title or alias equals the whole name; the read tool and connection instructions say there is no offset or limit (continue with `next_cursor`) and to prefer `section_id` or `focus` over a large `max_chars`. Complete search, batch, read and image output for previously accepted inputs is identical to v1.3.13 in the full parity check, which now also covers typo and missing names in batches.
 
 v1.3.15 changes no server behaviour: the README now opens with the product description and keeps release notes here, and the tracked `scripts/Compare-SearchOutput.mjs` (`npm run test:search-parity`) compares complete search, batch-lookup, read and image output with the pinned v1.3.13 baseline. `npm run test:corpus` now runs the whole corpus-backed service test file, so the locale-independent tie-breaker test is part of the release gate, and the cross-repo health test checks the skill's probe-failure categories.
 

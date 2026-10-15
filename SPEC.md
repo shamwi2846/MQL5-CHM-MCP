@@ -1,4 +1,4 @@
-# Portable Read-Only MQL5 CHM MCP v1.3.15
+# Portable Read-Only MQL5 CHM MCP v1.3.16
 
 ## Value Proposition
 
@@ -113,7 +113,7 @@ Returned signatures are conservative: a declaration is emitted only when its cal
 
 ### `mql5_chm_lookup_identifiers`
 
-Read-only identifier batch lookup, additive in 1.3.0. Input is a closed object with required `identifiers` (array of 1 to 16 ASCII names matching `^[A-Za-z_][A-Za-z0-9_]{0,127}$`), optional `source` (the existing four-source filter, default `mql5`), `limit` (integer 1 to 3 per name, default 1), and `require_current` (boolean, default false). The complete input is validated before any query; no values are clamped. Names are returned in input order, including duplicates.
+Read-only identifier batch lookup, additive in 1.3.0. Input is a closed object with required `identifiers` (array of 1 to 16 ASCII identifiers or exact topic titles of at most 128 characters matching `^[A-Za-z_][A-Za-z0-9_]*(?: [A-Za-z0-9_]+)*$`; titles were added in 1.3.16. Names are matched literally: FTS terms are quoted, and a name is `exact` only when a topic title or alias equals the whole normalized name, with no identifier tokens extracted from it — for space-free identifiers this is the same result as before), optional `source` (the existing four-source filter, default `mql5`), `limit` (integer 1 to 3 per name, default 1), and `require_current` (boolean, default false). The complete input is validated before any query; no values are clamped. Names are returned in input order, including duplicates.
 
 The service applies the existing single search with expansion disabled to each name. Output commits `source`, `limit`, `count` (input names), `result_count` (total candidates, at most 48), `corpus_revision`, `index_sha256`, and `lookups`. Each lookup contains `identifier`, `match_status` (`exact` if any candidate has exact search rank, otherwise `non_exact` for nonempty candidates or `none`), `count`, `online_check`, and up to three existing search results with full independent citations. Search status is not passage-level identifier proof. No passage, snippet or binary bytes are included in structured output. Native text supplies concise statuses and citations. Query failures fail the request without claiming partial success. The verified read-only index and all other tool interfaces remain unchanged.
 
@@ -177,11 +177,11 @@ HTTP timestamps are labeled as HTTP metadata or retrieval time, never as a CHM b
 
 ## Index and Revision Model
 
-- Server/package version: 1.3.15. Manifest and SQLite schema version: 3. Pointer schema: 2.
+- Server/package version: 1.3.16. Manifest and SQLite schema version: 3. Pointer schema: 2.
 - `corpus_sha256` is the SHA-256 of the UTF-8 concatenation `source_id + NUL + lowercase_chm_sha256 + NUL` for `mql5`, `mql5book`, then `neuronetworksbook`. It intentionally depends only on the downloaded source set so the checker can name a candidate before extraction.
 - `index_revision` is the lowercase SHA-256 of the completed schema-3 SQLite database. The database contains the complete asset catalog and asset-tree digest, so this identity binds text and image metadata without creating a self-hash cycle.
 - SQLite identity-bearing data excludes build/retrieval times, ETags, and HTTP Last-Modified. Those values remain in the manifest. Identical inputs, index contract, and image policy must produce byte-identical databases and index revisions.
-- SQLite metadata includes `index_contract`, the image-policy digest, asset-catalog digest, asset-tree digest, and exact counts. `index_contract` changes whenever extraction or indexing semantics change without a SQL-schema change. v1.3.15 emits `mql5-chm-index-v3-assets-v4`, introduced in v1.3.3 for DOM-ordered image associations and offset-aware trailing-whitespace trimming. The transitional runtime accepts rollback contracts `mql5-chm-index-v3-assets-v1` and `mql5-chm-index-v3-assets-v2`, and `mql5-chm-index-v3-assets-v3` as well as the current contract, while new candidate activation requires the current contract.
+- SQLite metadata includes `index_contract`, the image-policy digest, asset-catalog digest, asset-tree digest, and exact counts. `index_contract` changes whenever extraction or indexing semantics change without a SQL-schema change. v1.3.16 emits `mql5-chm-index-v3-assets-v4`, introduced in v1.3.3 for DOM-ordered image associations and offset-aware trailing-whitespace trimming. The transitional runtime accepts rollback contracts `mql5-chm-index-v3-assets-v1` and `mql5-chm-index-v3-assets-v2`, and `mql5-chm-index-v3-assets-v3` as well as the current contract, while new candidate activation requires the current contract.
 - Image occurrences use the latest preceding retained heading in source DOM order; occurrences before the first retained heading or in heading-free topics use the first section. An image may legitimately share the following heading's text offset while belonging to the preceding section. Trailing-whitespace removal updates recorded heading and image positions before final normalization, without inserting markers or changing rendered text.
 - Each immutable revision lives under `revisions/<index_revision>/` and contains its three CHMs, database, manifest, corpus lock, stage report when staged, and the exact `assets/` tree.
 - `data/active.json` is the only activation pointer. Schema 2 retains `active_revision`, `previous_revision`, and `activated_at`; revision fields identify indexes and are replaced atomically.

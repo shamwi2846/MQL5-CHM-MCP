@@ -33320,7 +33320,8 @@ var SOURCE_NAMES = Object.freeze(Object.keys(SOURCES));
 var SEARCH_SOURCES = Object.freeze(["all", ...SOURCE_NAMES]);
 var SEARCH_INPUT_KEYS = /* @__PURE__ */ new Set(["query", "source", "limit", "expand", "require_current"]);
 var BATCH_INPUT_KEYS = /* @__PURE__ */ new Set(["identifiers", "source", "limit", "require_current"]);
-var BATCH_IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/u;
+var BATCH_IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*(?: [A-Za-z0-9_]+)*$/u;
+var BATCH_IDENTIFIER_MAX_LENGTH = 128;
 var READ_INPUT_KEYS = /* @__PURE__ */ new Set([
   "topic_id",
   "section_id",
@@ -34602,8 +34603,11 @@ function validateBatchInput(input) {
     fail("INVALID_ARGUMENT", "identifiers must contain 1 to 16 names.");
   }
   for (const identifier of input.identifiers) {
-    if (typeof identifier !== "string" || !BATCH_IDENTIFIER_PATTERN.test(identifier)) {
-      fail("INVALID_ARGUMENT", "Each identifier must be an ASCII name of 1 to 128 characters.");
+    if (typeof identifier !== "string" || identifier.length > BATCH_IDENTIFIER_MAX_LENGTH || !BATCH_IDENTIFIER_PATTERN.test(identifier)) {
+      fail(
+        "INVALID_ARGUMENT",
+        "Each name must be an ASCII identifier or exact topic title of 1 to 128 characters: letters, digits and underscores, words separated by single spaces. Search concept phrases with mql5_chm_search."
+      );
     }
   }
   const source = input.source === void 0 ? "mql5" : input.source;
@@ -34937,7 +34941,9 @@ var Mql5ChmSearchService = class {
     }
     return terms;
   }
-  search(input) {
+  // options.wholeNameExact (batch lookups): only a title or alias equal to the
+  // whole name counts as exact; no identifier tokens are extracted from it.
+  search(input, options = {}) {
     this.#assertOpen();
     const { query, source, limit, expand, requireCurrent } = validateSearchInput(input);
     const normalizedQuery = normalizeText(query);
@@ -34964,7 +34970,7 @@ var Mql5ChmSearchService = class {
       const exactStatement = this.#statement(
         `SELECT t.topic_id, NULL AS section_id, t.source, t.title, t.breadcrumb, t.signature, t.content, CASE WHEN t.normalized_title = ? THEN 0 ELSE 1 END AS exact_kind FROM topics t WHERE ${exactFilter.sql} ORDER BY exact_kind, CASE t.source WHEN 'mql5' THEN 0 WHEN 'mql5book' THEN 1 ELSE 2 END, length(t.breadcrumb), t.topic_id LIMIT ?`
       );
-      for (const exactTerm of exactQueryTerms(query)) {
+      for (const exactTerm of options.wholeNameExact ? [normalizedQuery] : exactQueryTerms(query)) {
         const rows = exactStatement.all(exactTerm, ...exactFilter.args(exactTerm), fetchLimit);
         addRows(rows, "exact", [exactTerm]);
         if (results.length >= limit) break;
@@ -35108,7 +35114,7 @@ var Mql5ChmSearchService = class {
     const lookups = identifiers.map((identifier) => {
       let result = searched.get(identifier);
       if (result === void 0) {
-        result = this.search({ query: identifier, source, limit, expand: false, require_current: requireCurrent });
+        result = this.search({ query: identifier, source, limit, expand: false, require_current: requireCurrent }, { wholeNameExact: true });
         searched.set(identifier, result);
       }
       return {
@@ -35506,8 +35512,8 @@ var SERVER_INSTRUCTIONS = [
   "Offline MQL5 documentation for MetaTrader 5 API, language, error, trade-retcode and Strategy Tester facts.",
   SERVER_EVIDENCE_RULE,
   'Call mql5_chm_status once per task; look up 2+ names with mql5_chm_lookup_identifiers (source "mql5", limit 1), one name with mql5_chm_search (source "mql5", expand false); then mql5_chm_read the chosen topic_id with section_id or focus.',
-  "Batch lookups take up to 16 names; when that tool is unavailable use one mql5_chm_search per name. With no exact match, search a narrow concept phrase and confirm relevance.",
-  "For text-only reads pass include_related false and include_images false; to continue, pass next_cursor as cursor with the same topic_id and section_id.",
+  "Batch lookups take up to 16 identifiers or exact topic titles; when that tool is unavailable use one mql5_chm_search per name. With no exact match, search a narrow concept phrase and confirm relevance.",
+  "For text-only reads pass include_related false and include_images false. Prefer section_id or focus to a large max_chars; read has no offset or limit: to continue, pass next_cursor as cursor with the same topic_id and section_id and without focus.",
   "Reuse a verified passage for later claims while the index revision is unchanged instead of reading it again.",
   "Cite the exact title, topic_id (and section_id when used) and the corpus or index revision once per answer.",
   "The corpus is a local snapshot: when current information matters, pass require_current true and check the returned official_search_query on mql5.com."
@@ -35525,6 +35531,7 @@ var corpusSourceSchema = external_exports.enum(["mql5", "mql5book", "neuronetwor
 var topicIdSchema = external_exports.string().regex(/^(mql5|mql5book|neuronetworksbook):[0-9a-f]{24}$/, "Invalid stable topic ID");
 var sectionIdSchema = external_exports.string().regex(/^(mql5|mql5book|neuronetworksbook):[0-9a-f]{24}:s\d{3}$/, "Invalid stable section ID");
 var assetIdSchema = external_exports.string().regex(/^(mql5|mql5book|neuronetworksbook):asset:[0-9a-f]{24}$/, "Invalid stable asset ID");
+var batchNameSchema = external_exports.string().max(128).regex(/^[A-Za-z_][A-Za-z0-9_]*(?: [A-Za-z0-9_]+)*$/u, "Use an ASCII identifier or exact topic title: letters, digits, underscores, single spaces");
 function closedEmptyInputSchema() {
   const schema = external_exports.strictObject({}).default({});
   const definition = schema?._zod?.def;
@@ -35705,7 +35712,7 @@ function toolFailure(error51) {
 function createMcpServer(service) {
   const verifiedService = () => Promise.resolve(service);
   const server = new McpServer(
-    { name: "mql5-chm", version: "1.3.15" },
+    { name: "mql5-chm", version: "1.3.16" },
     { capabilities: { tools: {} }, instructions: SERVER_INSTRUCTIONS }
   );
   server.registerTool(
@@ -35747,9 +35754,9 @@ function createMcpServer(service) {
     "mql5_chm_lookup_identifiers",
     {
       title: "Look up a bounded batch of MQL5 identifiers",
-      description: "Look up 1 to 16 ASCII API or constant names in input order, including duplicates, using existing search rankings with expansion disabled. Default source is mql5; limit is 1 to 3 per identifier (default 1). Each name retains its own exact, non_exact or none search status, candidates, advisory check and citations. An exact search match is a lookup result: read and verify the complete identifier in the cited passage before asserting an API fact. The tool returns metadata, not documentation passages or images.",
+      description: "Look up 1 to 16 ASCII API or constant names, or exact topic titles such as Order Properties, in input order, including duplicates, using existing search rankings with expansion disabled. Names are matched literally; status is exact only when a topic title or alias equals the whole name. Search concept phrases with mql5_chm_search instead. Default source is mql5; limit is 1 to 3 per name (default 1). Each name retains its own exact, non_exact or none search status, candidates, advisory check and citations. An exact search match is a lookup result: read and verify the complete identifier in the cited passage before asserting an API fact. The tool returns metadata, not documentation passages or images.",
       inputSchema: external_exports.strictObject({
-        identifiers: external_exports.array(external_exports.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,127}$/u)).min(1).max(16).describe("1 to 16 ASCII identifier names, each 1 to 128 characters; order and duplicates are preserved"),
+        identifiers: external_exports.array(batchNameSchema).min(1).max(16).describe("1 to 16 ASCII identifiers or exact topic titles, each 1 to 128 characters of letters, digits and underscores with single spaces between words; order and duplicates are preserved"),
         source: sourceSchema.optional().default("mql5"),
         limit: external_exports.number().int().min(1).max(3).optional().default(1).describe("Maximum results per identifier, integer from 1 to 3"),
         require_current: external_exports.boolean().optional().default(false)
@@ -35762,7 +35769,7 @@ function createMcpServer(service) {
         index_sha256: sha256Schema,
         corpus_revision: sha256Schema,
         lookups: external_exports.array(external_exports.object({
-          identifier: external_exports.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,127}$/u),
+          identifier: batchNameSchema,
           match_status: external_exports.enum(["exact", "non_exact", "none"]),
           count: external_exports.number().int().min(0).max(3),
           online_check: onlineCheckSchema,
@@ -35784,7 +35791,7 @@ function createMcpServer(service) {
     "mql5_chm_read",
     {
       title: "Read local MQL5 CHM documentation",
-      description: "Read a bounded passage from a stable topic ID. Optionally select a section or focus and include bounded related-topic metadata. For text-only work pass include_related:false and include_images:false. To continue, pass the returned next_cursor as cursor (or next_image_cursor as image_cursor) with the same topic_id and section_id; cursors expire when the server restarts. The max_chars input must be an integer from 500 to 8000 and must not exceed 8000. In answers, name the exact returned section_heading when present (otherwise title), include citation.topic_id and citation.section_id when relevant, and state citation.corpus_revision or citation.index_revision once per answer when findings share that revision.",
+      description: "Read a bounded passage from a stable topic ID. Optionally select a section or focus and include bounded related-topic metadata. For text-only work pass include_related:false and include_images:false. There are no offset or limit inputs: to continue, pass the returned next_cursor as cursor (or next_image_cursor as image_cursor) with the same topic_id and section_id and without focus; cursors expire when the server restarts. Prefer section_id or focus to a large max_chars; max_chars must be an integer from 500 to 8000. In answers, name the exact returned section_heading when present (otherwise title), include citation.topic_id and citation.section_id when relevant, and state citation.corpus_revision or citation.index_revision once per answer when findings share that revision.",
       inputSchema: external_exports.strictObject({
         topic_id: topicIdSchema.describe("Stable topic ID returned by mql5_chm_search"),
         section_id: sectionIdSchema.optional().describe("Optional stable section ID from search"),

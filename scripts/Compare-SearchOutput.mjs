@@ -109,6 +109,13 @@ for (let i = 0; i < ids.length; i += 16) {
   compare(`batch ${i}`, (svc) => svc.lookupIdentifiers({ identifiers: batch, source: "mql5", limit: 1 }));
   if (i % 64 === 0) compare(`batch-all ${i}`, (svc) => svc.lookupIdentifiers({ identifiers: batch, source: "all", limit: 3 }));
 }
+// Identifiers the corpus does not contain verbatim: typos (fuzzy path) and invented names.
+const missing = [...typos.filter((v) => /^[A-Za-z_][A-Za-z0-9_]{0,127}$/u.test(v)), "Zz_NotAnMql5Api_1", "OrderSendXYZ", "CopyBufferz", "MQL5_UNKNOWN_CONSTANT"];
+for (let i = 0; i < missing.length; i += 16) {
+  const batch = missing.slice(i, i + 16);
+  compare(`batch-missing ${i}`, (svc) => svc.lookupIdentifiers({ identifiers: batch, source: "mql5", limit: 3 }));
+  compare(`batch-missing-all ${i}`, (svc) => svc.lookupIdentifiers({ identifiers: batch, source: "all", limit: 1 }));
+}
 const readTopics = every(topics, options.quick ? 50 : 5);
 for (const topic of readTopics) {
   compare(`read ${topic.topic_id}`, (svc) => withoutCursors(svc.read({ topic_id: topic.topic_id })));

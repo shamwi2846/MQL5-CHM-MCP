@@ -5,7 +5,7 @@ import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createMcpServer } from "../src/server.mjs";
-import { createSearchService, keyedTrigramSimilarity, trigramKey, trigramSimilarity } from "../src/search-service.mjs";
+import { buildFtsQuery, createSearchService, keyedTrigramSimilarity, trigramKey, trigramSimilarity } from "../src/search-service.mjs";
 import { buildFixture } from "./helpers/runtime-fixture.mjs";
 
 const exact = "Mql5CompatibilityToken";
@@ -97,13 +97,36 @@ test("typo fallback results are stable across sources and repeated searches", as
 test("batch service rejects malformed complete requests before the first query", async t => {
   const { service } = await fixture(t);
   let calls = 0; service.search = () => { calls++; throw new Error("Unexpected query"); };
-  const badNames = ["", " OnTick", "OnTick ", "OnTick\n", "OnTick\r\n", "OnTick\0", "OnTick()", "OnTick OR X", "../file", "éName", "A".repeat(129), 42, null];
+  const badNames = ["", " OnTick", "OnTick ", "OnTick  X", "OnTick\tX", "OnTick\n", "OnTick\r\n", "OnTick\0", "OnTick()", "Order-Properties", "OnTick*", "\"OnTick\"", "1 OnTick", "../file", "éName", "A".repeat(129), `${"A".repeat(64)} ${"B".repeat(64)}`, 42, null];
   const bad = [null, [], {}, { identifiers: [] }, { identifiers: Array(17).fill(exact) }, { identifiers: Array(1) },
     ...badNames.map(name => ({ identifiers: [exact, name] })),
     ...[0,4,1.5,true,"1",null,NaN].map(limit => ({ identifiers: [exact],limit })),
     { identifiers:[exact],source:"mt4" },{identifiers:[exact],require_current:1},{identifiers:[exact],expand:false},{identifiers:[exact],path:"secret"}];
   for (const input of bad) assert.throws(() => service.lookupIdentifiers(input), error => error.code === "INVALID_ARGUMENT");
   assert.equal(calls, 0);
+});
+
+test("batch titles are exact only on a whole title or alias and are matched literally", async t => {
+  const { service } = await fixture(t);
+  const batch = service.lookupIdentifiers({ identifiers: ["mql5 topic 7", "mql5 TOPIC 7", `${exact} values`, "OnTick OR X", "mql5 topic 999999", exact], limit: 3 });
+  assert.deepEqual(batch.lookups.map(x => x.identifier), ["mql5 topic 7", "mql5 TOPIC 7", `${exact} values`, "OnTick OR X", "mql5 topic 999999", exact]);
+  const [title, titleCase, phrase, operators, absentTitle, identifier] = batch.lookups;
+  assert.equal(title.match_status, "exact");
+  assert.equal(title.results[0].title, "mql5 topic 7");
+  assert.equal(titleCase.match_status, "exact", "titles match case-insensitively like single searches");
+  // A plain search extracts the CamelCase token and reports it exact; the batch
+  // must not, because the whole name is not a title or alias.
+  assert.ok(service.search({ query: `${exact} values`, source: "mql5", limit: 3, expand: false }).results.some(x => x.match_kind === "exact"));
+  assert.notEqual(phrase.match_status, "exact");
+  assert.ok(phrase.results.every(x => x.match_kind !== "exact"));
+  assert.notEqual(operators.match_status, "exact");
+  // Every word reaches FTS5 as a quoted literal, so OR/AND/NOT cannot act as operators.
+  assert.match(buildFtsQuery("OnTick OR X"), /^"[^"]+"\*( AND "[^"]+"\*)*$/u);
+  assert.deepEqual(operators.results, service.search({ query: "OnTick OR X", source: "mql5", limit: 3, expand: false }, { wholeNameExact: true }).results);
+  assert.notEqual(absentTitle.match_status, "exact");
+  assert.equal(identifier.match_status, "exact");
+  // Space-free identifiers keep exactly the single-search result.
+  assert.deepEqual(identifier.results, service.search({ query: exact, source: "mql5", limit: 3, expand: false }).results);
 });
 
 test("batch service accepts maximum bounds, preserves advisory checks and filters each source", async t => {
@@ -145,6 +168,10 @@ test("batch MCP schema and transport enforce bounds and omit document snippets",
   assert.ok(response.content[0].text.includes(response.structuredContent.corpus_revision));
   assert.equal(Object.hasOwn(response.structuredContent.lookups[0].results[0],"snippet"),false);
   assert.equal(Object.hasOwn(response.structuredContent.lookups[0].results[0],"text"),false);
+  // Titles pass the input schema and their echo passes the output schema.
+  const titled=await client.callTool({name:tool.name,arguments:{identifiers:["mql5 topic 7",exact,"OnTick OR X"]}});
+  assert.notEqual(titled.isError,true,JSON.stringify(titled.content));
+  assert.deepEqual(titled.structuredContent.lookups.map(x=>[x.identifier,x.match_status]),[["mql5 topic 7","exact"],[exact,"exact"],["OnTick OR X","none"]]);
   for(const args of [{identifiers:[]},{identifiers:Array(17).fill(exact)},{identifiers:[exact],limit:4},{identifiers:[exact],limit:1.2},{identifiers:[exact,"Bad(Name"]},{identifiers:[exact],extra:true}]) {
     assert.equal((await client.callTool({name:tool.name,arguments:args})).isError,true);
   }
