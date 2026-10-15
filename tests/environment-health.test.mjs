@@ -384,16 +384,28 @@ for (const shell of ["pwsh.exe", "powershell.exe"]) {
       try { assert.ok(codes(run([], 1).report).includes("mcp_integrity_failed")); }
       finally { await writeFile(path.join(fixture.root, "checksums.sha256"), checksumText); }
     });
-    for (const [name, update, code] of [
-      ["pinned Node version mismatch", packageJson => ({ ...packageJson, engines: { node: "0.0.0" } }), "mcp_node_version_failed"],
-      ["server version mismatch", packageJson => ({ ...packageJson, version: "0.0.0" }), "mcp_stdio_failed"],
+    // Peers older than skill 1.2.8 report no probe-failure category.
+    const peerReportsProbeFailure = /probe_failure=\$null/u.test(await readFile(health, "utf8"));
+    for (const [name, update, code, phase, reason] of [
+      ["pinned Node version mismatch", packageJson => ({ ...packageJson, engines: { node: "0.0.0" } }), "mcp_node_version_failed", "node_version", "unexpected_result"],
+      ["server version mismatch", packageJson => ({ ...packageJson, version: "0.0.0" }), "mcp_stdio_failed", "stdio", "nonzero_exit"],
     ]) {
       await t.test(name, async () => {
         const file = path.join(fixture.root, "package.json"); const bytes = await readFile(file);
         const changed = Buffer.from(JSON.stringify(update(JSON.parse(bytes))));
         await writeFile(file, changed);
         await writeFile(path.join(fixture.root, "checksums.sha256"), checksumText.replace(`${packageFiles["package.json"]} *package.json`, `${hash(changed)} *package.json`));
-        try { const { report } = run([], 1); assert.equal(report.mcp.integrity, "passed"); assert.equal(report.mcp.stdio_available, false); assert.ok(codes(report).includes(code)); }
+        try {
+          const { report } = run([], 1);
+          assert.equal(report.mcp.integrity, "passed"); assert.equal(report.mcp.stdio_available, false); assert.ok(codes(report).includes(code));
+          if (peerReportsProbeFailure) {
+            assert.equal(report.mcp.probe_failure.phase, phase);
+            assert.equal(report.mcp.probe_failure.reason, reason);
+            assert.equal(reason === "nonzero_exit" ? report.mcp.probe_failure.exit_code !== 0 : report.mcp.probe_failure.exit_code === 0, true);
+            const issue = report.issues.find(entry => entry.code === code);
+            assert.match(issue.message, reason === "nonzero_exit" ? /exited with a failure code/u : /unexpected version or result/u);
+          }
+        }
         finally { await writeFile(file, bytes); await writeFile(path.join(fixture.root, "checksums.sha256"), checksumText); }
       });
     }
