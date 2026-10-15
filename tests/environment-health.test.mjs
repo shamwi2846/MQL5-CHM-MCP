@@ -13,6 +13,14 @@ const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".
 const packageVersion = JSON.parse(await readFile(path.join(repository, "package.json"), "utf8")).version;
 const peerSkill = process.env.MQL5_HEALTH_SKILL_ROOT;
 const skillVersion = peerSkill ? JSON.parse(await readFile(path.join(peerSkill, "version.json"), "utf8")).version : null;
+// Capability gates use the counterpart's declared version, so a newer peer can
+// never silently skip a check (source-text detection could).
+const peerAtLeast = minimum => {
+  const have = String(skillVersion).split(".").map(Number), need = minimum.split(".").map(Number);
+  assert.ok(have.length === 3 && have.every(Number.isSafeInteger), `invalid counterpart skill version ${skillVersion}`);
+  for (let i = 0; i < 3; i++) if (have[i] !== need[i]) return have[i] > need[i];
+  return true;
+};
 const python = process.env.MQL5_HEALTH_PYTHON;
 const hash = bytes => createHash("sha256").update(bytes).digest("hex");
 
@@ -196,7 +204,7 @@ for (const shell of ["pwsh.exe", "powershell.exe"]) {
     });
     // The approved-peer CI leg pins an older skill whose health command has no
     // Claude Code mode; exercise these cases only against a supporting peer.
-    const peerSupportsClaude = /\[ValidateSet\('Codex','Claude'\)\]\[string\]\$ClientHost/u.test(await readFile(health, "utf8"));
+    const peerSupportsClaude = peerAtLeast("1.2.3");
     await t.test("Claude Code registration: user scope, overriding local scope, and absence", { skip: peerSupportsClaude ? false : "peer skill predates Claude Code health checks" }, async () => {
       const claudeHome = path.join(temporary, "claude home");
       await mkdir(claudeHome, { recursive: true });
@@ -385,7 +393,7 @@ for (const shell of ["pwsh.exe", "powershell.exe"]) {
       finally { await writeFile(path.join(fixture.root, "checksums.sha256"), checksumText); }
     });
     // Peers older than skill 1.2.8 report no probe-failure category.
-    const peerReportsProbeFailure = /probe_failure=\$null/u.test(await readFile(health, "utf8"));
+    const peerReportsProbeFailure = peerAtLeast("1.2.8");
     for (const [name, update, code, phase, reason] of [
       ["pinned Node version mismatch", packageJson => ({ ...packageJson, engines: { node: "0.0.0" } }), "mcp_node_version_failed", "node_version", "unexpected_result"],
       ["server version mismatch", packageJson => ({ ...packageJson, version: "0.0.0" }), "mcp_stdio_failed", "stdio", "nonzero_exit"],
