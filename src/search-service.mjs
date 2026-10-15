@@ -77,7 +77,11 @@ var SOURCE_NAMES = Object.freeze(Object.keys(SOURCES));
 var SEARCH_SOURCES = Object.freeze(["all", ...SOURCE_NAMES]);
 var SEARCH_INPUT_KEYS = /* @__PURE__ */ new Set(["query", "source", "limit", "expand", "require_current"]);
 const BATCH_INPUT_KEYS = new Set(["identifiers", "source", "limit", "require_current"]);
-const BATCH_IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/u;
+// An API/constant name or an exact topic title: ASCII words of letters, digits
+// and underscores separated by single spaces (≤128 characters). Names are
+// looked up literally; FTS terms are quoted, so words such as OR stay words.
+const BATCH_IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*(?: [A-Za-z0-9_]+)*$/u;
+const BATCH_IDENTIFIER_MAX_LENGTH = 128;
 var READ_INPUT_KEYS = /* @__PURE__ */ new Set([
   "topic_id",
   "section_id",
@@ -1503,10 +1507,13 @@ function validateBatchInput(input) {
     fail("INVALID_ARGUMENT", "identifiers must contain 1 to 16 names.");
   }
   // Validate the complete request before running even the first search; holes,
-  // non-string names and expression/path syntax must never become queries.
+  // non-string names and punctuation/path syntax must never become queries.
   for (const identifier of input.identifiers) {
-    if (typeof identifier !== "string" || !BATCH_IDENTIFIER_PATTERN.test(identifier)) {
-      fail("INVALID_ARGUMENT", "Each identifier must be an ASCII name of 1 to 128 characters.");
+    if (typeof identifier !== "string" || identifier.length > BATCH_IDENTIFIER_MAX_LENGTH || !BATCH_IDENTIFIER_PATTERN.test(identifier)) {
+      fail(
+        "INVALID_ARGUMENT",
+        "Each name must be an ASCII identifier or exact topic title of 1 to 128 characters: letters, digits and underscores, words separated by single spaces. Search concept phrases with mql5_chm_search.",
+      );
     }
   }
   const source = input.source === undefined ? "mql5" : input.source;
@@ -1852,7 +1859,9 @@ var Mql5ChmSearchService = class {
     }
     return terms;
   }
-  search(input) {
+  // options.wholeNameExact (batch lookups): only a title or alias equal to the
+  // whole name counts as exact; no identifier tokens are extracted from it.
+  search(input, options = {}) {
     this.#assertOpen();
     const { query, source, limit, expand, requireCurrent } = validateSearchInput(input);
     const normalizedQuery = normalizeText(query);
@@ -1884,7 +1893,7 @@ var Mql5ChmSearchService = class {
         `WHERE ${exactFilter.sql}` +
         " ORDER BY exact_kind, CASE t.source WHEN 'mql5' THEN 0 WHEN 'mql5book' THEN 1 ELSE 2 END, length(t.breadcrumb), t.topic_id LIMIT ?"
       );
-      for (const exactTerm of exactQueryTerms(query)) {
+      for (const exactTerm of options.wholeNameExact ? [normalizedQuery] : exactQueryTerms(query)) {
         const rows = exactStatement.all(exactTerm, ...exactFilter.args(exactTerm), fetchLimit);
         addRows(rows, "exact", [exactTerm]);
         if (results.length >= limit) break;
@@ -2059,11 +2068,13 @@ var Mql5ChmSearchService = class {
     this.#assertOpen();
     const { identifiers, source, limit, requireCurrent } = validateBatchInput(input);
     // Duplicates are preserved in the output but searched once per request.
+    // A space-free identifier yields the same exact terms either way, so only
+    // topic titles change: they are exact only on a whole-title/alias match.
     const searched = new Map();
     const lookups = identifiers.map((identifier) => {
       let result = searched.get(identifier);
       if (result === undefined) {
-        result = this.search({ query: identifier, source, limit, expand: false, require_current: requireCurrent });
+        result = this.search({ query: identifier, source, limit, expand: false, require_current: requireCurrent }, { wholeNameExact: true });
         searched.set(identifier, result);
       }
       return {

@@ -262,11 +262,16 @@ test("server instructions reach the client and name only real tools and inputs",
     const inputNames = new Set(listed.tools.flatMap((tool) => Object.keys(tool.inputSchema.properties ?? {})));
     const outputNames = new Set(["next_cursor", "official_search_query"]);
     for (const name of instructions.match(/\bmql5_chm_[a-z_]+/gu)) assert.ok(toolNames.has(name), `unknown tool ${name}`);
-    for (const name of ["source", "limit", "expand", "topic_id", "section_id", "focus", "include_related", "include_images", "cursor", "require_current"]) {
+    for (const name of ["source", "limit", "expand", "topic_id", "section_id", "focus", "include_related", "include_images", "cursor", "max_chars", "require_current"]) {
       assert.ok(instructions.includes(name), `instructions omit ${name}`);
       assert.ok(inputNames.has(name), `instructions name a non-input ${name}`);
     }
     for (const name of outputNames) assert.ok(instructions.includes(name));
+    // Rules agents broke in real use: continuation drops focus, reads have no offset/limit,
+    // targeted reads beat large passages, and batches take exact topic titles.
+    for (const phrase of ["without focus", "no offset or limit", "Prefer section_id or focus to a large max_chars", "exact topic titles"]) {
+      assert.ok(instructions.includes(phrase), `instructions omit "${phrase}"`);
+    }
     // Clients may truncate to 512 characters: the complete evidence rule and the
     // core status/lookup/read workflow must survive that truncation.
     const head = instructions.slice(0, 512);
