@@ -29,6 +29,8 @@ if ($LASTEXITCODE -ne 0) { throw 'MCP and skill compatibility failed.' }
 
 An absolute Python executable path with PyYAML is required; another isolated environment may be supplied. The shared `.cmd` launcher is not an executable accepted by Node's direct process API. Reports use exclusive creation and never replace earlier evidence. Temporary reports in the checkout should be kept outside commits.
 
+For a full local regression of the pair, run `pwsh -NoProfile -File scripts\Invoke-PairRegression.ps1 [-SkillRepository <skill checkout>] [-Skip <step,...>]` (PowerShell 7). It runs the skill's Python and PowerShell 7 suites, the MCP fast suite, this compatibility check and the environment-health tests, `npm run test:search-parity`, and the installed health check for Claude Code and Codex, then prints one PASS, FAIL or SKIPPED line per step; step logs go to `%TEMP%\mql5-regression\<timestamp>`. Release gates under both PowerShell hosts still run before every release.
+
 ## Installed pair
 
 Use the same runner from a dependency-installed MCP checkout, with explicit paths to the installed skill, package root, and bundle. For example, after assigning `$pythonPath` and `$codexHome` as above:
