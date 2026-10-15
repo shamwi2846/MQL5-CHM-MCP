@@ -28,6 +28,7 @@
     "package:portable": "powershell -NoProfile -ExecutionPolicy Bypass -File ./Package-Portable.ps1",
     "test:skill-compatibility": "node scripts/Test-SkillCompatibility.mjs",
     "benchmark:identifiers": "node scripts/Measure-IdentifierBatch.mjs",
+    "test:search-parity": "node scripts/Compare-SearchOutput.mjs --quick",
     "test:environment-health": "node --test tests/environment-health.test.mjs",
     "test:generated:extended": "pwsh -NoProfile -File tests/Invoke-GeneratedInputTests.ps1 -Tier extended"
   },
