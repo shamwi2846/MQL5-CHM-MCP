@@ -212,8 +212,8 @@ for (const shell of ["pwsh.exe", "powershell.exe"]) {
       const entry = command => ({ type: "stdio", command, args: [path.join(fixture.root, "app/server.mjs")], env: {} });
       const owned = entry(path.join(fixture.root, "runtime/node.exe"));
       // Case-distinct project keys are legal in Claude Code's configuration.
-      const writeConfig = (user, local) => writeFile(path.join(claudeHome, ".claude.json"), JSON.stringify({
-        projects: { [workspaceKey]: { mcpServers: local ? { "mql5-chm": local } : {} }, [workspaceKey.toUpperCase() + "-other"]: {}, [workspaceKey.toLowerCase() + "-other"]: {} },
+      const writeConfig = (user, local, disabled) => writeFile(path.join(claudeHome, ".claude.json"), JSON.stringify({
+        projects: { [workspaceKey]: { mcpServers: local ? { "mql5-chm": local } : {}, ...(disabled === undefined ? {} : { disabledMcpServers: disabled }) }, [workspaceKey.toUpperCase() + "-other"]: { disabledMcpServers: ["mql5-chm"] }, [workspaceKey.toLowerCase() + "-other"]: {} },
         mcpServers: user ? { "mql5-chm": user } : {},
       }));
       const claude = ["-ClientHost", "Claude", "-ClaudeConfigDirectory", claudeHome, "-ClaudePath", path.join(temporary, "missing-claude.exe")];
@@ -225,6 +225,19 @@ for (const shell of ["pwsh.exe", "powershell.exe"]) {
       assert.equal(report.mcp.stdio_available, true);
       assert.deepEqual(report.issues.filter(issue => issue.severity === "error"), []);
       assert.ok(codes(report).includes("claude_cli_missing"));
+      if (peerAtLeast("1.2.10")) {
+        // `/mcp disable` lists the exact name in this workspace's project entry;
+        // other projects, other names and non-array values leave it enabled.
+        await writeConfig(owned, null, ["other", "mql5-chm"]);
+        ({ report } = run(claude, 1));
+        assert.equal(report.claude.registration_state, "disabled");
+        assert.ok(codes(report).includes("mcp_disabled"));
+        for (const disabled of [["MQL5-CHM"], "mql5-chm", []]) {
+          await writeConfig(owned, null, disabled);
+          ({ report } = run(claude));
+          assert.equal(report.claude.registration_state, "enabled", JSON.stringify(disabled));
+        }
+      }
       await writeConfig(owned, entry(path.join(temporary, "other package/runtime/node.exe")));
       ({ report } = run(claude, 1));
       assert.equal(report.claude.registration_scope, "local");
