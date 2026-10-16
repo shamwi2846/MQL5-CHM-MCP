@@ -1730,7 +1730,7 @@ function Invoke-BoundedNodeJsDownload {
     $client = New-Object Net.Http.HttpClient($handler, $true)
     $client.Timeout = [Threading.Timeout]::InfiniteTimeSpan
     $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Get, $Uri)
-    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.3.17')
+    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.3.18')
     $response = $null
     $stream = $null
     $deadline = New-Object Threading.CancellationTokenSource([TimeSpan]::FromSeconds($TimeoutSeconds))
@@ -4963,7 +4963,7 @@ function Invoke-OfficialChmDownload {
             try {
                 if ($null -eq $InternalTestHooks) {
                     $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Get, $current)
-                    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp/1.3.17')
+                    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp/1.3.18')
                     try {
                         $httpResponse = $client.SendAsync(
                             $request,

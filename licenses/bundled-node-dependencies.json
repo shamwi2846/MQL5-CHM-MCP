@@ -5,13 +5,13 @@
   "packages": [
     {
       "name": "@modelcontextprotocol/sdk",
-      "version": "1.29.0",
+      "version": "1.31.0",
       "instance": "node_modules/@modelcontextprotocol/sdk",
       "license": "MIT",
       "bundles": [
         {
           "name": "server.mjs",
-          "bytes_in_output": 156657
+          "bytes_in_output": 157246
         }
       ],
       "notices": [
@@ -276,13 +276,13 @@
     },
     {
       "name": "fast-uri",
-      "version": "3.1.5",
+      "version": "3.1.8",
       "instance": "node_modules/fast-uri",
       "license": "BSD-3-Clause",
       "bundles": [
         {
           "name": "server.mjs",
-          "bytes_in_output": 28238
+          "bytes_in_output": 42029
         }
       ],
       "notices": [

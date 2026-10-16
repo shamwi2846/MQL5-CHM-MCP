@@ -258,7 +258,7 @@ function toolFailure(error) {
 export function createMcpServer(service) {
   const verifiedService = () => Promise.resolve(service);
   const server = new McpServer(
-    { name: "mql5-chm", version: "1.3.17" },
+    { name: "mql5-chm", version: "1.3.18" },
     { capabilities: { tools: {} }, instructions: SERVER_INSTRUCTIONS },
   );
 
