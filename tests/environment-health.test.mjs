@@ -453,7 +453,8 @@ for (const shell of ["pwsh.exe", "powershell.exe"]) {
           const { report, elapsed } = run([], detached ? 0 : 1);
           if (detached) assert.equal(report.status, "passed");
           else assert.ok(codes(report).includes("codex_registration_unavailable"));
-          assert.equal(report.mcp.stdio_available, true);
+          // Name the probe-failure category if the direct MCP probe ever fails here.
+          assert.equal(report.mcp.stdio_available, true, JSON.stringify({ probe_failure: report.mcp.probe_failure ?? null, issues: report.issues.map((issue) => issue.code) }));
           if (mode === "timeout") {
             assert.ok(elapsed < 20_000, `Probe deadline was not bounded: ${elapsed}ms`);
             const pid = (await readFile(path.join(state, "pid.txt"), "utf8")).trim();
