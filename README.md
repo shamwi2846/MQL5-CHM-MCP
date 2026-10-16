@@ -1,8 +1,8 @@
-# MQL5 CHM MCP 1.3.17
+# MQL5 CHM MCP 1.3.18
 
 A portable, local MCP server for the official English MQL5 reference, AlgoBook, and Neural Networks book. The active corpus contains 4,827 indexed topics, 16,261 sections, and a secure catalog of the original technical diagrams, screenshots, charts, and MQL5 object icons. Runtime access is offline, stdio-only, and strictly read-only; no MetaTrader account, HTTP port, trading access, or authentication is required.
 
-**v1.3.17** changes no server behaviour: the Claude Code installer stops with a clear error when neither `CLAUDE_CONFIG_DIR` nor `USERPROFILE` is set, and the batch-name rules here and in the specification describe exact topic titles. Since v1.3.16, batch lookups take exact topic titles (such as `Order Properties`) beside identifiers. Earlier changes are listed under [Release history](#release-history).
+**v1.3.18** updates the MCP SDK to 1.31.0 and the npm dependencies flagged by Dependabot security advisories (`npm audit` reports none); search, read and image output are unchanged. **v1.3.17** changed no server behaviour: the Claude Code installer stops with a clear error when neither `CLAUDE_CONFIG_DIR` nor `USERPROFILE` is set, and the batch-name rules here and in the specification describe exact topic titles. Since v1.3.16, batch lookups take exact topic titles (such as `Order Properties`) beside identifiers. Earlier changes are listed under [Release history](#release-history).
 
 The server exposes five closed-world tools:
 
@@ -180,6 +180,8 @@ For identifier batches, the compatibility check verifies requested source and li
 The development identifier benchmark accepts `--quality-cases <absolute-json>` together with `--quality-output <new-absolute-json>`. Use `tests/fixtures/documentation-quality.json` for the frozen 32-case suite. Existing invocations retain their identifier-only behavior. Quality results record relevant-result rank, independently selected passages, citations, original image commitments, response bytes, and nine warm timing samples. Timing is descriptive; correctness is required. Golden expectations originate from original CHM HTML and are not generated from server answers. Full results, including failed cases, remain in the separate quality artifact. Development benchmarks are excluded from portable runtime packages.
 
 ## Release history
+
+v1.3.18 is a dependency security update made after the repositories became public and Dependabot alerts were enabled. `@modelcontextprotocol/sdk` moves from 1.29.0 to 1.31.0 (OAuth-client advisory), and the lockfile moves `fast-uri` to 3.1.8, `undici` to 7.30.1, `hono` to 4.13.13, `ip-address` to 10.7.4, `proxy-addr` to 2.0.8 and `qs` to 6.16.1. Of these, only the SDK and `fast-uri` (through `ajv`) are in the bundles. `hono`, `ip-address`, `proxy-addr` and `qs` belong to the SDK's HTTP transport, which this stdio server does not bundle, and `undici` comes from Cheerio, which the indexer imports as `cheerio/slim` without it. The bundled third-party notices are regenerated, and the `@hono/node-server` 2.0.11 override is unchanged.
 
 v1.3.17 applies a CodeRabbit review of the 1.3.10–1.3.16 changes and changes no search, read or image output. `Install-Claude.ps1` and `Uninstall-Claude.ps1` now fail with an explicit error when neither `CLAUDE_CONFIG_DIR` nor `USERPROFILE` is set, instead of resolving `.claude.json` against the current directory. The README batch-name rule and the specification now state the 128-character limit and grammar for both identifiers and exact topic titles, and the parity command documents its `tar` requirement. The health tests check that a Claude Code server turned off with `/mcp disable` is reported as disabled (skill 1.2.10 and later).
 

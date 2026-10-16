@@ -8,7 +8,7 @@ This table is generated from `build/esbuild-meta.json`. It includes only package
 
 | Package | Version | Instance | Bundles | License |
 |---|---:|---|---|---|
-| `@modelcontextprotocol/sdk` | `1.29.0` | `node_modules/@modelcontextprotocol/sdk` | `server.mjs` | `MIT` |
+| `@modelcontextprotocol/sdk` | `1.31.0` | `node_modules/@modelcontextprotocol/sdk` | `server.mjs` | `MIT` |
 | `ajv` | `8.20.0` | `node_modules/ajv` | `server.mjs` | `MIT` |
 | `ajv-formats` | `3.0.1` | `node_modules/ajv-formats` | `server.mjs` | `MIT` |
 | `boolbase` | `1.0.0` | `node_modules/boolbase` | `indexer.mjs` | `ISC` |
@@ -23,7 +23,7 @@ This table is generated from `build/esbuild-meta.json`. It includes only package
 | `entities` | `4.5.0` | `node_modules/entities` | `indexer.mjs` | `BSD-2-Clause` |
 | `entities` | `7.0.1` | `node_modules/htmlparser2/node_modules/entities` | `indexer.mjs` | `BSD-2-Clause` |
 | `fast-deep-equal` | `3.1.3` | `node_modules/fast-deep-equal` | `server.mjs` | `MIT` |
-| `fast-uri` | `3.1.5` | `node_modules/fast-uri` | `server.mjs` | `BSD-3-Clause` |
+| `fast-uri` | `3.1.8` | `node_modules/fast-uri` | `server.mjs` | `BSD-3-Clause` |
 | `htmlparser2` | `10.1.0` | `node_modules/htmlparser2` | `indexer.mjs` | `MIT` |
 | `iconv-lite` | `0.7.3` | `node_modules/iconv-lite` | `indexer.mjs` | `MIT` |
 | `jpeg-js` | `0.4.4` | `node_modules/jpeg-js` | `indexer.mjs`, `server.mjs` | `BSD-3-Clause` |
