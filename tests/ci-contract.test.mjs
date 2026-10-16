@@ -31,8 +31,8 @@ test("compatibility CI tests the real private skill and gates release packaging"
   assert.match(workflow,/ReadApprovedPeer\.ps1.*-PeerRoot \.\/skill/u);
   const approved=JSON.parse(await text('.github/approved-peer.json'));
   assert.equal(approved.repository,'shamwi2846/MQL5-Coding-Skill');
-  assert.equal(approved.version,'1.2.9');
-  assert.equal(approved.commit,'078afab25155ee74a6569c451e68dd7cf1cc0cb8');
+  assert.equal(approved.version,'1.2.10');
+  assert.equal(approved.commit,'1c900d7995900350161ff332a01a5b7cb40bd934');
   assert.match(workflow, /npm run build:candidate/u);
   assert.match(workflow, /Test-SkillCompatibility\.mjs --skill-root skill\/skills\/mql5-coding --python \$pythonPath --report compatibility\.json/u);
   assert.match(workflow, /--require-hashes -r skill\/\.github\/requirements-ci\.txt/u);
