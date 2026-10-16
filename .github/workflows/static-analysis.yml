@@ -1,0 +1,62 @@
+name: Static analysis
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  schedule:
+    - cron: "41 6 * * 2"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: static-analysis-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Findings go to code scanning and do not fail these jobs; a scanner that
+# cannot run or upload does. CodeQL default setup covers JavaScript, Python,
+# C# and workflows separately.
+jobs:
+  workflows:
+    name: Workflow security (zizmor)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Check out source without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Audit GitHub workflows
+        uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482
+        with:
+          version: 1.30.1
+
+  powershell:
+    name: PowerShell analysis (PSScriptAnalyzer)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Check out source without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Analyze PowerShell files with the curated rule set
+        shell: pwsh
+        run: ./.github/scripts/Invoke-PSScriptAnalyzerSarif.ps1 -OutputPath psscriptanalyzer.sarif
+
+      - name: Upload PowerShell findings
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2
+        with:
+          sarif_file: psscriptanalyzer.sarif
+          category: psscriptanalyzer
