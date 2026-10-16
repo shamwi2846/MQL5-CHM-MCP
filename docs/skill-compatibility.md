@@ -46,7 +46,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Installed MCP and skill compatibility failed.'
 
 This mode checks the current indexed corpus and never starts MetaEditor or MT5. It reads `OnTester` and a topic with an image; those identifiers are test probes, not permanently cached topic IDs. Installed consumer files and the bundle are hashed; an installed skill without Git metadata has a null checkout commit. The MCP checkout commit identifies the test runner's source. The report's server path/hash identifies the tested bundle.
 
-## Private repository CI
+## Cross-repository CI
 
 The pair job also runs the skill's environment-health command against an actual MCP bundle and indexed synthetic corpus under PowerShell 7 and Windows PowerShell 5.1. Native synthetic Codex and editor executables provide controlled registration/error metadata; the editor is never executed. Cases cover source differences, disabled/tool-filtered registration, version/checksum failures, missing optional dependencies, redaction, timeouts, and exclusive report creation. Installed inputs must remain unchanged. For local regression testing from this MCP checkout after building the candidate bundle:
 
@@ -65,6 +65,6 @@ Generated profiles keep files inside the EA project relative and external select
 
 Each repository's `.github/workflows/skill-compatibility.yml` checks out its event revision and the counterpart's `main`; a manual run can select another `peer_ref`. Both exact resolved commits are recorded in the artifact. Node and Python versions, dependency lockfiles, and action commits are pinned. MCP release packaging has `needs: compatibility`; skill tag pushes run the pair check as well.
 
-Each repository needs an Actions secret named `MQL5_PEER_READ_KEY`: a unique read-only SSH deploy key registered on the counterpart repository. Create separate keys for each direction. Never store private keys in source control, use write access, or copy an account's broad token into CI. Checkouts set `persist-credentials: false`. Fork pull requests skip the secret-bearing job; trusted runs fail when the credential is missing. Rotate a target deploy key and its corresponding consumer secret together.
+Both repositories are public, so the counterpart is checked out with the job's read-only workflow token and no secret, and pull requests from forks run the same check (an owner approves workflow runs from outside contributors first). Every checkout sets `persist-credentials: false`.
 
 The JSON artifact records the MCP and skill commits, server version/hash, consumer file hashes, corpus revision, and passed scenarios. It is proof for that recorded pair rather than a guarantee about later counterpart changes. Re-run after either repository changes; the two CI jobs cover changes from either direction.

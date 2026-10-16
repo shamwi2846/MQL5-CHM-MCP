@@ -7,9 +7,6 @@ on:
         description: Counterpart branch, tag, or commit to verify
         type: string
         default: main
-    secrets:
-      MQL5_PEER_READ_KEY:
-        required: true
   workflow_dispatch:
     inputs:
       peer_ref:
@@ -47,7 +44,6 @@ jobs:
       fail-fast: false
       matrix:
         pair: [main, approved]
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
@@ -57,13 +53,14 @@ jobs:
           path: mcp
           persist-credentials: false
 
-      - name: Check out the counterpart with a read-only deploy key
+      # The counterpart is public: the job's read-only token (not persisted)
+      # fetches it, no secret is needed, and fork pull requests run this check.
+      - name: Check out the public counterpart without a secret
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: ${{ github.repository_owner }}/MQL5-Coding-Skill
           ref: ${{ matrix.pair == 'approved' && needs.resolve-peer.outputs.commit || inputs.peer_ref || 'main' }}
           path: skill
-          ssh-key: ${{ secrets.MQL5_PEER_READ_KEY }}
           persist-credentials: false
 
       - name: Verify the approved checkout identity

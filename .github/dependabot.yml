@@ -1,0 +1,16 @@
+# npm gets security updates only (enabled in the repository settings): a
+# version bump must regenerate and review the bundled third-party notices, and
+# the patched @hono/node-server lives in package.json overrides, which
+# Dependabot does not update. See SECURITY.md for the manual pins.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    groups:
+      github-actions:
+        patterns:
+          - "*"

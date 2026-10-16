@@ -17,7 +17,6 @@ jobs:
   compatibility:
     name: MCP and skill compatibility
     uses: ./.github/workflows/skill-compatibility.yml
-    secrets: inherit
 
   fast:
     name: Fast and maintenance MCP tests

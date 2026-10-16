@@ -8,22 +8,38 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1";
-const SETUP_NODE_ACTION = "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020";
-const UPLOAD_ARTIFACT_ACTION = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
+// Actions are pinned to full commit SHAs; Dependabot moves every use of an
+// action to the same new commit, so the policy fixes the form, not the value.
+const PINNED_ACTION = /^(?<action>[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_./-]+)?)@(?<sha>[0-9a-f]{40})$/u;
 const PINNED_HONO_NODE_SERVER_VERSION = "2.0.11";
 const APPROVED_HONO_NODE_SERVER_VERSIONS = new Set([PINNED_HONO_NODE_SERVER_VERSION]);
 
-test("compatibility CI tests the real private skill and gates release packaging", async () => {
+function assertPinnedAction(uses, action, context = "workflow") {
+  const match = PINNED_ACTION.exec(uses ?? "");
+  assert.ok(match, `${context}: ${uses} is not pinned to a full commit SHA`);
+  assert.equal(match.groups.action, action, `${context}: unexpected action ${uses}`);
+  return match.groups.sha;
+}
+
+async function workflowFiles() {
+  return (await readdir(path.join(root, ".github", "workflows"), { withFileTypes: true }))
+    .filter((entry) => entry.isFile() && /\.ya?ml$/iu.test(entry.name))
+    .map((entry) => `.github/workflows/${entry.name}`)
+    .sort();
+}
+
+test("compatibility CI tests the real public skill and gates release packaging", async () => {
   const workflow = await text(".github/workflows/skill-compatibility.yml");
   assert.match(workflow, /workflow_call:/u);
-  assert.match(workflow, /MQL5_PEER_READ_KEY:\s*\n\s*required: true/u);
-  assert.match(workflow, /github\.event\.pull_request\.head\.repo\.full_name == github\.repository/u);
+  // Both repositories are public: only the job's read-only token fetches the
+  // peer (no secret or extra token), and fork pull requests run the pair check.
+  assert.doesNotMatch(workflow, /MQL5_PEER_READ_KEY|secrets\.|ssh-key|head\.repo\.full_name/u);
   const checkouts = verifiedActionSteps(workflow, "actions/checkout@", "compatibility CI");
   assert.equal(checkouts.length, 3);
   const peer = actionStepInputs(checkouts[2]);
   assert.equal(peer.get("repository"), "${{ github.repository_owner }}/MQL5-Coding-Skill");
-  assert.equal(peer.get("ssh-key"), "${{ secrets.MQL5_PEER_READ_KEY }}");
+  assert.equal(peer.has("ssh-key"), false);
+  assert.equal(peer.has("token"), false);
   assert.equal(peer.get("persist-credentials"), "false");
   assert.equal(peer.get("path"), "skill");
   assert.match(workflow,/pair: \[main, approved\]/u);
@@ -40,10 +56,12 @@ test("compatibility CI tests the real private skill and gates release packaging"
   assert.match(workflow, /skill_checkout_commit/u);
   const upload = verifiedActionSteps(workflow, "actions/upload-artifact@", "compatibility CI");
   assert.equal(upload.length, 1);
-  assert.equal(actionStepUses(upload[0]), UPLOAD_ARTIFACT_ACTION);
+  assertPinnedAction(actionStepUses(upload[0]), "actions/upload-artifact", "compatibility CI");
   assert.equal(actionStepInputs(upload[0]).get("if-no-files-found"), "error");
   for (const file of ["windows-ci.yml", "release-validation.yml"]) {
-    assert.match(await text(`.github/workflows/${file}`), /uses: \.\/\.github\/workflows\/skill-compatibility\.yml\s*\n\s*secrets: inherit/u);
+    const caller = await text(`.github/workflows/${file}`);
+    assert.match(caller, /uses: \.\/\.github\/workflows\/skill-compatibility\.yml/u);
+    assert.doesNotMatch(caller, /secrets:\s*inherit/u, `${file} must not pass secrets to the compatibility check`);
   }
   assert.match(await text(".github/workflows/release-validation.yml"), /release:\s*\n\s*needs: compatibility/u);
   assert.match(JSON.parse(await text("package.json")).scripts["test:fast"], /tests\/skill-compatibility\.test\.mjs/u);
@@ -435,7 +453,7 @@ test("Windows CI runs fast and cross-shell maintenance suites on pull requests w
   assert.match(workflow, /\bpull_request\s*:/u);
   assert.equal(setupNodeSteps.length, 1);
   const setupNodeInputs = actionStepInputs(setupNodeSteps[0]);
-  assert.equal(actionStepUses(setupNodeSteps[0]), SETUP_NODE_ACTION);
+  assertPinnedAction(actionStepUses(setupNodeSteps[0]), "actions/setup-node", "Windows CI");
   assert.equal(setupNodeInputs.get("node-version"), "24.17.0");
   assert.equal(setupNodeInputs.get("cache"), "npm");
   assert.match(workflow, /npm run test:fast/u);
@@ -449,18 +467,15 @@ test("Windows CI runs fast and cross-shell maintenance suites on pull requests w
 });
 
 test("GitHub workflows never persist checkout credentials", async () => {
-  const workflowFiles = (await readdir(path.join(root, ".github", "workflows"), { withFileTypes: true }))
-    .filter((entry) => entry.isFile() && /\.ya?ml$/iu.test(entry.name))
-    .map((entry) => `.github/workflows/${entry.name}`)
-    .sort();
-  assert.ok(workflowFiles.length > 0, "repository has no GitHub workflows");
+  const files = await workflowFiles();
+  assert.ok(files.length > 0, "repository has no GitHub workflows");
   let checkoutCount = 0;
-  for (const relativePath of workflowFiles) {
+  for (const relativePath of files) {
     const workflow = await text(relativePath);
     const checkoutSteps = verifiedActionSteps(workflow, "actions/checkout@", relativePath);
     checkoutCount += checkoutSteps.length;
     for (const checkoutStep of checkoutSteps) {
-      assert.equal(actionStepUses(checkoutStep), CHECKOUT_ACTION);
+      assertPinnedAction(actionStepUses(checkoutStep), "actions/checkout", relativePath);
       assert.equal(
         actionStepInputs(checkoutStep).get("persist-credentials"),
         "false",
@@ -471,13 +486,29 @@ test("GitHub workflows never persist checkout credentials", async () => {
   assert.ok(checkoutCount > 0, "repository workflows contain no checkout steps");
 });
 
+test("every workflow action is pinned to one full commit SHA per action", async () => {
+  const pins = new Map();
+  for (const relativePath of await workflowFiles()) {
+    for (const step of workflowSteps(await text(relativePath))) {
+      const uses = actionStepUses(step);
+      if (uses === undefined || uses.startsWith("./")) continue;
+      const match = PINNED_ACTION.exec(uses);
+      assert.ok(match, `${relativePath}: ${uses} is not pinned to a full commit SHA`);
+      const { action, sha } = match.groups;
+      assert.ok(!pins.has(action) || pins.get(action) === sha, `${relativePath}: ${action} differs from its pin in another workflow`);
+      pins.set(action, sha);
+    }
+  }
+  assert.ok(pins.has("actions/checkout") && pins.has("actions/setup-node"), "pinned action inventory is incomplete");
+});
+
 test("release validation runs full suites under PowerShell 7 and Windows PowerShell 5.1", async () => {
   const workflow = await text(".github/workflows/release-validation.yml");
   const setupNodeSteps = verifiedActionSteps(workflow, "actions/setup-node@", "release validation");
   assert.match(workflow, /tags:[\s\S]*v\*/u);
   assert.equal(setupNodeSteps.length, 1);
   const setupNodeInputs = actionStepInputs(setupNodeSteps[0]);
-  assert.equal(actionStepUses(setupNodeSteps[0]), SETUP_NODE_ACTION);
+  assertPinnedAction(actionStepUses(setupNodeSteps[0]), "actions/setup-node", "release validation");
   assert.equal(setupNodeInputs.get("node-version"), "24.17.0");
   assert.equal(setupNodeInputs.get("package-manager-cache"), "false");
   assert.equal(setupNodeInputs.has("cache"), false);
@@ -514,7 +545,7 @@ test("release validation retains the exact verified ZIP and sidecar", async () =
 
   const uploadSteps = verifiedActionSteps(workflow, "actions/upload-artifact@", "release validation");
   assert.equal(uploadSteps.length, 1);
-  assert.equal(actionStepUses(uploadSteps[0]), UPLOAD_ARTIFACT_ACTION);
+  assertPinnedAction(actionStepUses(uploadSteps[0]), "actions/upload-artifact", "release validation");
   const uploadInputs = actionStepInputs(uploadSteps[0]);
   assert.equal(uploadInputs.get("name"), "mql5-chm-mcp-release-${{ github.sha }}");
   assert.equal(uploadInputs.get("if-no-files-found"), "error");
