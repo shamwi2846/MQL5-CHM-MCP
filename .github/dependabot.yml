@@ -10,6 +10,9 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 3
+    # Wait a week after a release so a compromised version can be pulled first.
+    cooldown:
+      default-days: 7
     groups:
       github-actions:
         patterns:
