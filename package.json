@@ -33,7 +33,7 @@
     "test:generated:extended": "pwsh -NoProfile -File tests/Invoke-GeneratedInputTests.ps1 -Tier extended"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.29.0",
+    "@modelcontextprotocol/sdk": "1.31.0",
     "cheerio": "1.2.0",
     "iconv-lite": "0.7.3",
     "jpeg-js": "0.4.4",
