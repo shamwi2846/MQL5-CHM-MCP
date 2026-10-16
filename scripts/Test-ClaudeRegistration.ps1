@@ -110,6 +110,23 @@ switch ($arguments[1]) {
     $env:MQL5_FAKE_CLAUDE_SCENARIO = $scenarioPath
 
     Assert-Test ((Get-ClaudeUserConfigPath) -ceq [IO.Path]::GetFullPath($configPath)) 'Claude Code config path does not follow CLAUDE_CONFIG_DIR.'
+    # Without CLAUDE_CONFIG_DIR the user profile is required; a missing profile
+    # must fail instead of resolving .claude.json against the current directory.
+    $oldProfile = $env:USERPROFILE
+    try {
+        $env:CLAUDE_CONFIG_DIR = $null
+        $env:USERPROFILE = $fixtureRoot
+        Assert-Test ((Get-ClaudeUserConfigPath) -ceq [IO.Path]::GetFullPath((Join-Path $fixtureRoot '.claude.json'))) 'Claude Code config path does not fall back to the user profile.'
+        foreach ($profileValue in @($null, ' ')) {
+            $env:USERPROFILE = $profileValue
+            $message = $null
+            try { Get-ClaudeUserConfigPath | Out-Null } catch { $message = $_.Exception.Message }
+            Assert-Test ($message -ceq 'Cannot locate the Claude Code configuration: neither CLAUDE_CONFIG_DIR nor USERPROFILE is set.') 'A missing user profile did not stop Claude Code config resolution.'
+        }
+    } finally {
+        $env:USERPROFILE = $oldProfile
+        $env:CLAUDE_CONFIG_DIR = $configRoot
+    }
     $lease = Enter-ClaudeRegistrationMutex -TimeoutSeconds 5
     try {
         Assert-Test ([string]$lease.Name -ceq 'Global\Mql5ChmMcp-ClaudeRegistration-v1') 'Claude Code registration mutex is not machine-global and fixed.'

@@ -1730,7 +1730,7 @@ function Invoke-BoundedNodeJsDownload {
     $client = New-Object Net.Http.HttpClient($handler, $true)
     $client.Timeout = [Threading.Timeout]::InfiniteTimeSpan
     $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Get, $Uri)
-    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.3.16')
+    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp-packager/1.3.17')
     $response = $null
     $stream = $null
     $deadline = New-Object Threading.CancellationTokenSource([TimeSpan]::FromSeconds($TimeoutSeconds))
@@ -2285,6 +2285,9 @@ function Get-ClaudeUserConfigPath {
     # inside CLAUDE_CONFIG_DIR when set, otherwise in the user's home.
     if (-not [string]::IsNullOrWhiteSpace($env:CLAUDE_CONFIG_DIR)) {
         return [IO.Path]::GetFullPath((Join-Path $env:CLAUDE_CONFIG_DIR '.claude.json'))
+    }
+    if ([string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+        throw 'Cannot locate the Claude Code configuration: neither CLAUDE_CONFIG_DIR nor USERPROFILE is set.'
     }
     return [IO.Path]::GetFullPath((Join-Path $env:USERPROFILE '.claude.json'))
 }
@@ -4960,7 +4963,7 @@ function Invoke-OfficialChmDownload {
             try {
                 if ($null -eq $InternalTestHooks) {
                     $request = New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Get, $current)
-                    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp/1.3.16')
+                    [void]$request.Headers.UserAgent.ParseAdd('mql5-chm-mcp/1.3.17')
                     try {
                         $httpResponse = $client.SendAsync(
                             $request,

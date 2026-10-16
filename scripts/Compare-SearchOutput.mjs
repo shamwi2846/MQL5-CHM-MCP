@@ -5,7 +5,8 @@
 //   node scripts/Compare-SearchOutput.mjs [--root <package-or-checkout>] [--baseline <commit>] [--quick]
 //
 // --root defaults to this checkout (its data/ and revisions/ corpus fixture).
-// The baseline's src/ and config/ are extracted once with `git archive` into
+// The baseline's src/ and config/ are extracted once with `git archive` and the
+// `tar` on PATH (Windows 10 and later include tar.exe) into
 // build/search-baseline-<commit>/ (git-ignored) and resolve dependencies from
 // this checkout's node_modules. Move the default baseline only when a release
 // intentionally changes results.
